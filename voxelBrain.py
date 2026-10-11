@@ -1,12 +1,18 @@
 import numpy as np
 from jaxtyping import Float64, Float16, Int8
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import vnoise #type: ignore
-from typing import Annotated, get_type_hints
+from typing import Annotated, get_type_hints, Protocol, runtime_checkable, Any
+
+
+@runtime_checkable
+class Checkable(Protocol):
+    def check(self, val: Any) -> None:
+        ...
 
 
 @dataclass(frozen=True, slots=True)
-class R:
+class R(Checkable):
     min_val: float | int
     max_val: float | int
     odd: bool = False
@@ -74,7 +80,7 @@ def auto_ranged(cls):
         for name, hint in hints.items():
             if hasattr(hint, "__metadata__"):
                 for meta in hint.__metadata__:
-                    if hasattr(meta, "check"):
+                    if isinstance(meta, Checkable):
                         meta.check(getattr(self, name))
 
     cls.__init__ = new_init
@@ -82,7 +88,7 @@ def auto_ranged(cls):
 
 
 @dataclass(frozen=True, slots=True)
-class NeuronTypeChoice:
+class NeuronTypeChoice(Checkable):
     excit: int = 1
     inhib: int = -1
 
@@ -118,6 +124,25 @@ class PerlinParams:
     bias: Annotated[float, R(-0.5, 5.0)]
     frequency: Annotated[float, R(0.0, 1.0)]
     cutoff: Annotated[float, R(0.0, 0.95)]
+    size: Annotated[int, R(0, Config.N+2)]
+
+
+@auto_ranged
+@dataclass(frozen=True, slots=True)
+class DopamineParams(PerlinParams):
+    size: Annotated[int, R(Config.N, Config.N)] = field(init=False, default=Config.N)
+
+
+@auto_ranged
+@dataclass(frozen=True, slots=True)
+class SleepParams(PerlinParams):
+    size: Annotated[int, R(Config.N, Config.N)] = field(init=False, default=Config.N)
+
+
+@auto_ranged
+@dataclass(frozen=True, slots=True)
+class SignaturePerlinParams(PerlinParams):
+    size: Annotated[int, R(Config.N+2, Config.N+2)] = field(init=False, default=Config.N+2)
 
 
 @auto_ranged
@@ -141,9 +166,9 @@ class Link28thParams:
 @auto_ranged
 @dataclass(frozen=True, slots=True)
 class SignatureParams:
-    perlin_x: PerlinParams
-    perlin_y: PerlinParams
-    perlin_z: PerlinParams
+    perlin_x: SignaturePerlinParams
+    perlin_y: SignaturePerlinParams
+    perlin_z: SignaturePerlinParams
 
 
 @auto_ranged
@@ -182,26 +207,27 @@ def update_lattice(current_map: Float64[np.ndarray, "Iz Iy Ix"], inhib_params: I
 
 def perlin_gen(perlin_params: PerlinParams) -> Float64[np.ndarray, "Nz Ny Nx"]:
     freq = perlin_params.frequency
-    i = np.arange(Config.N**3)
-    x = (i & Config.mask).astype(np.float64) * freq
-    y = ((i >> Config.shift_y) & Config.mask).astype(np.float64) * freq
-    z = (i >> Config.shift_z).astype(np.float64) * freq
+    size = perlin_params.size
+    i = np.arange(size**3)
+    x = (i % size).astype(np.float64) * freq
+    y = ((i // size) % size).astype(np.float64) * freq
+    z = ((i // (size ** 2)) % size).astype(np.float64) * freq
     vn = vnoise.Noise(seed=perlin_params.seed)
     noise = vn.noise3(x, y, z)
     bias = perlin_params.bias
     cutoff = perlin_params.cutoff
-    return np.clip((noise - cutoff) / (1 - cutoff) + bias, 0.0, 1.0).reshape(Config.N, Config.N, Config.N)
+    return np.clip((noise - cutoff) / (1 - cutoff) + bias, 0.0, 1.0).reshape(size, size, size)
 
 
-def dopamine_gen(perlin_params: PerlinParams) -> Float64[np.ndarray, "Nz Ny Nx"]:
-    return perlin_gen(perlin_params)
+def dopamine_gen(dopamine_params: DopamineParams) -> Float64[np.ndarray, "Dz Dy Dx"]: # N^3
+    return perlin_gen(dopamine_params)
 
 
-def sleep_gen(perlin_params: PerlinParams) -> Float64[np.ndarray, "Nz Ny Nx"]:
-    return perlin_gen(perlin_params)
+def sleep_gen(sleep_params: SleepParams) -> Float64[np.ndarray, "Slz Sly SLx"]: # N^3
+    return perlin_gen(sleep_params)
 
 
-def inhib_gen(inhib_params: InhibParams) -> Int8[np.ndarray, "Iz Iy Ix"]:
+def inhib_gen(inhib_params: InhibParams) -> Int8[np.ndarray, "Iz Iy Ix"]: # (N+2)^3
     rng = np.random.default_rng(seed=inhib_params.seed)
     shape = (Config.N+2, Config.N+2, Config.N+2)
     inhib_map = rng.uniform(0.0, 1.0, shape)
@@ -211,7 +237,7 @@ def inhib_gen(inhib_params: InhibParams) -> Int8[np.ndarray, "Iz Iy Ix"]:
     return sign_map
 
 
-def neuron_signature_gen(signature_params: SignatureParams) -> Float64[np.ndarray, "Nz Ny Nx 3"]:
+def neuron_signature_gen(signature_params: SignatureParams) -> Float64[np.ndarray, "Siz Siy Six 3"]: # (N+2)^3
     noisex = perlin_gen(signature_params.perlin_x)
     noisey = perlin_gen(signature_params.perlin_y)
     noisez = perlin_gen(signature_params.perlin_z)
@@ -222,8 +248,8 @@ def neuron_signature_gen(signature_params: SignatureParams) -> Float64[np.ndarra
 @dataclass(frozen=True, slots=True)
 class GenesisParams:
     signature_params: SignatureParams
-    dopamine_params: PerlinParams
-    sleep_params: PerlinParams
+    dopamine_params: DopamineParams
+    sleep_params: SleepParams
     inhib_params: InhibParams
     resource_params: NeuronResourceParams
     link28th_params: Link28thParams
