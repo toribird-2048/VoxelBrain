@@ -243,7 +243,7 @@ def perlin_gen(perlin_params: PerlinParams) -> Float64[np.ndarray, "Nz Ny Nx"]:
     y = ((i // size) % size).astype(np.float64) * freq
     z = ((i // (size ** 2)) % size).astype(np.float64) * freq
     vn = vnoise.Noise(seed=perlin_params.seed)
-    noise = vn.noise3(x, y, z)
+    noise = vn.noise3(x, y, z, grid_mode=False)
     bias = perlin_params.bias
     cutoff = perlin_params.cutoff
     return np.clip((noise - cutoff) / (1 - cutoff) + bias, 0.0, 1.0).reshape(size, size, size)
