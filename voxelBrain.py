@@ -1,6 +1,6 @@
 import numpy as np
 from jaxtyping import Float64, Float16, Int8
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, MISSING, fields
 import vnoise #type: ignore
 from typing import Annotated, get_type_hints, Protocol, runtime_checkable, Any
 
@@ -8,6 +8,11 @@ from typing import Annotated, get_type_hints, Protocol, runtime_checkable, Any
 @runtime_checkable
 class Checkable(Protocol):
     def check(self, val: Any) -> None:
+        ...
+
+@runtime_checkable
+class Generatable(Protocol):
+    def generate(self) -> Any:
         ...
 
 
@@ -36,25 +41,18 @@ class R(Checkable):
         if self.log and self.val_type == int:
             raise ValueError("int型にlogフラグを立てることはできません。")
 
-    def check(self, val:float | int | np.ndarray):
+    def check(self, val:float | int):
+        if self.val_type != type(val):
+            raise TypeError("範囲と値の型が一致しません。")
         if isinstance(val, bool):
             raise TypeError("範囲チェックする数値に真偽値は入れられません。")
-
-        if isinstance(val, np.ndarray):
-            if not np.issubdtype(val.dtype, np.number):
-                raise TypeError(f"配列のdtype{val.dtype}が不正です。dtypeはnp.numberのサブタイプである必要があります。")
-
-            if (val < self.min_val).any() or (self.max_val < val).any():
-                raise ValueError(f"配列の値は、全て{self.min_val}以上{self.max_val}以下である必要があります。")
-            return
-
         
         if not self.min_val <= val <= self.max_val:
             raise ValueError(f"値{val}が範囲{self.min_val}~{self.max_val}を外れています。")
         if self.odd and val % 2 != 1:
             raise ValueError(f"値{val}は奇数である必要があります。")
 
-    def sample(self):
+    def generate(self):
         if self.val_type == int:
             if self.odd:
                 k_low = int(self.min_val) // 2
@@ -74,7 +72,15 @@ class R(Checkable):
 def auto_ranged(cls):
     orig_init = cls.__init__
     hints = get_type_hints(cls, include_extras=True)
-
+    for f in fields(cls):
+        if f.init == True:
+            hint = hints[f.name]
+            if hasattr(hint, "__metadata__"):
+                if not any(isinstance(meta, Checkable) for meta in hint.__metadata__):
+                    raise TypeError("auto_rangedで修飾されたクラスの変数は、Checkableなアノテーションがつけられている必要があります。")
+            else:
+                raise TypeError("auto_rangedで修飾されたクラスの変数は、アノテーションがつけられている必要があります。")
+                    
     def new_init(self, *args, **kwargs):
         orig_init(self, *args, **kwargs)
         for name, hint in hints.items():
@@ -84,7 +90,33 @@ def auto_ranged(cls):
                         meta.check(getattr(self, name))
 
     cls.__init__ = new_init
+    cls.__auto_ranged__ = True
     return cls
+
+
+def is_auto_ranged(cls):
+    return getattr(cls, "__auto_ranged__", False)
+
+
+def generate(cls):
+    if not is_auto_ranged(cls):
+        raise TypeError("generate関数に渡されるクラスはauto_rangedで修飾されている必要があります。")
+    hints = get_type_hints(cls, include_extras=True)
+    kwargs = {}
+    for f in fields(cls):
+        if f.init == True:
+            hint = hints[f.name]
+            if hasattr(hint, "__metadata__"):
+                meta = hint.__metadata__
+                generatable_meta = next((m for m in meta if isinstance(m, Generatable)), None)
+                if generatable_meta is not None:
+                    kwargs[f.name] = generatable_meta.generate()
+                else:
+                    raise TypeError("generate関数に入れるクラスの変数は、固定値以外全てGeneratableである必要があります。")
+            else:
+                raise TypeError("generate関数に入れるクラスの変数は、固定値以外全てアノテーションが付されている必要があります。")
+    return cls(**kwargs)
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,7 +136,6 @@ class NeuronTypeChoice(Checkable):
             invalid = (val != self.excit) & (val != self.inhib)
             if invalid.any():
                 raise ValueError("配列の値は1, -1のどちらかである必要があります。")
-
 
 
 class Config:
@@ -163,7 +194,6 @@ class Link28thParams:
     bias: Annotated[int, R(0, 511)]
 
 
-@auto_ranged
 @dataclass(frozen=True, slots=True)
 class SignatureParams:
     perlin_x: SignaturePerlinParams
@@ -255,8 +285,23 @@ class GenesisParams:
     link28th_params: Link28thParams
     learning_params: LearningParams
 
+    @classmethod
+    def new(cls) -> "GenesisParams":
+        return cls(
+            signature_params=SignatureParams(
+                perlin_x=generate(SignaturePerlinParams),
+                perlin_y=generate(SignaturePerlinParams),
+                perlin_z=generate(SignaturePerlinParams)
+            ),
+            dopamine_params=generate(DopamineParams),
+            sleep_params=generate(SleepParams),
+            inhib_params=generate(InhibParams),
+            resource_params=generate(NeuronResourceParams),
+            link28th_params=generate(Link28thParams),
+            learning_params=generate(LearningParams)
+        )
 
-@auto_ranged
+
 @dataclass(slots=True)
 class Gene:
     signature_map: Annotated[Float16[np.ndarray, "Siz Siy Six 3"], R(-1.0, 1.0)]
@@ -278,3 +323,6 @@ class Gene:
             link28th_params=genesis_params.link28th_params,
             learning_params=genesis_params.learning_params
         )
+
+genesis_params = GenesisParams.new()
+gene = Gene.new(genesis_params)
