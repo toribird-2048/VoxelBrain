@@ -17,7 +17,7 @@ class Generatable(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
-class R(Checkable):
+class R():
     min_val: float | int
     max_val: float | int
     odd: bool = False
@@ -40,8 +40,10 @@ class R(Checkable):
             raise ValueError("float型にoddフラグを立てることはできません。")
         if self.log and self.val_type == int:
             raise ValueError("int型にlogフラグを立てることはできません。")
+        if self.max_val < self.min_val:
+            raise ValueError("最大値よりも最小値を大きくすることはできません。")
 
-    def check(self, val:float | int):
+    def check(self, val: float | int):
         if self.val_type != type(val):
             raise TypeError("範囲と値の型が一致しません。")
         if isinstance(val, bool):
@@ -55,9 +57,9 @@ class R(Checkable):
     def generate(self):
         if self.val_type == int:
             if self.odd:
-                k_low = int(self.min_val) // 2
-                k_high = int(self.max_val) // 2 + 1
-                return int(2 * np.random.randint(k_low, k_high) + 1)
+                k_min = (int(self.min_val) + 1) // 2 if self.min_val % 2 == 0 else int(self.min_val) // 2
+                k_max = (int(self.max_val) - 1) // 2
+                return int(2 * np.random.randint(k_min, k_max + 1) + 1)
             return np.random.randint(self.min_val, self.max_val + 1)
 
         if self.val_type == float:
@@ -67,6 +69,37 @@ class R(Checkable):
                 return 10 ** np.random.uniform(log_min, log_max)
             return np.random.uniform(self.min_val, self.max_val)
         raise ValueError("UnexpectedError")
+
+
+@dataclass(frozen=True, slots=True)
+class Rgene():
+    min_val: np.floating | np.integer
+    max_val: np.floating | np.integer
+
+    @property
+    def val_type(self) -> type:
+        if type(self.min_val) != type(self.max_val):
+            raise TypeError("最小値と最大値の型が一致していません。")
+        return type(self.min_val)
+
+    def __post_init__(self):
+        if type(self.min_val) != type(self.max_val):
+            raise TypeError("最小値と最大値の型が一致していません。")
+        if self.val_type is bool:
+            raise TypeError("最小値に真偽値を入れることはできません。")
+        if self.max_val < self.min_val:
+            raise ValueError("最大値よりも最小値を大きくすることはできません。")
+        if not (np.issubdtype(self.val_type, np.integer) or np.issubdtype(self.val_type, np.floating)):
+            raise TypeError("最小値はnp.floating, あるいはnp.integerの型しか取れません。")
+
+    def check(self, val: np.ndarray):
+        if not isinstance(val, np.ndarray):
+            raise TypeError("チェックする配列はnp.ndarray型である必要があります")
+        if not np.issubdtype(val.dtype, self.val_type):
+            raise TypeError("範囲と値の型が一致しません。")
+        
+        if not ((self.min_val <= val) & (val <= self.max_val)).all():
+            raise ValueError(f"配列{val}の数値の一部が範囲{self.min_val}~{self.max_val}を外れています。")
 
 
 def auto_ranged(cls):
@@ -83,11 +116,12 @@ def auto_ranged(cls):
                     
     def new_init(self, *args, **kwargs):
         orig_init(self, *args, **kwargs)
-        for name, hint in hints.items():
+        for f in fields(self):
+            hint = hints[f.name]
             if hasattr(hint, "__metadata__"):
                 for meta in hint.__metadata__:
                     if isinstance(meta, Checkable):
-                        meta.check(getattr(self, name))
+                        meta.check(getattr(self, f.name))
 
     cls.__init__ = new_init
     cls.__auto_ranged__ = True
@@ -118,20 +152,12 @@ def generate(cls):
     return cls(**kwargs)
 
 
-
 @dataclass(frozen=True, slots=True)
-class NeuronTypeChoice(Checkable):
+class NeuronTypeChoiceGene():
     excit: int = 1
     inhib: int = -1
 
-    def check(self, val: np.ndarray | int):
-        if isinstance(val, bool):
-            raise TypeError("値は1, -1のどちらかである必要があります。")
-        if isinstance(val, int):
-            if val != self.excit and val != self.inhib:
-                raise ValueError("値は1, -1のどちらかである必要があります。")
-            return
-
+    def check(self, val: np.ndarray):
         if isinstance(val, np.ndarray):
             invalid = (val != self.excit) & (val != self.inhib)
             if invalid.any():
@@ -253,7 +279,7 @@ def dopamine_gen(dopamine_params: DopamineParams) -> Float64[np.ndarray, "Dz Dy 
     return perlin_gen(dopamine_params)
 
 
-def sleep_gen(sleep_params: SleepParams) -> Float64[np.ndarray, "Slz Sly SLx"]: # N^3
+def sleep_gen(sleep_params: SleepParams) -> Float64[np.ndarray, "Slz Sly Slx"]: # N^3
     return perlin_gen(sleep_params)
 
 
@@ -277,7 +303,8 @@ def neuron_signature_gen(signature_params: SignatureParams) -> Float64[np.ndarra
 
 @dataclass(frozen=True, slots=True)
 class GenesisParams:
-    signature_params: SignatureParams
+    signature_pre_params: SignatureParams
+    signature_post_params: SignatureParams
     dopamine_params: DopamineParams
     sleep_params: SleepParams
     inhib_params: InhibParams
@@ -288,7 +315,12 @@ class GenesisParams:
     @classmethod
     def new(cls) -> "GenesisParams":
         return cls(
-            signature_params=SignatureParams(
+            signature_pre_params=SignatureParams(
+                perlin_x=generate(SignaturePerlinParams),
+                perlin_y=generate(SignaturePerlinParams),
+                perlin_z=generate(SignaturePerlinParams)
+            ),
+            signature_post_params=SignatureParams(
                 perlin_x=generate(SignaturePerlinParams),
                 perlin_y=generate(SignaturePerlinParams),
                 perlin_z=generate(SignaturePerlinParams)
@@ -304,10 +336,11 @@ class GenesisParams:
 
 @dataclass(slots=True)
 class Gene:
-    signature_map: Annotated[Float16[np.ndarray, "Siz Siy Six 3"], R(-1.0, 1.0)]
-    dopamine_map: Annotated[Float16[np.ndarray, "Dz Dy Dx"], R(0.0, 1.0)]
-    sleep_map: Annotated[Float16[np.ndarray, "Slz Sly Slx"], R(0.0, 1.0)]
-    inhib_map: Annotated[Int8[np.ndarray, "Iz Iy Ix"], NeuronTypeChoice()]
+    signature_pre_map: Annotated[Float16[np.ndarray, "Siz Siy Six 3"], Rgene(np.float16(-1.0), np.float16(1.0))]
+    signature_post_map: Annotated[Float16[np.ndarray, "Siz Siy Six 3"], Rgene(np.float16(-1.0), np.float16(1.0))]
+    dopamine_map: Annotated[Float16[np.ndarray, "Dz Dy Dx"], Rgene(np.float16(0.0), np.float16(1.0))]
+    sleep_map: Annotated[Float16[np.ndarray, "Slz Sly Slx"], Rgene(np.float16(0.0), np.float16(1.0))]
+    inhib_map: Annotated[Int8[np.ndarray, "Iz Iy Ix"], NeuronTypeChoiceGene()]
     resource_params: NeuronResourceParams
     link28th_params: Link28thParams
     learning_params: LearningParams
@@ -315,7 +348,8 @@ class Gene:
     @classmethod
     def new(cls, genesis_params: GenesisParams) -> "Gene":
         return cls(
-            signature_map=neuron_signature_gen(genesis_params.signature_params).astype(np.float16),
+            signature_pre_map=neuron_signature_gen(genesis_params.signature_pre_params).astype(np.float16),
+            signature_post_map=neuron_signature_gen(genesis_params.signature_post_params).astype(np.float16),
             dopamine_map=dopamine_gen(genesis_params.dopamine_params).astype(np.float16),
             sleep_map=sleep_gen(genesis_params.sleep_params).astype(np.float16),
             inhib_map=inhib_gen(genesis_params.inhib_params).astype(np.int8),
@@ -323,6 +357,17 @@ class Gene:
             link28th_params=genesis_params.link28th_params,
             learning_params=genesis_params.learning_params
         )
+
+    def __post_init__(self):
+        hints = get_type_hints(self.__class__, include_extras=True)
+        for f in fields(self):
+            hint = hints[f.name]
+            if hasattr(hint, "__metadata__"):
+                meta = hint.__metadata__
+                checkable_meta = next((m for m in meta if isinstance(m, Checkable)), None)
+                if checkable_meta is not None:
+                    checkable_meta.check(getattr(self, f.name))
+
 
 genesis_params = GenesisParams.new()
 gene = Gene.new(genesis_params)
