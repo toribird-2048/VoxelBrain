@@ -1,8 +1,9 @@
 import numpy as np
 from jaxtyping import Float64, Float16, Int8
-from dataclasses import dataclass, field, MISSING, fields
+from dataclasses import dataclass, field, fields
 import vnoise #type: ignore
 from typing import Annotated, get_type_hints, Protocol, runtime_checkable, Any
+import slangpy as spy
 
 
 @runtime_checkable
@@ -215,7 +216,7 @@ class InhibParams:
 
 @auto_ranged
 @dataclass(frozen=True, slots=True)
-class Link28thParams:
+class Link27thParams:
     multiplier: Annotated[int, R(0, 511, odd=True)]
     bias: Annotated[int, R(0, 511)]
 
@@ -272,15 +273,15 @@ def perlin_gen(perlin_params: PerlinParams) -> Float64[np.ndarray, "Nz Ny Nx"]:
     noise = vn.noise3(x, y, z, grid_mode=False)
     bias = perlin_params.bias
     cutoff = perlin_params.cutoff
-    return np.clip((noise - cutoff) / (1 - cutoff) + bias, 0.0, 1.0).reshape(size, size, size)
+    return np.clip((noise - cutoff) / (1 - cutoff) + bias, -1.0, 1.0).reshape(size, size, size)
 
 
 def dopamine_gen(dopamine_params: DopamineParams) -> Float64[np.ndarray, "Dz Dy Dx"]: # N^3
-    return perlin_gen(dopamine_params)
+    return np.clip(perlin_gen(dopamine_params), 0.0, 1.0)
 
 
 def sleep_gen(sleep_params: SleepParams) -> Float64[np.ndarray, "Slz Sly Slx"]: # N^3
-    return perlin_gen(sleep_params)
+    return np.clip(perlin_gen(sleep_params), 0.0, 1.0)
 
 
 def inhib_gen(inhib_params: InhibParams) -> Int8[np.ndarray, "Iz Iy Ix"]: # (N+2)^3
@@ -309,7 +310,7 @@ class GenesisParams:
     sleep_params: SleepParams
     inhib_params: InhibParams
     resource_params: NeuronResourceParams
-    link28th_params: Link28thParams
+    link27th_params: Link27thParams
     learning_params: LearningParams
 
     @classmethod
@@ -329,7 +330,7 @@ class GenesisParams:
             sleep_params=generate(SleepParams),
             inhib_params=generate(InhibParams),
             resource_params=generate(NeuronResourceParams),
-            link28th_params=generate(Link28thParams),
+            link27th_params=generate(Link27thParams),
             learning_params=generate(LearningParams)
         )
 
@@ -342,7 +343,7 @@ class Gene:
     sleep_map: Annotated[Float16[np.ndarray, "Slz Sly Slx"], Rgene(np.float16(0.0), np.float16(1.0))]
     inhib_map: Annotated[Int8[np.ndarray, "Iz Iy Ix"], NeuronTypeChoiceGene()]
     resource_params: NeuronResourceParams
-    link28th_params: Link28thParams
+    link27th_params: Link27thParams
     learning_params: LearningParams
 
     @classmethod
@@ -354,7 +355,7 @@ class Gene:
             sleep_map=sleep_gen(genesis_params.sleep_params).astype(np.float16),
             inhib_map=inhib_gen(genesis_params.inhib_params).astype(np.int8),
             resource_params=genesis_params.resource_params,
-            link28th_params=genesis_params.link28th_params,
+            link27th_params=genesis_params.link27th_params,
             learning_params=genesis_params.learning_params
         )
 
@@ -371,3 +372,40 @@ class Gene:
 
 genesis_params = GenesisParams.new()
 gene = Gene.new(genesis_params)
+
+
+with open("calcWeights.slang", "r", encoding="utf-8") as f:
+    source_code = f"#define DIM {Config.dim}\n" + f.read()
+
+device = spy.create_device()
+module = device.load_module_from_source("kernel", source_code)
+entry = module.entry_point("main")
+program = device.link_program([module], [entry])
+kernel = device.create_compute_kernel(program)
+
+sig_pre_np = np.ascontiguousarray(gene.signature_pre_map, dtype=np.float16)
+sig_post_np = np.ascontiguousarray(gene.signature_post_map, dtype=np.float16)
+
+out_np = np.zeros(512 * 28, dtype=np.float16)
+
+buf_pre = device.create_buffer(data=sig_pre_np)
+buf_post = device.create_buffer(data=sig_post_np)
+buf_out = device.create_buffer(
+    data=out_np,
+    usage=spy.BufferUsage.unordered_access
+)
+
+kernel.dispatch(
+    thread_count=(Config.N, Config.N, Config.N),
+    signature_pre_map=buf_pre,
+    signature_post_map=buf_post,
+    weight_map_output=buf_out,
+    multiplier=gene.link27th_params.multiplier,
+    bias=gene.link27th_params.bias
+)
+
+weights_raw = buf_out.to_numpy()
+weights = weights_raw.view(np.float16).reshape(512, 28)
+
+
+print("wow")
