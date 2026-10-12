@@ -223,6 +223,7 @@ class Link27thParams:
 
 @dataclass(frozen=True, slots=True)
 class SignatureParams:
+    perlin_w: SignaturePerlinParams
     perlin_x: SignaturePerlinParams
     perlin_y: SignaturePerlinParams
     perlin_z: SignaturePerlinParams
@@ -242,13 +243,14 @@ class LearningParams:
     learning_rate: Annotated[float, R(0.0, 1.0)]
     forget_rate: Annotated[float, R(0.0, 1.0)]
     learning_threshold: Annotated[float, R(0.0, 1.0)]
+    tag_decay: Annotated[float, R(0.7, 0.99)]
 
 
 def update_lattice(current_map: Float64[np.ndarray, "Iz Iy Ix"], inhib_params: InhibParams):
     s = [slice(0, -2), slice(1, -1), slice(2, None)]
 
     neighbors = [
-        current_map[s[dx], s[dy], s[dz]]
+        current_map[s[dz], s[dy], s[dx]]
         for dx in range(3)
         for dy in range(3)
         for dz in range(3)
@@ -294,12 +296,13 @@ def inhib_gen(inhib_params: InhibParams) -> Int8[np.ndarray, "Iz Iy Ix"]: # (N+2
     return sign_map
 
 
-def neuron_signature_gen(signature_params: SignatureParams) -> Float64[np.ndarray, "Siz Siy Six 3"]: # (N+2)^3
+def neuron_signature_gen(signature_params: SignatureParams) -> Float64[np.ndarray, "Siz Siy Six 4"]: # (N+2)^3 * 4
+    noisew = perlin_gen(signature_params.perlin_w)
     noisex = perlin_gen(signature_params.perlin_x)
     noisey = perlin_gen(signature_params.perlin_y)
     noisez = perlin_gen(signature_params.perlin_z)
-    noisexyz = np.stack([noisex, noisey, noisez], axis=-1)
-    return noisexyz
+    noise_wxyz = np.stack([noisew, noisex, noisey, noisez], axis=-1)
+    return noise_wxyz
 
 
 @dataclass(frozen=True, slots=True)
@@ -317,11 +320,13 @@ class GenesisParams:
     def new(cls) -> "GenesisParams":
         return cls(
             signature_pre_params=SignatureParams(
+                perlin_w=generate(SignaturePerlinParams),
                 perlin_x=generate(SignaturePerlinParams),
                 perlin_y=generate(SignaturePerlinParams),
                 perlin_z=generate(SignaturePerlinParams)
             ),
             signature_post_params=SignatureParams(
+                perlin_w=generate(SignaturePerlinParams),
                 perlin_x=generate(SignaturePerlinParams),
                 perlin_y=generate(SignaturePerlinParams),
                 perlin_z=generate(SignaturePerlinParams)
@@ -337,8 +342,8 @@ class GenesisParams:
 
 @dataclass(slots=True)
 class Gene:
-    signature_pre_map: Annotated[Float16[np.ndarray, "Siz Siy Six 3"], Rgene(np.float16(-1.0), np.float16(1.0))]
-    signature_post_map: Annotated[Float16[np.ndarray, "Siz Siy Six 3"], Rgene(np.float16(-1.0), np.float16(1.0))]
+    signature_pre_map: Annotated[Float16[np.ndarray, "Siz Siy Six 4"], Rgene(np.float16(-1.0), np.float16(1.0))]
+    signature_post_map: Annotated[Float16[np.ndarray, "Siz Siy Six 4"], Rgene(np.float16(-1.0), np.float16(1.0))]
     dopamine_map: Annotated[Float16[np.ndarray, "Dz Dy Dx"], Rgene(np.float16(0.0), np.float16(1.0))]
     sleep_map: Annotated[Float16[np.ndarray, "Slz Sly Slx"], Rgene(np.float16(0.0), np.float16(1.0))]
     inhib_map: Annotated[Int8[np.ndarray, "Iz Iy Ix"], NeuronTypeChoiceGene()]

@@ -10,7 +10,7 @@
 #define SHIFT_Z (DIM * 2)
 
 
-uint3 indexToCoord(uint index)
+uint3 indexToCoordN(uint index)
 {
     uint x = (index >> SHIFT_X) & MASK;
     uint y = (index >> SHIFT_Y) & MASK;
@@ -18,17 +18,42 @@ uint3 indexToCoord(uint index)
     return uint3(x, y, z);
 }
 
-uint coordToIndex(uint3 coord)
+uint coordToIndexN(uint3 coord)
 {
     uint index = (coord.z << SHIFT_Z) | (coord.y << SHIFT_Y) | (coord.x << SHIFT_X);
     return index;
 }
 
+uint3 indexToCoordNp2(uint index)
+{
+    uint x = index % (N+2);
+    uint y = (index / (N+2)) % (N+2);
+    uint z = (index / ((N+2) * (N+2))) % (N+2);
+    return uint3(x, y, z);
+}
+
+uint coordToIndexNp2(uint3 coord)
+{
+    uint index = ((N+2) * (N+2)) * coord.z + (N+2) * coord.y + coord.x;
+    return index;
+}
+
+half4 get_sig_pre(StructuredBuffer<half4> sig_pre_map_np2, int3 coord) {
+    uint3 coord_np2 = uint3(coord + 1);
+    return sig_pre_map_np2[coordToIndexNp2(coord_np2)];
+}
+
+half4 get_sig_post(StructuredBuffer<half4> sig_post_map_np2, int3 coord) {
+    uint3 coord_np2 = uint3(coord + 1);
+    return sig_post_map_np2[coordToIndexNp2(coord_np2)];
+}
+
+
 [shader("compute")]
 [numthreads(N, N, N)]
 void main(
-    StructuredBuffer<half3> signature_pre_map,
-    StructuredBuffer<half3> signature_post_map,
+    StructuredBuffer<half4> signature_pre_map_np2,
+    StructuredBuffer<half4> signature_post_map_np2,
     RWStructuredBuffer<half> weight_map_output,
     uint3 groupThreadID: SV_GroupThreadID,
     uint groupIndex: SV_GroupIndex,
@@ -36,10 +61,7 @@ void main(
     uniform uint bias
 )
 {
-    uint3 my_sig_coord = groupThreadID + 1;
-    uint P = N + 2;
-    uint my_sig_index = (P * P) * my_sig_coord.z + P * my_sig_coord.y + my_sig_coord.x;
-    half3 my_post = signature_post_map[my_sig_index];
+    half4 my_post = get_sig_post(signature_post_map_np2, groupThreadID);
     uint base_offset = groupIndex * 28;
     [unroll]
     for (int dz = -1; dz <= 1; dz++)
@@ -51,14 +73,12 @@ void main(
             for (int dx = -1; dx <= 1; dx++)
             {
                 uint weight_index = base_offset + 9 * (dz + 1) + 3 * (dy + 1) + (dx + 1);
-                int3 target_sign_coord = int3(my_sig_coord) + int3(dx, dy, dz);
-                int target_sign_index = (P * P) * target_sign_coord.z + P * target_sign_coord.y + target_sign_coord.x;
-                weight_map_output[weight_index] = saturate(dot(my_post, signature_pre_map[target_sign_index]));
+                int3 target_sign_coord = int3(groupThreadID) + int3(dx, dy, dz);
+                weight_map_output[weight_index] = saturate(0.25h * dot(my_post, get_sig_pre(signature_pre_map_np2, target_sign_coord)));
             }
         }
     }
-    uint3 sign_27th_coord = indexToCoord(groupIndex * multiplier + bias) + 1;
-    uint sign_27th_index = (P * P) * sign_27th_coord.z + P * sign_27th_coord.y + sign_27th_coord.x;
-    weight_map_output[base_offset + 27] = saturate(dot(my_post, signature_pre_map[sign_27th_index]));
+    uint3 sign_27th_coord = indexToCoordN(groupIndex * multiplier + bias);
+    weight_map_output[base_offset + 27] = saturate(0.25h * dot(my_post, get_sig_pre(signature_pre_map_np2, sign_27th_coord)));
 }
 
