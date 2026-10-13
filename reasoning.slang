@@ -10,6 +10,9 @@
 #define SHIFT_Z (DIM * 2)
 
 
+groupshared half outputs_s[N + 2][N + 2][N + 2];
+
+
 uint3 indexToCoordN(uint index)
 {
     uint x = (index >> SHIFT_X) & MASK;
@@ -38,7 +41,25 @@ uint coordToIndexNp2(uint3 coord)
     return index;
 }
 
-groupshared half s_outputs[N + 2][N + 2][N + 2];
+half get_weight(StructuredBuffer<half> weights, int3 center_coord, int3 coord_rel) {
+    uint weight_index = uint(coordToIndexN(center_coord) * 28 + 9 * (coord_rel.z + 1) + 3 * (coord_rel.y + 1) + (coord_rel.x + 1));
+    return weights[weight_index];
+}
+
+half get_weight_27th(StructuredBuffer<half> weights, int3 center_coord) {
+    uint weight_index = uint(coordToIndexN(center_coord) * 28 + 27);
+    return weights[weight_index];
+}
+
+half get_output_s(int3 coord) {
+    uint3 target_coord_np2 = coord + 1;
+    return outputs_s[target_coord_np2.z][target_coord_np2.y][target_coord_np2.x];
+} 
+
+void set_output_s(int3 coord, half val) {
+    uint3 target_coord_np2 = coord + 1;
+    outputs_s[target_coord_np2.z][target_coord_np2.y][target_coord_np2.x] = val;
+}
 
 [shader("compute")]
 [numthreads(N, N, N)]
@@ -62,22 +83,33 @@ void main(
 {
     uint P = N + 2;
 
-    uint3 my_coord = groupThreadID + 1;
-    uint3 my_index = coordToIndexNp2(my_coord);
-    s_outputs[my_coord.z][my_coord.y][my_coord.x] = 0.0h;
+    set_output_s(groupThreadID, 0.0h);
+
+    GroupMemoryBarrierWithGroupSync();
+
+    half R = 1.0h;
+    uint tag = 0;
 
     for (uint i = 0; i <= 100; i++) {
         half net = 0.0h;
-        half rate = 0.0h;
-        half R = 1.0h;
-        uint tag = 0;
         for (int dz = -1; dz <= 1; dz++) {
             for (int dy = -1; dy <= 1; dy++) {
                 for (int dx = -1; dx <= 1; dx++) {
-                    half weight = weights_map[]
-                    net += 
+                    net += get_output_s(groupThreadID + int3(dx, dy, dz)) * get_weight(weights_map, groupThreadID, int3(dx, dy, dz));
                 }
             }
         }
+        uint3 coord_27th = indexToCoordN(groupIndex * link27th_multiplier + link27th_bias);
+        net += get_output_s(coord_27th) * get_weight_27th(weights_map, groupThreadID);
+
+        half output_rate = min(1.0h, resource_base_output * exp2(net * resource_beta));
+
+        GroupMemoryBarrierWithGroupSync();
+
+        set_output_s(groupThreadID, output_rate * R);
+
+        GroupMemoryBarrierWithGroupSync();
+
+        R = saturate(R - output_rate * R + resource_k_refill);
     }
 }
