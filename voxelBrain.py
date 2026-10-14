@@ -4,6 +4,8 @@ from dataclasses import dataclass, field, fields
 import vnoise #type: ignore
 from typing import Annotated, get_type_hints, Protocol, runtime_checkable, Any
 import slangpy as spy
+import dataclasses
+import time
 
 
 @runtime_checkable
@@ -379,38 +381,153 @@ genesis_params = GenesisParams.new()
 gene = Gene.new(genesis_params)
 
 
-with open("calcWeights.slang", "r", encoding="utf-8") as f:
-    source_code = f"#define DIM {Config.dim}\n" + f.read()
-
 device = spy.create_device()
-module = device.load_module_from_source("kernel", source_code)
-entry = module.entry_point("main")
-program = device.link_program([module], [entry])
-kernel = device.create_compute_kernel(program)
 
-sig_pre_np = np.ascontiguousarray(gene.signature_pre_map, dtype=np.float16)
-sig_post_np = np.ascontiguousarray(gene.signature_post_map, dtype=np.float16)
 
-out_np = np.zeros(512 * 28, dtype=np.float16)
 
-buf_pre = device.create_buffer(data=sig_pre_np)
-buf_post = device.create_buffer(data=sig_post_np)
-buf_out = device.create_buffer(
-    data=out_np,
-    usage=spy.BufferUsage.unordered_access
-)
+def dispatch_kernel(device, filename: str, thread_count, params_dict: dict):
+    with open(filename + ".slang", "r", encoding="utf-8") as f:
+        source_code = f"#define DIM {Config.dim}\n" + f.read()
 
-kernel.dispatch(
+    module = device.load_module_from_source("kernel" + filename, source_code)
+    entry = module.entry_point("main")
+    program = device.link_program([module], [entry])
+    kernel = device.create_compute_kernel(program)
+    
+    params_buf_dict = {}
+    
+    for key, value in params_dict.items():
+        if isinstance(value, np.ndarray):
+            data_type: np.dtype = value.dtype
+            val_conti = np.ascontiguousarray(value, dtype=data_type)
+            if "pout" in key:
+                buf_val = device.create_buffer(data=val_conti, usage=spy.BufferUsage.unordered_access)
+            else:
+                buf_val = device.create_buffer(data=val_conti)
+            params_buf_dict[key] = buf_val
+            continue
+        params_buf_dict[key] = value
+    
+    kernel.dispatch(
+        thread_count=thread_count,
+        **params_buf_dict
+        )
+    
+    return params_buf_dict
+
+
+start_time = time.perf_counter()
+
+pout_np = np.zeros(512 * 28, dtype=np.float16)
+
+calc_weight_dict = {
+    "signature_pre_map_np2": gene.signature_pre_map,
+    "signature_post_map_np2": gene.signature_post_map,
+    "weight_map_poutput": pout_np,
+    "multiplier": gene.link27th_params.multiplier,
+    "bias": gene.link27th_params.bias
+}
+
+
+buf_out_dict = dispatch_kernel(
+    device=device,
+    filename="calcWeights",
     thread_count=(Config.N, Config.N, Config.N),
-    signature_pre_map=buf_pre,
-    signature_post_map=buf_post,
-    weight_map_output=buf_out,
-    multiplier=gene.link27th_params.multiplier,
-    bias=gene.link27th_params.bias
+    params_dict=calc_weight_dict
 )
 
-weights_raw = buf_out.to_numpy()
+weights_raw = buf_out_dict["weight_map_poutput"].to_numpy()
 weights = weights_raw.view(np.float16).reshape(512, 28)
 
 
+poutput = np.zeros((Config.N + 2) * (Config.N + 2) * (Config.N + 2), dtype=np.float16)
+
+reasoning_dict = {
+    "dopamine_map": gene.dopamine_map,
+    "sleep_map": gene.sleep_map,
+    "inhib_map": gene.inhib_map,
+    "weights_map": weights,
+    "resource_params": dataclasses.asdict(gene.resource_params),
+    "link27th_params": dataclasses.asdict(gene.link27th_params),
+    "learning_params": dataclasses.asdict(gene.learning_params),
+    "topython_poutput": poutput
+}
+
+buf_out_reasoning = dispatch_kernel(
+    device=device,
+    filename="reasoning",
+    thread_count=(524288*Config.N, Config.N, Config.N),
+    params_dict=reasoning_dict
+)
+
+poutput_raw = buf_out_reasoning["topython_poutput"].to_numpy()
+poutput = poutput_raw.view(np.float16).reshape((Config.N + 2), (Config.N + 2), (Config.N + 2))
+
+
+
+
+
+
+# -------------------------------------------------------------
+# 動作・ヘルスチェック用コード
+# -------------------------------------------------------------
+print("\n" + "=" * 50)
+print("🧠 VoxelBrain ヘルスチェック & 統計レポート")
+print("=" * 50)
+
+# 1. 致命的なエラー（NaN / Inf）の検知
+has_nan = np.isnan(poutput).any()
+has_inf = np.isinf(poutput).any()
+
+if has_nan or has_inf:
+    print(f"❌ [警告] 異常値が検出されました！ NaN: {has_nan}, Inf: {has_inf}")
+else:
+    print("✅ [正常] NaN / Inf は検出されませんでした。")
+
+# 2. 内部ニューロン (N^3) と 膜・外殻 (Np2 - N^3) を分離
+inner = poutput[1:-1, 1:-1, 1:-1]
+
+# 膜マスクを作成して膜領域を抽出
+membrane_mask = np.ones_like(poutput, dtype=bool)
+membrane_mask[1:-1, 1:-1, 1:-1] = False
+membrane = poutput[membrane_mask]
+
+# 3. 統計サマリー
+print("\n--- 📊 統計情報 ---")
+print(f"【全体 (N+2)^3】")
+print(f"  Min : {poutput.min():.4f} | Max : {poutput.max():.4f} | Mean: {poutput.mean():.4f} | Std: {poutput.std():.4f}")
+
+print(f"\n【内部ニューロン (N^3) - 実質的な発火結果】")
+print(f"  Min : {inner.min():.4f} | Max : {inner.max():.4f} | Mean: {inner.mean():.4f} | Std: {inner.std():.4f}")
+active_neurons = np.count_nonzero(inner > 0.01)
+total_inner = inner.size
+print(f"  発火ニューロン数 (>0.01): {active_neurons} / {total_inner} ({active_neurons / total_inner * 100:.1f}%)")
+
+print(f"\n【膜（外殻領域）- 外部環境・センサ入力】")
+print(f"  Min : {membrane.min():.4f} | Max : {membrane.max():.4f} | Mean: {membrane.mean():.4f}")
+
+# 4. 中央スライス（断面図）の簡易プレビュー
+print("\n--- 🔍 中央断面スライス (Z = N/2) ---")
+mid_z = (Config.N + 2) // 2
+slice_2d = poutput[mid_z, :, :]
+# 数値を 0~9 の文字（またはアスキー）で簡易ヒートマップ表示
+chars = " .:-=+*#%@"
+heat_map = ""
+for row in slice_2d:
+    line = "".join(chars[int(np.clip(val, 0.0, 1.0) * (len(chars) - 1))] for val in row)
+    heat_map += f"  [{line}]\n"
+print(heat_map)
+print("=" * 50)
+
+
+end_time = time.perf_counter()
+elapsed_time = end_time - start_time
+
+print(f"処理時間: {elapsed_time:.6f} 秒")
+
+
+
 print("wow")
+
+
+

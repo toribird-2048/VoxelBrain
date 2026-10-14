@@ -82,6 +82,24 @@ void merge_outputs_membrane(uint index_np2h2_x) {
     outputs_s[index1_np2h2.x][index1_np2h2.y] = half(uint(is_internal1)) * outputs_s[index1_np2h2.x][index1_np2h2.y] + half(uint(!is_internal1)) * membraneNp2[index1_np2h2.x][index1_np2h2.y];
 }
 
+struct ResourceParams {
+    half base_output;
+    half beta;
+    half k_refill;
+}
+
+struct Link27thParams {
+    uint multiplier;
+    uint bias;
+}
+
+struct LearningParams {
+    half learning_rate;
+    half forget_rate;
+    half learning_threshold;
+    half tag_decay;
+}
+
 [shader("compute")]
 [numthreads(N, N, N)]
 void main(
@@ -91,15 +109,10 @@ void main(
     StructuredBuffer<half> sleep_map,
     StructuredBuffer<int> inhib_map,
     StructuredBuffer<half> weights_map,
-    uniform half resource_base_output,
-    uniform half resource_beta,
-    uniform half resource_k_refill,
-    uniform uint link27th_multiplier,
-    uniform uint link27th_bias,
-    uniform half learning_learning_rate,
-    uniform half learning_forget_rate,
-    uniform half learning_learning_threshold,
-    uniform half learning_tag_decay,
+    uniform ResourceParams resource_params,
+    uniform Link27thParams link27th_params,
+    uniform LearningParams learning_params,
+    RWStructuredBuffer<half2> topython_poutput
 )
 {
     half R = 1.0h;
@@ -113,7 +126,7 @@ void main(
     GroupMemoryBarrierWithGroupSync();
 
     for (uint i = 0; i <= 100; i++) {
-        half net = 0.0h;
+        half net = 0.5h;
         for (uint idx_np2h2 = groupIndex; idx_np2h2 < TOTAL_np2h2; idx_np2h2 += N * N * N) {
             merge_outputs_membrane(idx_np2h2);
         }
@@ -124,10 +137,10 @@ void main(
                 }
             }
         }
-        uint3 coord_27th = indexToCoordN(groupIndex * link27th_multiplier + link27th_bias);
+        uint3 coord_27th = indexToCoordN(groupIndex * link27th_params.multiplier + link27th_params.bias);
         net += get_output_s(coord_27th) * get_weight_27th(weights_map, groupThreadID);
 
-        half output_rate = min(1.0h, resource_base_output * exp2(net * resource_beta));
+        half output_rate = min(1.0h, resource_params.base_output * exp2(net * resource_params.beta));
 
         GroupMemoryBarrierWithGroupSync();
 
@@ -135,6 +148,9 @@ void main(
 
         GroupMemoryBarrierWithGroupSync();
 
-        R = saturate(R - output_rate * R + resource_k_refill);
+        R = saturate(R - output_rate * R + resource_params.k_refill);
+
+        for (uint idx_np2h2 = groupIndex; idx_np2h2 < TOTAL_np2h2; idx_np2h2 += N * N * N)
+            topython_poutput[idx_np2h2] = outputs_s[idx_np2h2];
     }
 }

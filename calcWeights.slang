@@ -73,7 +73,7 @@ uint set_weight_27th(RWStructuredBuffer<half> weights, int3 center_coord, half v
 void main(
     StructuredBuffer<half4> signature_pre_map_np2,
     StructuredBuffer<half4> signature_post_map_np2,
-    RWStructuredBuffer<half> weight_map_output,
+    RWStructuredBuffer<half> weight_map_poutput,
     uint3 groupThreadID: SV_GroupThreadID,
     uint groupIndex: SV_GroupIndex,
     uniform uint multiplier,
@@ -93,12 +93,12 @@ void main(
                 int3 target_sig_coord = int3(groupThreadID) + int3(dx, dy, dz);
                 half4 target_sig_pre = get_sig_pre(signature_pre_map_np2, target_sig_coord);
                 half val = saturate(0.25h * dot(my_post, target_sig_pre));
-                set_weight(weight_map_output, groupThreadID, int3(dx, dy, dz), val);
+                set_weight(weight_map_poutput, groupThreadID, int3(dx, dy, dz), val);
             }
         }
     }
     uint3 sig_27th_coord = indexToCoordN(groupIndex * multiplier + bias);
     half4 sig_27th_pre = get_sig_pre(signature_pre_map_np2, sig_27th_coord);
         half val_27th = saturate(0.25h * dot(my_post, sig_27th_pre));
-    set_weight_27th(weight_map_output, groupThreadID, val_27th);
+    set_weight_27th(weight_map_poutput, groupThreadID, val_27th);
 }
