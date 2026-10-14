@@ -9,8 +9,8 @@
 #define SHIFT_Y (DIM)
 #define SHIFT_Z (DIM * 2)
 
-
-groupshared half outputs_s[N + 2][N + 2][N + 2];
+groupshared half2 outputs_s[(N + 2) * (N + 2) * (N + 2) >> 1];
+globallycoherent RWStructuredBuffer<half2> membraneNp2;
 
 
 uint3 indexToCoordN(uint index)
@@ -53,12 +53,33 @@ half get_weight_27th(StructuredBuffer<half> weights, int3 center_coord) {
 
 half get_output_s(int3 coord) {
     uint3 target_coord_np2 = coord + 1;
-    return outputs_s[target_coord_np2.z][target_coord_np2.y][target_coord_np2.x];
+    uint index = coordToIndexNp2(target_coord_np2);
+    return outputs_s[index >> 1][index & 1];
 } 
 
 void set_output_s(int3 coord, half val) {
     uint3 target_coord_np2 = coord + 1;
-    outputs_s[target_coord_np2.z][target_coord_np2.y][target_coord_np2.x] = val;
+    uint index = coordToIndexNp2(target_coord_np2);
+    outputs_s[index >> 1][index & 1] = val;
+}
+
+uint3 idxNp2h2_to_coordNp2(uint2 index_np2h2) {
+    uint index_np2 = index_np2h2.x << 1 | index_np2h2.y;
+    return indexToCoordNp2(index_np2);
+}
+
+bool is_internal(uint2 index_np2h2) {
+    uint3 coord_np2 = idxNp2h2_to_coordNp2(index_np2h2);
+    return ((((coord_np2.x - 1) | (coord_np2.y - 1) | (coord_np2.z - 1)) & ~MASK) == 0);
+}
+
+void merge_outputs_membrane(uint index_np2h2_x) {
+    uint2 index0_np2h2 = uint2(index_np2h2_x, 0);
+    uint2 index1_np2h2 = uint2(index_np2h2_x, 1);
+    bool is_internal0 = is_internal(index0_np2h2);
+    bool is_internal1 = is_internal(index1_np2h2);
+    outputs_s[index0_np2h2.x][index0_np2h2.y] = half(uint(is_internal0)) * outputs_s[index0_np2h2.x][index0_np2h2.y] + half(uint(!is_internal0)) * membraneNp2[index0_np2h2.x][index0_np2h2.y];
+    outputs_s[index1_np2h2.x][index1_np2h2.y] = half(uint(is_internal1)) * outputs_s[index1_np2h2.x][index1_np2h2.y] + half(uint(!is_internal1)) * membraneNp2[index1_np2h2.x][index1_np2h2.y];
 }
 
 [shader("compute")]
@@ -81,17 +102,21 @@ void main(
     uniform half learning_tag_decay,
 )
 {
-    uint P = N + 2;
+    half R = 1.0h;
+    uint tag = 0;
+    uint TOTAL_np2h2 = (N + 2) * (N + 2) * (N + 2) >> 1;
 
-    set_output_s(groupThreadID, 0.0h);
+    for (uint idx_np2h2 = groupIndex; idx_np2h2 < TOTAL_np2h2; idx_np2h2 += N * N * N) {
+        outputs_s[idx_np2h2] = half2(0.0h, 0.0h);
+    }
 
     GroupMemoryBarrierWithGroupSync();
 
-    half R = 1.0h;
-    uint tag = 0;
-
     for (uint i = 0; i <= 100; i++) {
         half net = 0.0h;
+        for (uint idx_np2h2 = groupIndex; idx_np2h2 < TOTAL_np2h2; idx_np2h2 += N * N * N) {
+            merge_outputs_membrane(idx_np2h2);
+        }
         for (int dz = -1; dz <= 1; dz++) {
             for (int dy = -1; dy <= 1; dy++) {
                 for (int dx = -1; dx <= 1; dx++) {
