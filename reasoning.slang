@@ -10,6 +10,10 @@
 #define SHIFT_Z (DIM * 2)
 
 groupshared half2 outputs_s[(N + 2) * (N + 2) * (N + 2) >> 1];
+groupshared half dopamine_map[N * N * N];
+groupshared half sleep_map[N * N * N];
+groupshared int inhib_map[N * N * N];
+groupshared half weights[N * N * N];
 globallycoherent RWStructuredBuffer<half2> membraneNp2;
 
 
@@ -74,12 +78,14 @@ bool is_internal(uint2 index_np2h2) {
 }
 
 void merge_outputs_membrane(uint index_np2h2_x) {
-    uint2 index0_np2h2 = uint2(index_np2h2_x, 0);
-    uint2 index1_np2h2 = uint2(index_np2h2_x, 1);
-    bool is_internal0 = is_internal(index0_np2h2);
-    bool is_internal1 = is_internal(index1_np2h2);
-    outputs_s[index0_np2h2.x][index0_np2h2.y] = half(uint(is_internal0)) * outputs_s[index0_np2h2.x][index0_np2h2.y] + half(uint(!is_internal0)) * membraneNp2[index0_np2h2.x][index0_np2h2.y];
-    outputs_s[index1_np2h2.x][index1_np2h2.y] = half(uint(is_internal1)) * outputs_s[index1_np2h2.x][index1_np2h2.y] + half(uint(!is_internal1)) * membraneNp2[index1_np2h2.x][index1_np2h2.y];
+    half2 current_out = outputs_s[index_np2h2_x];
+    half2 memb_val = membraneNp2[index_np2h2_x];
+    bool is_internal0 = is_internal(uint2(index_np2h2_x, 0));
+    bool is_internal1 = is_internal(uint2(index_np2h2_x, 1));
+    outputs_s[index_np2h2_x] = half2(
+        is_internal0 ? current_out.x : memb_val.x,
+        is_internal1 ? current_out.y : memb_val.y
+    );
 }
 
 struct ResourceParams {
@@ -105,28 +111,34 @@ struct LearningParams {
 void main(
     uint3 groupThreadID: SV_GroupThreadID,
     uint groupIndex: SV_GroupIndex,
-    StructuredBuffer<half> dopamine_map,
-    StructuredBuffer<half> sleep_map,
-    StructuredBuffer<int> inhib_map,
-    StructuredBuffer<half> weights_map,
+    uint3 groupID: SV_GroupID,
+    StructuredBuffer<half> dopamine_map_all,
+    StructuredBuffer<half> sleep_map_all,
+    StructuredBuffer<int> inhib_map_all,
+    StructuredBuffer<half> weights_map_all,
+    RWStructuredBuffer<half2> global_poutputs,
     uniform ResourceParams resource_params,
     uniform Link27thParams link27th_params,
     uniform LearningParams learning_params,
-    RWStructuredBuffer<half2> topython_poutput
 )
 {
+    dopamine_map[groupIndex] = dopamine_map_all[N * N * N * groupID.x + groupIndex];
+    sleep_map[groupIndex] = sleep_map_all[N * N * N * groupID.x + groupIndex];
+    inhib_map[groupIndex] = inhib_map_all[N * N * N * groupID.x + groupIndex];
+    weights[groupIndex] = weights_map_all[N * N * N * groupID.x + groupIndex];
+    
     half R = 1.0h;
     uint tag = 0;
     uint TOTAL_np2h2 = (N + 2) * (N + 2) * (N + 2) >> 1;
 
     for (uint idx_np2h2 = groupIndex; idx_np2h2 < TOTAL_np2h2; idx_np2h2 += N * N * N) {
-        outputs_s[idx_np2h2] = half2(0.0h, 0.0h);
+        outputs_s[idx_np2h2] = half2(0.5h, 0.5h);
     }
 
     GroupMemoryBarrierWithGroupSync();
 
     for (uint i = 0; i <= 100; i++) {
-        half net = 0.5h;
+        half net = 0.0h;
         for (uint idx_np2h2 = groupIndex; idx_np2h2 < TOTAL_np2h2; idx_np2h2 += N * N * N) {
             merge_outputs_membrane(idx_np2h2);
         }
@@ -150,7 +162,8 @@ void main(
 
         R = saturate(R - output_rate * R + resource_params.k_refill);
 
-        for (uint idx_np2h2 = groupIndex; idx_np2h2 < TOTAL_np2h2; idx_np2h2 += N * N * N)
-            topython_poutput[idx_np2h2] = outputs_s[idx_np2h2];
+        for (uint idx_np2h2 = groupIndex; idx_np2h2 < TOTAL_np2h2; idx_np2h2 += (N+2) * (N+2) * (N+2) >> 1)
+            global_poutputs[TOTAL_np2h2 * groupIndex + idx_np2h2] = outputs_s[idx_np2h2];
+
     }
 }

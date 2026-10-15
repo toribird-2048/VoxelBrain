@@ -439,91 +439,159 @@ buf_out_dict = dispatch_kernel(
 weights_raw = buf_out_dict["weight_map_poutput"].to_numpy()
 weights = weights_raw.view(np.float16).reshape(512, 28)
 
+m: int = 1 << 17
 
-poutput = np.zeros((Config.N + 2) * (Config.N + 2) * (Config.N + 2), dtype=np.float16)
+global_poutputs = np.zeros((m, Config.N, Config.N, Config.N), dtype=np.float16)
 
 reasoning_dict = {
     "dopamine_map": gene.dopamine_map,
     "sleep_map": gene.sleep_map,
     "inhib_map": gene.inhib_map,
     "weights_map": weights,
+    "global_poutputs": global_poutputs,
     "resource_params": dataclasses.asdict(gene.resource_params),
     "link27th_params": dataclasses.asdict(gene.link27th_params),
     "learning_params": dataclasses.asdict(gene.learning_params),
-    "topython_poutput": poutput
 }
 
 buf_out_reasoning = dispatch_kernel(
     device=device,
     filename="reasoning",
-    thread_count=(524288*Config.N, Config.N, Config.N),
+    thread_count=(m*Config.N, Config.N, Config.N),
     params_dict=reasoning_dict
 )
 
-poutput_raw = buf_out_reasoning["topython_poutput"].to_numpy()
-poutput = poutput_raw.view(np.float16).reshape((Config.N + 2), (Config.N + 2), (Config.N + 2))
+poutput_raw = buf_out_reasoning["global_poutputs"].to_numpy()
+poutput = poutput_raw.view(np.float16).reshape(m, Config.N, Config.N, Config.N)
 
-
-
-
-
-
-# -------------------------------------------------------------
-# 動作・ヘルスチェック用コード
-# -------------------------------------------------------------
-print("\n" + "=" * 50)
-print("🧠 VoxelBrain ヘルスチェック & 統計レポート")
-print("=" * 50)
-
-# 1. 致命的なエラー（NaN / Inf）の検知
-has_nan = np.isnan(poutput).any()
-has_inf = np.isinf(poutput).any()
-
-if has_nan or has_inf:
-    print(f"❌ [警告] 異常値が検出されました！ NaN: {has_nan}, Inf: {has_inf}")
-else:
-    print("✅ [正常] NaN / Inf は検出されませんでした。")
-
-# 2. 内部ニューロン (N^3) と 膜・外殻 (Np2 - N^3) を分離
-inner = poutput[1:-1, 1:-1, 1:-1]
-
-# 膜マスクを作成して膜領域を抽出
-membrane_mask = np.ones_like(poutput, dtype=bool)
-membrane_mask[1:-1, 1:-1, 1:-1] = False
-membrane = poutput[membrane_mask]
-
-# 3. 統計サマリー
-print("\n--- 📊 統計情報 ---")
-print(f"【全体 (N+2)^3】")
-print(f"  Min : {poutput.min():.4f} | Max : {poutput.max():.4f} | Mean: {poutput.mean():.4f} | Std: {poutput.std():.4f}")
-
-print(f"\n【内部ニューロン (N^3) - 実質的な発火結果】")
-print(f"  Min : {inner.min():.4f} | Max : {inner.max():.4f} | Mean: {inner.mean():.4f} | Std: {inner.std():.4f}")
-active_neurons = np.count_nonzero(inner > 0.01)
-total_inner = inner.size
-print(f"  発火ニューロン数 (>0.01): {active_neurons} / {total_inner} ({active_neurons / total_inner * 100:.1f}%)")
-
-print(f"\n【膜（外殻領域）- 外部環境・センサ入力】")
-print(f"  Min : {membrane.min():.4f} | Max : {membrane.max():.4f} | Mean: {membrane.mean():.4f}")
-
-# 4. 中央スライス（断面図）の簡易プレビュー
-print("\n--- 🔍 中央断面スライス (Z = N/2) ---")
-mid_z = (Config.N + 2) // 2
-slice_2d = poutput[mid_z, :, :]
-# 数値を 0~9 の文字（またはアスキー）で簡易ヒートマップ表示
-chars = " .:-=+*#%@"
-heat_map = ""
-for row in slice_2d:
-    line = "".join(chars[int(np.clip(val, 0.0, 1.0) * (len(chars) - 1))] for val in row)
-    heat_map += f"  [{line}]\n"
-print(heat_map)
-print("=" * 50)
 
 
 end_time = time.perf_counter()
 elapsed_time = end_time - start_time
 
 print(f"処理時間: {elapsed_time:.6f} 秒")
+
+# -------------------------------------------------------------
+# 動作・ヘルスチェック & バリデーションレポート
+# -------------------------------------------------------------
+def validate_tensor(name: str, arr: np.ndarray, expected_shape: tuple, expected_range: tuple[float, float] | None = None):
+    """テンソルの基本構造と数値妥当性をチェックするヘルパー"""
+    print(f"\n--- [{name}] チェック ---")
+    is_valid = True
+
+    # 1. Shape & Dtype
+    if arr.shape != expected_shape:
+        print(f"❌ [Shape不一致] 期待値: {expected_shape}, 実際: {arr.shape}")
+        is_valid = False
+    else:
+        print(f"✅ Shape: {arr.shape} ({arr.dtype})")
+
+    # 2. NaN / Inf
+    has_nan = np.isnan(arr).any()
+    has_inf = np.isinf(arr).any()
+    if has_nan or has_inf:
+        print(f"❌ [異常値検出] NaN: {has_nan}, Inf: {has_inf}")
+        is_valid = False
+    else:
+        print("✅ NaN / Inf: なし")
+
+    # 3. 全ゼロ（カーネル未書き込み/不発）チェック
+    is_all_zero = not np.any(arr)
+    if is_all_zero:
+        print("⚠️ [警告] 配列が完全にゼロです（カーネル処理が実行されていない可能性があります）")
+        is_valid = False
+
+    # 4. 統計量 & 値域
+    min_val, max_val = float(np.min(arr)), float(np.max(arr))
+    mean_val, std_val = float(np.mean(arr)), float(np.std(arr))
+    print(f"   統計量: min={min_val:.4f}, max={max_val:.4f}, mean={mean_val:.4f}, std={std_val:.4f}")
+
+    if expected_range is not None:
+        low, high = expected_range
+        # float16 の微小な丸め誤差を許容
+        eps = 1e-3
+        out_of_bounds = ((arr < low - eps) | (arr > high + eps)).sum()
+        if out_of_bounds > 0:
+            print(f"❌ [値域違反] 想定範囲 [{low}, {high}] を外れた要素数: {out_of_bounds} ({out_of_bounds / arr.size * 100:.2f}%)")
+            is_valid = False
+        else:
+            print(f"✅ 値域: 想定範囲 [{low}, {high}] 内")
+
+    return is_valid
+
+
+print("\n" + "=" * 60)
+print("🧠 VoxelBrain ヘルスチェック & 統計バリデーション")
+print("=" * 60)
+
+# =============================================================
+# 1. weights の正当性チェック
+# =============================================================
+expected_weights_shape = (512, 28)
+weights_valid = validate_tensor(
+    name="weights (calcWeights 出力)",
+    arr=weights,
+    expected_shape=expected_weights_shape,
+    expected_range=(-1.0, 1.0)  # シグネチャ内積等の想定値域に合わせて調整
+)
+
+# 結合が有効に生成されているか（非ゼロ結合の割合）
+active_weights_ratio = (np.abs(weights) > 1e-4).mean() * 100
+print(f"   シナプス活性結合率: {active_weights_ratio:.2f}%")
+
+
+# =============================================================
+# 2. global_poutputs (推論出力) の正当性チェック
+# =============================================================
+expected_poutput_shape = (m, Config.N, Config.N, Config.N)
+poutput_valid = validate_tensor(
+    name="global_poutputs (reasoning 出力)",
+    arr=poutput,
+    expected_shape=expected_poutput_shape,
+    expected_range=(0.0, 1.0)  # 通常ニューロン出力は [0, 1] または [-1, 1]
+)
+
+# =============================================================
+# 3. ニューロン活動のダイナミクス・局所領域チェック
+# =============================================================
+print("\n--- [ニューロン発火・空間活動性チェック] ---")
+
+# (A) 死亡ニューロン（全ステップで一度も発火していないセル）の検出
+# 形状: (Config.N, Config.N, Config.N)
+cell_activity = np.abs(poutput).max(axis=0)
+dead_cells_count = np.sum(cell_activity < 1e-4)
+total_cells = Config.N ** 3
+dead_cell_ratio = (dead_cells_count / total_cells) * 100
+
+if dead_cells_count == total_cells:
+    print("❌ [重大な警告] すべてのニューロンが静止（全ステップ出力ゼロ）しています！")
+elif dead_cells_count > 0:
+    print(f"⚠️ 沈黙ニューロン: {dead_cells_count}/{total_cells} 個 ({dead_cell_ratio:.1f}%)")
+else:
+    print("✅ 全ニューロンにおいて活動が確認されました。")
+
+# (B) 内部コア (N-2)^3 と 境界シェル (表面) の分離チェック
+# ※ poutput は 4次元 (m, N, N, N) なので空間3軸 (axis 1, 2, 3) をスライスします
+if Config.N > 2:
+    inner_core = poutput[:, 1:-1, 1:-1, 1:-1]
+    
+    # 表面（シェル）マスクの作成
+    shell_mask = np.ones((Config.N, Config.N, Config.N), dtype=bool)
+    shell_mask[1:-1, 1:-1, 1:-1] = False
+    shell_outputs = poutput[:, shell_mask]
+
+    print(f"   コア領域 (中央 {Config.N-2}^3)   : 平均発火 {inner_core.mean():.4f}, 最大 {inner_core.max():.4f}")
+    print(f"   シェル領域 (外枠 {total_cells - (Config.N-2)**3}セル): 平均発火 {shell_outputs.mean():.4f}, 最大 {shell_outputs.max():.4f}")
+
+
+
+print("\n" + "=" * 60)
+if weights_valid and poutput_valid and dead_cells_count < total_cells:
+    print(f"🎉 【判定: 合格】 全てのテンソルが正常に生成・計算されています。 (所要時間: {elapsed_time:.4f}秒)")
+else:
+    print(f"🚨 【判定: 警告あり】 上記のエラー・警告項目を確認してください。 (所要時間: {elapsed_time:.4f}秒)")
+print("=" * 60)
+
 
 
 

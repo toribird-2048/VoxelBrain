@@ -9,7 +9,6 @@
 #define SHIFT_Y (DIM)
 #define SHIFT_Z (DIM * 2)
 
-[ForceInline]
 uint3 indexToCoordN(uint index)
 {
     uint x = (index >> SHIFT_X) & MASK;
@@ -18,14 +17,12 @@ uint3 indexToCoordN(uint index)
     return uint3(x, y, z);
 }
 
-[ForceInline]
 uint coordToIndexN(uint3 coord)
 {
     uint index = (coord.z << SHIFT_Z) | (coord.y << SHIFT_Y) | (coord.x << SHIFT_X);
     return index;
 }
 
-[ForceInline]
 uint3 indexToCoordNp2(uint index)
 {
     uint x = index % (N+2);
@@ -34,33 +31,28 @@ uint3 indexToCoordNp2(uint index)
     return uint3(x, y, z);
 }
 
-[ForceInline]
 uint coordToIndexNp2(uint3 coord)
 {
     uint index = ((N+2) * (N+2)) * coord.z + (N+2) * coord.y + coord.x;
     return index;
 }
 
-[ForceInline]
 half4 get_sig_pre(StructuredBuffer<half4> sig_pre_map_np2, int3 coord) {
     uint3 coord_np2 = uint3(coord + 1);
     return sig_pre_map_np2[coordToIndexNp2(coord_np2)];
 }
 
-[ForceInline]
 half4 get_sig_post(StructuredBuffer<half4> sig_post_map_np2, int3 coord) {
     uint3 coord_np2 = uint3(coord + 1);
     return sig_post_map_np2[coordToIndexNp2(coord_np2)];
 }
 
-[ForceInline]
 uint set_weight(RWStructuredBuffer<half> weights, int3 center_coord, int3 coord_rel, half val) {
     uint weight_index = uint(coordToIndexN(center_coord) * 28 + 9 * (coord_rel.z + 1) + 3 * (coord_rel.y + 1) + (coord_rel.x + 1));
     weights[weight_index] = val;
     return 0;
 }
 
-[ForceInline]
 uint set_weight_27th(RWStructuredBuffer<half> weights, int3 center_coord, half val) {
     uint weight_index = uint(coordToIndexN(center_coord) * 28 + 27);
     weights[weight_index] = val;
