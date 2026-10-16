@@ -7,11 +7,13 @@ import slangpy as spy
 import dataclasses
 import time
 
-rng = np.random.default_rng(seed=42)
 
 @runtime_checkable
 class Generatable(Protocol):
-    def generate(self) -> Any:
+    val_type: type
+    val_min: float | int
+    val_max: float | int
+    def generate(self, count: int, seed: int) -> Any:
         ...
 
 @dataclass(frozen=True, slots=True)
@@ -33,40 +35,93 @@ class R:
                             """)
         if self.val_type is int and self.log == True:
             raise TypeError()
-    
+        
+    def generate(self, count: int, seed: int) -> np.ndarray:
+        rng = np.random.default_rng(seed=seed)
+        if self.val_type == float:
+            if self.log == True:
+                return np.exp(rng.uniform(np.log(self.val_min), np.log(self.val_max), size=count))
+            return rng.uniform(self.val_min, self.val_max, size=count)
+        if self.val_type == int:
+            if self.odd == True:
+                k_min = (int(self.val_min) + 1) // 2 if self.val_min % 2 == 0 else int(self.val_min) // 2
+                k_max = (int(self.val_max) - 1) // 2
+                return 2 * rng.integers(k_min, k_max + 1, size=count) + 1
+            return rng.integers(self.val_min, self.val_max, size=count, endpoint=True)
+        raise ValueError("Unexpected Error")
     
 @dataclass(frozen=True, slots=True)
 class R4:
     val_type: type
-    min: float | int
-    max: float | int
+    val_min: float | int
+    val_max: float | int
     odd: bool = False
     log: bool = False
+    
+    def __post_init__(self):
+            if type(self.val_min) != self.val_type or type(self.val_max) != self.val_type:
+                raise TypeError(f"""
+                                val_minとval_maxはval_typeと型が同じでなければなりませんが、
+                                val_min: {type(self.val_min)} 
+                                val_max: {type(self.val_max)}
+                                val_type: {self.val_type}
+                                でした。
+                                """)
+            if self.val_type is int and self.log == True:
+                raise TypeError()
+    
+    def generate(self, count: int, seed: int) -> np.ndarray:
+        rng = np.random.default_rng(seed=seed)
+        if self.val_type == float:
+            if self.log == True:
+                return np.exp(rng.uniform(np.log(self.val_min), np.log(self.val_max), size=(count, 4)))
+            return rng.uniform(self.val_min, self.val_max, size=(count, 4))
+        if self.val_type == int:
+            if self.odd == True:
+                k_min = (int(self.val_min) + 1) // 2 if self.val_min % 2 == 0 else int(self.val_min) // 2
+                k_max = (int(self.val_max) - 1) // 2
+                return 2 * rng.integers(k_min, k_max + 1, size=(count, 4)) + 1
+            return rng.integers(self.val_min, self.val_max, size=(count, 4))
+        raise ValueError("Unexpected Error")
 
 class Config:
     dim: int = 3
     N: int = 1 << dim
+    P: int = N + 2
     shift_x: int = 0
     shift_y: int = dim
     shift_z: int = dim * 2
     total_cells: int = 1 << (dim * 3)
     mask: int = N - 1
-
-
-class DopSleepParams:
-    seed = R(int, 0, 1<<20)
-    bias = R(float, -0.5, 5.0)
-    freq = R(float, 0.0, 1.0)
-    cutoff = R(float, 0.0, 0.95)
     
+    m: int = 1 << 17
+    
+    class Seed:
+        sigpre: int = 1;
+        sigpost: int = 2;
+        dop: int = 3;
+        sleep: int = 4;
+        inhib: int = 5;
+        link: int = 6;
+        res: int = 7;
+        learn: int = 9;
 
-class SigParams:
+
+class SigRange:
     seeds = R4(int, 0, 1<<20)
-    biases = R4(float, -0.5, 5.0)
+    biases = R4(float, -0.5, 0.5)
     freqs = R4(float, 0.0, 1.0)
     cutoffs = R4(float, 0.0, 0.95)
 
-class InhibParams:
+
+class DopSleepRange:
+    seed = R(int, 0, 1<<20)
+    bias = R(float, -0.5, 0.5)
+    freq = R(float, 0.0, 1.0)
+    cutoff = R(float, 0.0, 0.95)
+
+
+class InhibRange:
     seed = R(int, 0, 1<<20)
     speed = R(float, 1.0, 2.0)
     cutoff = R(float, 0.0, 1.5)
@@ -75,97 +130,86 @@ class InhibParams:
     threshold = R(float, 0.0, 1.0)
 
 
-class Link27thParams:
+class Link27thRange:
     multiplier = R(int, 0, 511, odd=True)
     bias = R(int, 0, 511)
 
 
-class NeuronResourceParams:
+class NeuronResourceRange:
     base_output = R(float, 0.001, 0.05, log=True)
     beta = R(float, 0.2, 1.2)
     k_refill = R(float, 0.02, 0.3)
 
 
-class LearningParams:
+class LearningRange:
     learning_rate = R(float, 0.0, 1.0)
     forget_rate = R(float, 0.0, 1.0)
     learning_threshold = R(float, 0.0, 1.0)
     tag_decay = R(float, 0.7, 0.99)
     
     
-def generate(cls):
+
+
+def generate(cls, seed: int) -> dict["str", np.ndarray]:
+    params_dict = {}
     for key, value in vars(cls).items():
         if not key.startswith("__"):
             if isinstance(value, Generatable):
-                
+                params_dict[key] = value.generate(Config.m, seed)
+    return params_dict
+
+
+
+
 
 
 @dataclass(frozen=True, slots=True)
 class GenesisParams:
-    signature_pre_params: SigParams
-    signature_post_params: SigParams
-    dopamine_params: DopSleepParams
-    sleep_params: DopSleepParams
-    inhib_params: InhibParams
-    resource_params: NeuronResourceParams
-    link27th_params: Link27thParams
-    learning_params: LearningParams
+    signature_pre_params: dict["str", np.ndarray]
+    signature_post_params: dict["str", np.ndarray]
+    dopamine_params: dict["str", np.ndarray]
+    sleep_params: dict["str", np.ndarray]
+    inhib_params: dict["str", np.ndarray]
+    resource_params: dict["str", np.ndarray]
+    link27th_params: dict["str", np.ndarray]
+    learning_params: dict["str", np.ndarray]
 
     @classmethod
     def new(cls) -> "GenesisParams":
         return cls(
-            signature_pre_params=generate(SigParams),
-            signature_post_params=generate(SigParams),
-            dopamine_params=generate(DopSleepParams),
-            sleep_params=generate(DopSleepParams),
-            inhib_params=generate(InhibParams),
-            resource_params=generate(NeuronResourceParams),
-            link27th_params=generate(Link27thParams),
-            learning_params=generate(LearningParams)
+            signature_pre_params=generate(SigRange, Config.Seed.sigpre),
+            signature_post_params=generate(SigRange, Config.Seed.sigpost),
+            dopamine_params=generate(DopSleepRange, Config.Seed.dop),
+            sleep_params=generate(DopSleepRange, Config.Seed.sleep),
+            inhib_params=generate(InhibRange, Config.Seed.inhib),
+            resource_params=generate(NeuronResourceRange, Config.Seed.res),
+            link27th_params=generate(Link27thRange, Config.Seed.link),
+            learning_params=generate(LearningRange, Config.Seed.learn)
         )
-
-
-@dataclass(slots=True)
-class Gene:
-    signature_pre_map: Annotated[Float16[np.ndarray, "Siz Siy Six 4"], Rgene(np.float16(-1.0), np.float16(1.0))]
-    signature_post_map: Annotated[Float16[np.ndarray, "Siz Siy Six 4"], Rgene(np.float16(-1.0), np.float16(1.0))]
-    dopamine_map: Annotated[Float16[np.ndarray, "Dz Dy Dx"], Rgene(np.float16(0.0), np.float16(1.0))]
-    sleep_map: Annotated[Float16[np.ndarray, "Slz Sly Slx"], Rgene(np.float16(0.0), np.float16(1.0))]
-    inhib_map: Annotated[Int8[np.ndarray, "Iz Iy Ix"], NeuronTypeChoiceGene()]
-    resource_params: NeuronResourceParams
-    link27th_params: Link27thParams
-    learning_params: LearningParams
-
-    @classmethod
-    def new(cls, genesis_params: GenesisParams) -> "Gene":
-        return cls(
-            signature_pre_map=neuron_signature_gen(genesis_params.signature_pre_params).astype(np.float16),
-            signature_post_map=neuron_signature_gen(genesis_params.signature_post_params).astype(np.float16),
-            dopamine_map=dopamine_gen(genesis_params.dopamine_params).astype(np.float16),
-            sleep_map=sleep_gen(genesis_params.sleep_params).astype(np.float16),
-            inhib_map=inhib_gen(genesis_params.inhib_params).astype(np.int8),
-            resource_params=genesis_params.resource_params,
-            link27th_params=genesis_params.link27th_params,
-            learning_params=genesis_params.learning_params
-        )
-
-    def __post_init__(self):
-        hints = get_type_hints(self.__class__, include_extras=True)
-        for f in fields(self):
-            hint = hints[f.name]
-            if hasattr(hint, "__metadata__"):
-                meta = hint.__metadata__
-                checkable_meta = next((m for m in meta if isinstance(m, Checkable)), None)
-                if checkable_meta is not None:
-                    checkable_meta.check(getattr(self, f.name))
 
 
 genesis_params = GenesisParams.new()
-gene = Gene.new(genesis_params)
 
 
 device = spy.create_device()
 
+
+def cast_and_buffer(ndarray_dict: dict[str, np.ndarray], device: spy.Device):
+    buf_dict = {}
+    for key, value in ndarray_dict.items():
+        if np.issubdtype(value.dtype, np.floating):
+            target_type = np.float16
+        elif np.issubdtype(value.dtype, np.integer):
+            target_type = np.int32
+        else:
+            raise TypeError("この関数に入れるndarrayはすべてintかfloatでなければいけません。")       
+        val_conti = np.ascontiguousarray(value, dtype=target_type)
+        if "pout" in key:
+            buf_val = device.create_buffer(data=val_conti, usage=spy.BufferUsage.unordered_access)
+        else:
+            buf_val = device.create_buffer(data=val_conti)
+        buf_dict[key] = buf_val
+    return buf_dict
 
 
 def dispatch_kernel(device, filename: str, thread_count, params_dict: dict):
@@ -199,183 +243,111 @@ def dispatch_kernel(device, filename: str, thread_count, params_dict: dict):
     return params_buf_dict
 
 
-start_time = time.perf_counter()
 
-pout_np = np.zeros(512 * 28, dtype=np.float16)
+
+sig_pre_map_np2 = np.zeros(Config.m * Config.P * Config.P * Config.P * 4, dtype=np.half)
+sig_post_map_np2 = np.zeros(Config.m * Config.P * Config.P * Config.P * 4, dtype=np.half)
+dopamine_map = np.zeros(Config.m * Config.N * Config.N * Config.N, dtype=np.half)
+sleep_map = np.zeros(Config.m * Config.N * Config.N * Config.N, dtype=np.half)
+inhib_sign_map = np.zeros(Config.m * Config.N * Config.N * Config.N, dtype=np.half)
+
+
+generation_dict = {
+    "sig_pre_map_np2_pout": sig_pre_map_np2,
+    "sig_post_map_np2_pout": sig_post_map_np2,
+    "dopamine_map_pout": dopamine_map,
+    "sleep_map_pout": sleep_map,
+    "inhib_sign_map_pout": inhib_sign_map,
+    "sig_pre_genes": cast_and_buffer(genesis_params.signature_pre_params, device),
+    "sig_post_genes": cast_and_buffer(genesis_params.signature_post_params, device),
+    "dopamine_genes": cast_and_buffer(genesis_params.dopamine_params, device),
+    "sleep_genes": cast_and_buffer(genesis_params.sleep_params, device),
+    "inhib_genes": cast_and_buffer(genesis_params.inhib_params, device)
+}
+
+start_time_gen = time.perf_counter()
+
+genesis_out_dict = dispatch_kernel(
+    device = device,
+    filename="generation",
+    thread_count=(Config.m * Config.N, Config.N, Config.N),
+    params_dict=generation_dict
+)
+
+
+
+end_time_gen = time.perf_counter()
+elapsed_time_gen = end_time_gen - start_time_gen
+
+print(f"gen処理時間: {elapsed_time_gen:.6f} 秒")
+
+
+start_time_weight = time.perf_counter()
+
+pout_np = np.zeros(Config.m * Config.N * Config.N * Config.N * 28, dtype=np.float16)
+
+
+signature_pre_map = genesis_out_dict["sig_pre_map_np2_pout"]
+signature_post_map = genesis_out_dict["sig_post_map_np2_pout"]
+link27th_multipliers = genesis_params.link27th_params["multiplier"]
+link27th_biases = genesis_params.link27th_params["bias"]
+
 
 calc_weight_dict = {
-    "signature_pre_map_np2": gene.signature_pre_map,
-    "signature_post_map_np2": gene.signature_post_map,
+    "signature_pre_map_np2": signature_pre_map,
+    "signature_post_map_np2": signature_post_map,
     "weight_map_poutput": pout_np,
-    "multiplier": gene.link27th_params.multiplier,
-    "bias": gene.link27th_params.bias
+    "multipliers": link27th_multipliers.astype(np.int32),
+    "biases": link27th_biases.astype(np.int32)
 }
 
 
 buf_out_dict = dispatch_kernel(
     device=device,
     filename="calcWeights",
-    thread_count=(Config.N, Config.N, Config.N),
+    thread_count=(Config.m * Config.N, Config.N, Config.N),
     params_dict=calc_weight_dict
 )
 
-weights_raw = buf_out_dict["weight_map_poutput"].to_numpy()
-weights = weights_raw.view(np.float16).reshape(512, 28)
 
-m: int = 1 << 17
+end_time_weight = time.perf_counter()
+elapsed_time_weight = end_time_weight - start_time_weight
+print(f"weight処理時間: {elapsed_time_weight:.6f} 秒")
 
-global_poutputs = np.zeros((m, Config.N, Config.N, Config.N), dtype=np.float16)
+
+start_time_output = time.perf_counter()
+
+
+global_poutputs = np.zeros((Config.m, Config.P, Config.P, Config.P), dtype=np.float16)
+
+
+dopamine_map = genesis_out_dict["dopamine_map_pout"]
+sleep_map = genesis_out_dict["sleep_map_pout"]
+inhib_map = genesis_out_dict["inhib_sign_map_pout"]
 
 reasoning_dict = {
-    "dopamine_map": gene.dopamine_map,
-    "sleep_map": gene.sleep_map,
-    "inhib_map": gene.inhib_map,
-    "weights_map": weights,
-    "global_poutputs": global_poutputs,
-    "resource_params": dataclasses.asdict(gene.resource_params),
-    "link27th_params": dataclasses.asdict(gene.link27th_params),
-    "learning_params": dataclasses.asdict(gene.learning_params),
+    "dopamine_map_all": dopamine_map,
+    "sleep_map_all": sleep_map,
+    "inhib_map_all": inhib_map,
+    "weights_map_all": buf_out_dict["weight_map_poutput"],
+    "global_poutputs_all": global_poutputs,
+    "resource_params_all": cast_and_buffer(genesis_params.resource_params, device),
+    "link27th_params_all": cast_and_buffer(genesis_params.link27th_params, device),
+    "learning_params_all": cast_and_buffer(genesis_params.learning_params, device)
 }
 
 buf_out_reasoning = dispatch_kernel(
     device=device,
     filename="reasoning",
-    thread_count=(m*Config.N, Config.N, Config.N),
+    thread_count=(Config.m*Config.N, Config.N, Config.N),
     params_dict=reasoning_dict
 )
 
-poutput_raw = buf_out_reasoning["global_poutputs"].to_numpy()
-poutput = poutput_raw.view(np.float16).reshape(m, Config.N, Config.N, Config.N)
 
+end_time_output = time.perf_counter()
+elapsed_time_output = end_time_output - start_time_output
 
-
-end_time = time.perf_counter()
-elapsed_time = end_time - start_time
-
-print(f"処理時間: {elapsed_time:.6f} 秒")
-
-# -------------------------------------------------------------
-# 動作・ヘルスチェック & バリデーションレポート
-# -------------------------------------------------------------
-def validate_tensor(name: str, arr: np.ndarray, expected_shape: tuple, expected_range: tuple[float, float] | None = None):
-    """テンソルの基本構造と数値妥当性をチェックするヘルパー"""
-    print(f"\n--- [{name}] チェック ---")
-    is_valid = True
-
-    # 1. Shape & Dtype
-    if arr.shape != expected_shape:
-        print(f"❌ [Shape不一致] 期待値: {expected_shape}, 実際: {arr.shape}")
-        is_valid = False
-    else:
-        print(f"✅ Shape: {arr.shape} ({arr.dtype})")
-
-    # 2. NaN / Inf
-    has_nan = np.isnan(arr).any()
-    has_inf = np.isinf(arr).any()
-    if has_nan or has_inf:
-        print(f"❌ [異常値検出] NaN: {has_nan}, Inf: {has_inf}")
-        is_valid = False
-    else:
-        print("✅ NaN / Inf: なし")
-
-    # 3. 全ゼロ（カーネル未書き込み/不発）チェック
-    is_all_zero = not np.any(arr)
-    if is_all_zero:
-        print("⚠️ [警告] 配列が完全にゼロです（カーネル処理が実行されていない可能性があります）")
-        is_valid = False
-
-    # 4. 統計量 & 値域
-    min_val, max_val = float(np.min(arr)), float(np.max(arr))
-    mean_val, std_val = float(np.mean(arr)), float(np.std(arr))
-    print(f"   統計量: min={min_val:.4f}, max={max_val:.4f}, mean={mean_val:.4f}, std={std_val:.4f}")
-
-    if expected_range is not None:
-        low, high = expected_range
-        # float16 の微小な丸め誤差を許容
-        eps = 1e-3
-        out_of_bounds = ((arr < low - eps) | (arr > high + eps)).sum()
-        if out_of_bounds > 0:
-            print(f"❌ [値域違反] 想定範囲 [{low}, {high}] を外れた要素数: {out_of_bounds} ({out_of_bounds / arr.size * 100:.2f}%)")
-            is_valid = False
-        else:
-            print(f"✅ 値域: 想定範囲 [{low}, {high}] 内")
-
-    return is_valid
-
-
-print("\n" + "=" * 60)
-print("🧠 VoxelBrain ヘルスチェック & 統計バリデーション")
-print("=" * 60)
-
-# =============================================================
-# 1. weights の正当性チェック
-# =============================================================
-expected_weights_shape = (512, 28)
-weights_valid = validate_tensor(
-    name="weights (calcWeights 出力)",
-    arr=weights,
-    expected_shape=expected_weights_shape,
-    expected_range=(-1.0, 1.0)  # シグネチャ内積等の想定値域に合わせて調整
-)
-
-# 結合が有効に生成されているか（非ゼロ結合の割合）
-active_weights_ratio = (np.abs(weights) > 1e-4).mean() * 100
-print(f"   シナプス活性結合率: {active_weights_ratio:.2f}%")
-
-
-# =============================================================
-# 2. global_poutputs (推論出力) の正当性チェック
-# =============================================================
-expected_poutput_shape = (m, Config.N, Config.N, Config.N)
-poutput_valid = validate_tensor(
-    name="global_poutputs (reasoning 出力)",
-    arr=poutput,
-    expected_shape=expected_poutput_shape,
-    expected_range=(0.0, 1.0)  # 通常ニューロン出力は [0, 1] または [-1, 1]
-)
-
-# =============================================================
-# 3. ニューロン活動のダイナミクス・局所領域チェック
-# =============================================================
-print("\n--- [ニューロン発火・空間活動性チェック] ---")
-
-# (A) 死亡ニューロン（全ステップで一度も発火していないセル）の検出
-# 形状: (Config.N, Config.N, Config.N)
-cell_activity = np.abs(poutput).max(axis=0)
-dead_cells_count = np.sum(cell_activity < 1e-4)
-total_cells = Config.N ** 3
-dead_cell_ratio = (dead_cells_count / total_cells) * 100
-
-if dead_cells_count == total_cells:
-    print("❌ [重大な警告] すべてのニューロンが静止（全ステップ出力ゼロ）しています！")
-elif dead_cells_count > 0:
-    print(f"⚠️ 沈黙ニューロン: {dead_cells_count}/{total_cells} 個 ({dead_cell_ratio:.1f}%)")
-else:
-    print("✅ 全ニューロンにおいて活動が確認されました。")
-
-# (B) 内部コア (N-2)^3 と 境界シェル (表面) の分離チェック
-# ※ poutput は 4次元 (m, N, N, N) なので空間3軸 (axis 1, 2, 3) をスライスします
-if Config.N > 2:
-    inner_core = poutput[:, 1:-1, 1:-1, 1:-1]
-    
-    # 表面（シェル）マスクの作成
-    shell_mask = np.ones((Config.N, Config.N, Config.N), dtype=bool)
-    shell_mask[1:-1, 1:-1, 1:-1] = False
-    shell_outputs = poutput[:, shell_mask]
-
-    print(f"   コア領域 (中央 {Config.N-2}^3)   : 平均発火 {inner_core.mean():.4f}, 最大 {inner_core.max():.4f}")
-    print(f"   シェル領域 (外枠 {total_cells - (Config.N-2)**3}セル): 平均発火 {shell_outputs.mean():.4f}, 最大 {shell_outputs.max():.4f}")
-
-
-
-print("\n" + "=" * 60)
-if weights_valid and poutput_valid and dead_cells_count < total_cells:
-    print(f"🎉 【判定: 合格】 全てのテンソルが正常に生成・計算されています。 (所要時間: {elapsed_time:.4f}秒)")
-else:
-    print(f"🚨 【判定: 警告あり】 上記のエラー・警告項目を確認してください。 (所要時間: {elapsed_time:.4f}秒)")
-print("=" * 60)
-
-
+print(f"output処理時間: {elapsed_time_output:.6f} 秒")
 
 
 print("wow")

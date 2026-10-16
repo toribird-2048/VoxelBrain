@@ -23,18 +23,18 @@ struct SigPerlinGenes {
 };
 
 struct PerlinGenes {
-    StructuredBuffer<uint> seeds;
-    StructuredBuffer<float> biases;
-    StructuredBuffer<float> freqs;
-    StructuredBuffer<float> cutoffs;
+    StructuredBuffer<uint> seed;
+    StructuredBuffer<float> biase;
+    StructuredBuffer<float> freq;
+    StructuredBuffer<float> cutoff;
 };
 
 struct InhibGenes {
-    StructuredBuffer<uint> seeds;
-    StructuredBuffer<float> speeds;
-    StructuredBuffer<float> cutoffs;
+    StructuredBuffer<uint> seed;
+    StructuredBuffer<float> speed;
+    StructuredBuffer<float> cutoff;
     StructuredBuffer<uint> steps;
-    StructuredBuffer<float> bases;
+    StructuredBuffer<float> base;
     StructuredBuffer<float> threshold;
 };
 
@@ -107,7 +107,7 @@ float perlin_gen(float3 coord, float freq, uint seed) {
     return sum;
 }
 
-void sig_gen(RWStructuredBuffer<float4> sig_map_np2, SigPerlinGenes genes, uint group_id_x, uint group_index) {
+void sig_gen(RWStructuredBuffer<half4> sig_map_np2, SigPerlinGenes genes, uint group_id_x, uint group_index) {
     uint4 seed = genes.seeds[group_id_x];
     float4 bias = genes.biases[group_id_x];
     float4 freq = genes.freqs[group_id_x];
@@ -123,19 +123,19 @@ void sig_gen(RWStructuredBuffer<float4> sig_map_np2, SigPerlinGenes genes, uint 
             perlin_gen(coord, freq.w, seed.w)
         );
 
-        sig_map_np2[group_id_x * TOTAL_NP2 + idx_np2] = clamp((sum_xyzw - cutoff) / (1.0f - cutoff) + bias, -1.0f, 1.0f);
+        sig_map_np2[group_id_x * TOTAL_NP2 + idx_np2] = half4(clamp((sum_xyzw - cutoff) / (1.0f - cutoff) + bias, -1.0f, 1.0f));
     }
 }
 
-void dop_sleep_gen(RWStructuredBuffer<float> map, PerlinGenes genes, uint group_id_x, uint group_index, uint3 group_thread_id) {
-    uint seed = genes.seeds[group_id_x];
-    float bias = genes.biases[group_id_x];
-    float freq = genes.freqs[group_id_x];
-    float cutoff = genes.cutoffs[group_id_x];
+void dop_sleep_gen(RWStructuredBuffer<half> map, PerlinGenes genes, uint group_id_x, uint group_index, uint3 group_thread_id) {
+    uint seed = genes.seed[group_id_x];
+    float bias = genes.biase[group_id_x];
+    float freq = genes.freq[group_id_x];
+    float cutoff = genes.cutoff[group_id_x];
 
     float sum = perlin_gen(group_thread_id, freq, seed);
 
-    map[group_id_x * N * N * N + group_index] = clamp((sum - cutoff) / (1.0f - cutoff) + bias, -1.0f, 1.0f);
+    map[group_id_x * N * N * N + group_index] = half(clamp((sum - cutoff) / (1.0f - cutoff) + bias, -1.0f, 1.0f));
 }
 
 float get_inhib(int3 coord_np2, uint step) {
@@ -152,28 +152,28 @@ void main(
     uint groupIndex: SV_GroupIndex,
     uint3 groupThreadID: SV_GroupThreadID,
     uint3 groupID: SV_GroupID,
-    RWStructuredBuffer<float4> sig_pre_map_np2, // Np2 * Np2 * Np2 * 4
-    RWStructuredBuffer<float4> sig_post_map_np2, // Np2 * Np2 * Np2 * 4
-    RWStructuredBuffer<float> dopamine_map, // N * N * N
-    RWStructuredBuffer<float> sleep_map, // N * N * N
-    RWStructuredBuffer<uint> inhib_sign_map, // N * N * N
+    RWStructuredBuffer<half4> sig_pre_map_np2_pout, // m * Np2 * Np2 * Np2 * 4
+    RWStructuredBuffer<half4> sig_post_map_np2_pout, // m * Np2 * Np2 * Np2 * 4
+    RWStructuredBuffer<half> dopamine_map_pout, // m * N * N * N
+    RWStructuredBuffer<half> sleep_map_pout, // m * N * N * N
+    RWStructuredBuffer<uint> inhib_sign_map_pout, // m * N * N * N
     uniform SigPerlinGenes sig_pre_genes,
     uniform SigPerlinGenes sig_post_genes,
     uniform PerlinGenes dopamine_genes,
     uniform PerlinGenes sleep_genes,
     uniform InhibGenes inhib_genes
 ) {
-    sig_gen(sig_pre_map_np2, sig_pre_genes, groupID.x, groupIndex);
-    sig_gen(sig_post_map_np2, sig_post_genes, groupID.x, groupIndex);
+    sig_gen(sig_pre_map_np2_pout, sig_pre_genes, groupID.x, groupIndex);
+    sig_gen(sig_post_map_np2_pout, sig_post_genes, groupID.x, groupIndex);
 
-    dop_sleep_gen(dopamine_map, dopamine_genes, groupID.x, groupIndex, groupThreadID);
-    dop_sleep_gen(sleep_map, sleep_genes, groupID.x, groupIndex, groupThreadID);
+    dop_sleep_gen(dopamine_map_pout, dopamine_genes, groupID.x, groupIndex, groupThreadID);
+    dop_sleep_gen(sleep_map_pout, sleep_genes, groupID.x, groupIndex, groupThreadID);
 
 
-    uint seed_inhib = inhib_genes.seeds[groupID.x];
-    float base_inhib = inhib_genes.bases[groupID.x];
-    float speed_inhib = inhib_genes.speeds[groupID.x];
-    float cutoff_inhib = inhib_genes.cutoffs[groupID.x];
+    uint seed_inhib = inhib_genes.seed[groupID.x];
+    float base_inhib = inhib_genes.base[groupID.x];
+    float speed_inhib = inhib_genes.speed[groupID.x];
+    float cutoff_inhib = inhib_genes.cutoff[groupID.x];
     uint step_inhib = inhib_genes.steps[groupID.x];
     float threshold_inhib = inhib_genes.threshold[groupID.x];
 
@@ -209,5 +209,5 @@ void main(
         set_inhib(center_coord_np2, write_slot, saturate(speed_inhib * (center_val - cutoff_inhib * max_val)));
         GroupMemoryBarrierWithGroupSync();
     }
-    inhib_sign_map[groupID.x * TOTAL_N + groupIndex] = get_inhib(center_coord_np2, step_inhib - 1) > threshold_inhib ? 1 : 0;
+    inhib_sign_map_pout[groupID.x * TOTAL_N + groupIndex] = get_inhib(center_coord_np2, step_inhib - 1) > threshold_inhib ? 1 : 0;
 }
