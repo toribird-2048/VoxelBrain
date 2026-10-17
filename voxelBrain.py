@@ -94,7 +94,9 @@ class Config:
     total_cells: int = 1 << (dim * 3)
     mask: int = N - 1
     
-    m: int = 1 << 17
+    m: int = 1 << 14
+    
+    world_size: float = 100.0
     
     class Seed:
         sigpre: int = 1;
@@ -212,18 +214,24 @@ def cast_and_buffer(ndarray_dict: dict[str, np.ndarray], device: spy.Device):
     return buf_dict
 
 
-def dispatch_kernel(device, filename: str, thread_count, params_dict: dict):
+def build_kernel(device, filename: str):
     with open(filename + ".slang", "r", encoding="utf-8") as f:
         source_code = f"#define DIM {Config.dim}\n" + f.read()
-
+    
     module = device.load_module_from_source("kernel" + filename, source_code)
     entry = module.entry_point("main")
     program = device.link_program([module], [entry])
     kernel = device.create_compute_kernel(program)
+    return kernel
+
+
+def create_buf(device: spy.Device, params: np.ndarray | dict[str, np.ndarray]):
+    if isinstance(params, np.ndarray):
+        return device.create_buffer(data=params)
     
     params_buf_dict = {}
     
-    for key, value in params_dict.items():
+    for key, value in params.items():
         if isinstance(value, np.ndarray):
             data_type: np.dtype = value.dtype
             val_conti = np.ascontiguousarray(value, dtype=data_type)
@@ -234,15 +242,7 @@ def dispatch_kernel(device, filename: str, thread_count, params_dict: dict):
             params_buf_dict[key] = buf_val
             continue
         params_buf_dict[key] = value
-    
-    kernel.dispatch(
-        thread_count=thread_count,
-        **params_buf_dict
-        )
-    
     return params_buf_dict
-
-
 
 
 sig_pre_map_np2 = np.zeros(Config.m * Config.P * Config.P * Config.P * 4, dtype=np.half)
@@ -265,14 +265,18 @@ generation_dict = {
     "inhib_genes": cast_and_buffer(genesis_params.inhib_params, device)
 }
 
+gen_buf_dict = create_buf(device, generation_dict)
+
 start_time_gen = time.perf_counter()
 
-genesis_out_dict = dispatch_kernel(
-    device = device,
-    filename="generation",
+
+kernel_generation = build_kernel(device, "generation")
+
+kernel_generation.dispatch(
     thread_count=(Config.m * Config.N, Config.N, Config.N),
-    params_dict=generation_dict
+    **gen_buf_dict
 )
+
 
 
 
@@ -284,65 +288,134 @@ print(f"gen処理時間: {elapsed_time_gen:.6f} 秒")
 
 start_time_weight = time.perf_counter()
 
-pout_np = np.zeros(Config.m * Config.N * Config.N * Config.N * 28, dtype=np.float16)
+
+kernel_out = build_kernel(device, filename="calcWeights")
+    
+    
+def calc_weight(sig_pre: spy.Buffer, sig_post: spy.Buffer, multipliers: spy.Buffer, bias: spy.Buffer):
+    pout_np = np.zeros(Config.m * Config.N * Config.N * Config.N * 28, dtype=np.float16)
 
 
-signature_pre_map = genesis_out_dict["sig_pre_map_np2_pout"]
-signature_post_map = genesis_out_dict["sig_post_map_np2_pout"]
-link27th_multipliers = genesis_params.link27th_params["multiplier"]
-link27th_biases = genesis_params.link27th_params["bias"]
+    calc_weight_dict = {
+        "signature_pre_map_np2": sig_pre,
+        "signature_post_map_np2": sig_post,
+        "weight_map_poutput": device.create_buffer(data=pout_np, usage=spy.BufferUsage.unordered_access),
+        "multipliers": multipliers,
+        "biases": bias
+    }
 
+    kernel_out.dispatch(
+        thread_count=(Config.m * Config.N, Config.N, Config.N),
+        **calc_weight_dict
+    )
+    
+    return calc_weight_dict["weight_map_poutput"]
 
-calc_weight_dict = {
-    "signature_pre_map_np2": signature_pre_map,
-    "signature_post_map_np2": signature_post_map,
-    "weight_map_poutput": pout_np,
-    "multipliers": link27th_multipliers.astype(np.int32),
-    "biases": link27th_biases.astype(np.int32)
-}
-
-
-buf_out_dict = dispatch_kernel(
-    device=device,
-    filename="calcWeights",
-    thread_count=(Config.m * Config.N, Config.N, Config.N),
-    params_dict=calc_weight_dict
-)
-
+weight_buf = calc_weight(
+    sig_pre=gen_buf_dict["sig_pre_map_np2_pout"],
+    sig_post=gen_buf_dict["sig_post_map_np2_pout"],
+    multipliers=device.create_buffer(data=genesis_params.link27th_params["multiplier"], usage=spy.BufferUsage.unordered_access),
+    bias=device.create_buffer(data=genesis_params.link27th_params["bias"].astype(np.int32))
+    )
 
 end_time_weight = time.perf_counter()
 elapsed_time_weight = end_time_weight - start_time_weight
 print(f"weight処理時間: {elapsed_time_weight:.6f} 秒")
 
 
-start_time_output = time.perf_counter()
 
 
-global_poutputs = np.zeros((Config.m, Config.P, Config.P, Config.P), dtype=np.float16)
+global_poutputs_buf = device.create_buffer(
+    data=np.zeros((Config.m, Config.P, Config.P, Config.P), dtype=np.float16),
+    usage=spy.BufferUsage.unordered_access
+    )
 
 
-dopamine_map = genesis_out_dict["dopamine_map_pout"]
-sleep_map = genesis_out_dict["sleep_map_pout"]
-inhib_map = genesis_out_dict["inhib_sign_map_pout"]
+membrane_buf = device.create_buffer(
+    data=np.zeros((Config.m, Config.P, Config.P, Config.P), dtype=np.float16),
+    usage=spy.BufferUsage.unordered_access
+    )
+
+synapse_tag_buf = device.create_buffer(
+    data=np.zeros((Config.m, Config.P, Config.P, Config.P, 28), dtype=np.float16),
+    usage=spy.BufferUsage.unordered_access
+    )
+
+dopamine_sum_buf = device.create_buffer(
+    data=np.zeros(Config.m, dtype=np.float16),
+    usage=spy.BufferUsage.unordered_access
+    )
+
+sleep_sum_buf = device.create_buffer(
+    data=np.zeros(Config.m, dtype=np.float16),
+    usage=spy.BufferUsage.unordered_access
+    )
 
 reasoning_dict = {
-    "dopamine_map_all": dopamine_map,
-    "sleep_map_all": sleep_map,
-    "inhib_map_all": inhib_map,
-    "weights_map_all": buf_out_dict["weight_map_poutput"],
-    "global_poutputs_all": global_poutputs,
+    "dopamine_map_all": gen_buf_dict["dopamine_map_pout"],
+    "sleep_map_all": gen_buf_dict["sleep_map_pout"],
+    "inhib_map_all": gen_buf_dict["inhib_sign_map_pout"],
+    "weights_map_all": weight_buf,
+    "global_poutputs_all": global_poutputs_buf,
+    "membrane_all": membrane_buf,
+    "synapse_tag_all": synapse_tag_buf,
     "resource_params_all": cast_and_buffer(genesis_params.resource_params, device),
     "link27th_params_all": cast_and_buffer(genesis_params.link27th_params, device),
-    "learning_params_all": cast_and_buffer(genesis_params.learning_params, device)
+    "learning_params_all": cast_and_buffer(genesis_params.learning_params, device),
+    "dopamine_sum": dopamine_sum_buf,
+    "sleep_sum": sleep_sum_buf
 }
 
-buf_out_reasoning = dispatch_kernel(
-    device=device,
-    filename="reasoning",
-    thread_count=(Config.m*Config.N, Config.N, Config.N),
-    params_dict=reasoning_dict
-)
 
+
+
+pos_buf = device.create_buffer(
+    data=np.zeros((Config.m, 2), dtype=np.float32),
+    usage=spy.BufferUsage.unordered_access,
+    )
+
+obj_pos_buf = device.create_buffer(
+    data=np.random.uniform(-Config.world_size, Config.world_size, size=(Config.m, 2)).astype(np.float32),
+    usage=spy.BufferUsage.unordered_access,
+    )
+
+goal_count_buf = device.create_buffer(
+    data=np.zeros(Config.m, dtype=np.uint32),
+    usage=spy.BufferUsage.unordered_access,
+    )
+
+sim_dict = {
+    "global_poutputs_all": global_poutputs_buf,
+    "object_pos_all": obj_pos_buf,
+    "membrane_all": membrane_buf,
+    "position_all": pos_buf,
+    "goal_count_all": goal_count_buf,
+    "dt": 0.01,
+    "step": 0,
+}
+
+kernel_reasoning = build_kernel(device, "reasoning")
+kernel_sim = build_kernel(device, "sim")
+
+
+start_time_output = time.perf_counter()
+
+for step in range(10):
+    kernel_reasoning.dispatch(
+        thread_count=(Config.m*Config.N, Config.N, Config.N),
+        **reasoning_dict
+    )
+    
+    sim_dict["step"] = step
+
+    kernel_sim.dispatch(
+        thread_count=(Config.m, 1, 1),
+        **sim_dict
+    )
+    if str(step).endswith("000"):
+        device.wait()
+    
+device.wait()
 
 end_time_output = time.perf_counter()
 elapsed_time_output = end_time_output - start_time_output
@@ -350,7 +423,102 @@ elapsed_time_output = end_time_output - start_time_output
 print(f"output処理時間: {elapsed_time_output:.6f} 秒")
 
 
+import numpy as np
+
+# =================================================================
+# 1. GPUからデータをNumPy配列として回収 & 基本計算
+# =================================================================
+device.wait() # 確実に計算完了を待機
+
+# ゴール回数と最終座標を取得
+goal_counts = goal_count_buf.to_numpy().view(np.uint32)
+final_pos = pos_buf.to_numpy().view(np.float32).reshape(-1, 2)
+
+# 原点 (0, 0) からの移動距離を計算
+dists = np.linalg.norm(final_pos, axis=1)
+m = len(goal_counts)
+
+# =================================================================
+# 2. 全体統計の計算 & 表示
+# =================================================================
+total_goals = int(np.sum(goal_counts))
+max_goals = int(np.max(goal_counts))
+min_goals = int(np.min(goal_counts))
+mean_goals = float(np.mean(goal_counts))
+median_goals = float(np.median(goal_counts))
+std_goals = float(np.std(goal_counts))
+
+achieved_mask = goal_counts > 0
+achieved_count = int(np.sum(achieved_mask))
+achieved_rate = (achieved_count / m) * 100
+
+active_mask = dists >= 1.0
+active_count = int(np.sum(active_mask))
+
+print("\n" + "=" * 65)
+print("                   📊 シミュレーション結果統計")
+print("=" * 65)
+print(f"  総個体数 (m)        : {m:,} 体")
+print(f"  総ゴール回数        : {total_goals:,} 回")
+print(f"  ゴール達成個体数    : {achieved_count:,} 体 ({achieved_rate:.2f}%)")
+print(f"  自力で歩けた個体(≧1.0): {active_count:,} 体 ({active_count / m * 100:.2f}%)")
+print("-" * 65)
+print(f"  最大ゴール数 (Max)  : {max_goals} 回")
+print(f"  平均ゴール数 (Mean) : {mean_goals:.3f} 回")
+print(f"  中央値 (Median)     : {median_goals:.1f} 回")
+print(f"  標準偏差 (Std)      : {std_goals:.3f}")
+print("=" * 65)
+
+# =================================================================
+# 3. ゴール回数の度数分布
+# =================================================================
+print("\n[ゴール回数ごとの個体分布]")
+unique_counts, num_agents = np.unique(goal_counts, return_counts=True)
+for count, num in zip(unique_counts[:10], num_agents[:10]):
+    bar = "■" * int((num / m) * 40)
+    print(f"  {count:3d} 回ゴール : {num:6,d} 体 ({num / m * 100:5.1f}%) | {bar}")
+if len(unique_counts) > 10:
+    remaining_num = np.sum(num_agents[10:])
+    print(f"  それ以上    : {remaining_num:6,d} 体 ({remaining_num / m * 100:5.1f}%)")
+
+# =================================================================
+# 4. 🏆 ゴール回数 上位 15 個体（移動距離つき！）
+# =================================================================
+top_k_goal = 15
+sorted_by_goal = np.argsort(goal_counts)[::-1]  # ゴール数の降順ソート
+
+print(f"\n[🏆 ゴール回数 上位 {top_k_goal} 個体（運動実績つき）]")
+print("  順位 | 個体ID (index) | ゴール回数 | 移動距離 | 最終座標 (X, Y)")
+print("  -----+----------------+------------+----------+-----------------------")
+for rank in range(min(top_k_goal, m)):
+    idx = sorted_by_goal[rank]
+    count = goal_counts[idx]
+    d = dists[idx]
+    x, y = final_pos[idx]
+    print(f"   {rank+1:2d}位 | ID: {idx:10d} |   {count:4d} 回  | {d:7.2f}  | ({x:6.2f}, {y:6.2f})")
+print("=" * 65)
+
+# =================================================================
+# 5. 🏃 移動距離 上位 20 体
+# =================================================================
+top_k_dist = 20
+sorted_by_dist = np.argsort(dists)[::-1]  # 移動距離の降順ソート
+
+best_mover_id = sorted_by_dist[0]
+best_dist = dists[best_mover_id]
+best_goals = goal_counts[best_mover_id]
+best_pos = final_pos[best_mover_id]
+
+print(f"\n[🏃 移動距離 上位 {top_k_dist} 体（最大チャンピオン: ID {best_mover_id} / 距離 {best_dist:.2f} / ゴール {best_goals}回）]")
+print("  順位 | 個体ID (index) | 移動距離 | ゴール回数 | 最終座標 (X, Y)")
+print("  -----+----------------+----------+------------+-----------------------")
+for rank in range(min(top_k_dist, len(dists))):
+    idx = sorted_by_dist[rank]
+    d = dists[idx]
+    g = goal_counts[idx]
+    x, y = final_pos[idx]
+    print(f"   {rank+1:2d}位 | ID: {idx:10d} | {d:7.2f}  |   {g:2d} 回   | ({x:6.2f}, {y:6.2f})")
+print("=" * 65)
+
+
 print("wow")
-
-
-
