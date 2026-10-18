@@ -94,7 +94,7 @@ class Config:
     total_cells: int = 1 << (dim * 3)
     mask: int = N - 1
     
-    m: int = 1 << 14
+    m: int = 1 << 17
     
     world_size: float = 100.0
     
@@ -337,7 +337,7 @@ membrane_buf = device.create_buffer(
     )
 
 synapse_tag_buf = device.create_buffer(
-    data=np.zeros((Config.m, Config.P, Config.P, Config.P, 28), dtype=np.float16),
+    data=np.zeros((Config.m, Config.N, Config.N, Config.N, 28), dtype=np.float16),
     usage=spy.BufferUsage.unordered_access
     )
 
@@ -350,24 +350,6 @@ sleep_sum_buf = device.create_buffer(
     data=np.zeros(Config.m, dtype=np.float16),
     usage=spy.BufferUsage.unordered_access
     )
-
-reasoning_dict = {
-    "dopamine_map_all": gen_buf_dict["dopamine_map_pout"],
-    "sleep_map_all": gen_buf_dict["sleep_map_pout"],
-    "inhib_map_all": gen_buf_dict["inhib_sign_map_pout"],
-    "weights_map_all": weight_buf,
-    "global_poutputs_all": global_poutputs_buf,
-    "membrane_all": membrane_buf,
-    "synapse_tag_all": synapse_tag_buf,
-    "resource_params_all": cast_and_buffer(genesis_params.resource_params, device),
-    "link27th_params_all": cast_and_buffer(genesis_params.link27th_params, device),
-    "learning_params_all": cast_and_buffer(genesis_params.learning_params, device),
-    "dopamine_sum": dopamine_sum_buf,
-    "sleep_sum": sleep_sum_buf
-}
-
-
-
 
 pos_buf = device.create_buffer(
     data=np.zeros((Config.m, 2), dtype=np.float32),
@@ -384,34 +366,41 @@ goal_count_buf = device.create_buffer(
     usage=spy.BufferUsage.unordered_access,
     )
 
-sim_dict = {
+reasoning_sim_dict = {
+    "dopamine_map_all": gen_buf_dict["dopamine_map_pout"],
+    "sleep_map_all": gen_buf_dict["sleep_map_pout"],
+    "inhib_map_all": gen_buf_dict["inhib_sign_map_pout"],
+    "weights_map_all": weight_buf,
+    "global_poutputs_all": global_poutputs_buf,
+    "membrane_all": membrane_buf,
+    "synapse_tag_all": synapse_tag_buf,
+    "resource_params_all": cast_and_buffer(genesis_params.resource_params, device),
+    "link27th_params_all": cast_and_buffer(genesis_params.link27th_params, device),
+    "learning_params_all": cast_and_buffer(genesis_params.learning_params, device),
+    "dopamine_sum": dopamine_sum_buf,
+    "sleep_sum": sleep_sum_buf,
     "global_poutputs_all": global_poutputs_buf,
     "object_pos_all": obj_pos_buf,
-    "membrane_all": membrane_buf,
     "position_all": pos_buf,
     "goal_count_all": goal_count_buf,
     "dt": 0.01,
     "step": 0,
 }
 
-kernel_reasoning = build_kernel(device, "reasoning")
-kernel_sim = build_kernel(device, "sim")
+
+kernel_reasoning = build_kernel(device, "reasoningSim")
 
 
 start_time_output = time.perf_counter()
 
-for step in range(10):
+for step in range(100):
     kernel_reasoning.dispatch(
         thread_count=(Config.m*Config.N, Config.N, Config.N),
-        **reasoning_dict
+        **reasoning_sim_dict
     )
     
-    sim_dict["step"] = step
+    reasoning_sim_dict["step"] = step
 
-    kernel_sim.dispatch(
-        thread_count=(Config.m, 1, 1),
-        **sim_dict
-    )
     if str(step).endswith("000"):
         device.wait()
     
