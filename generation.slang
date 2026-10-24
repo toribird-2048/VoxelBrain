@@ -24,7 +24,7 @@ struct SigPerlinGenes {
 
 struct PerlinGenes {
     StructuredBuffer<uint> seed;
-    StructuredBuffer<float> biase;
+    StructuredBuffer<float> bias;
     StructuredBuffer<float> freq;
     StructuredBuffer<float> cutoff;
 };
@@ -129,7 +129,7 @@ void sig_gen(RWStructuredBuffer<half4> sig_map_np2, SigPerlinGenes genes, uint g
 
 void dop_sleep_gen(RWStructuredBuffer<half> map, PerlinGenes genes, uint group_id_x, uint group_index, uint3 group_thread_id) {
     uint seed = genes.seed[group_id_x];
-    float bias = genes.biase[group_id_x];
+    float bias = genes.bias[group_id_x];
     float freq = genes.freq[group_id_x];
     float cutoff = genes.cutoff[group_id_x];
 
@@ -148,7 +148,7 @@ void set_inhib(int3 coord_np2, uint step, float val) {
 
 [shader("compute")]
 [numthreads(N, N, N)]
-void main(
+void computeMain(
     uint groupIndex: SV_GroupIndex,
     uint3 groupThreadID: SV_GroupThreadID,
     uint3 groupID: SV_GroupID,
@@ -191,8 +191,8 @@ void main(
     int3 center_coord_np2 = int3(groupThreadID + 1);
     for (int i = 0; i < step_inhib; i++) {
         float max_val = 0;
-        uint read_slot = (i - 1 == -1 ? 1 : (i - 1) & 1);
         uint write_slot = i & 1;
+        uint read_slot = write_slot ^ 1;
         float center_val = get_inhib(center_coord_np2, read_slot);
         [unroll]
         for (int dz = -1; dz <= 1; dz++) {
@@ -209,5 +209,12 @@ void main(
         set_inhib(center_coord_np2, write_slot, saturate(speed_inhib * (center_val - cutoff_inhib * max_val)));
         GroupMemoryBarrierWithGroupSync();
     }
-    inhib_sign_map_pout[groupID.x * TOTAL_N + groupIndex] = get_inhib(center_coord_np2, step_inhib - 1) > threshold_inhib ? 1 : 0;
+    bool my_inhib = get_inhib(center_coord_np2, step_inhib - 1) > threshold_inhib ? true : false;
+
+    uint4 ballot = WaveActiveBallot(my_inhib);
+
+    if (WaveIsFirstLane()) {
+        uint packed_index = (groupID.x * 16) + (groupIndex / WaveGetLaneCount());
+        inhib_sign_map_pout[packed_index] = ballot.x;
+    }
 }

@@ -66,7 +66,7 @@ uint set_weight_27th(uint group_id_x, RWStructuredBuffer<half> weights, int3 cen
 
 [shader("compute")]
 [numthreads(N, N, N)]
-void main(
+void computeMain(
     StructuredBuffer<half4> signature_pre_map_np2,
     StructuredBuffer<half4> signature_post_map_np2,
     RWStructuredBuffer<half> weight_map_poutput,
