@@ -306,7 +306,8 @@ void computeMain(
     uniform Link27thParamsAll link27th_params_all,
     uniform LearningParamsAll learning_params_all,
     uniform MutationParamsAll mutation_params_all,
-    RWStructuredBuffer<uint> bool_passed_all,
+    RWStructuredBuffer<half> mutation_rate_all,
+    uniform uint step,
     uniform uint total
 ) {
     SigMutationParams sig_pre_mutation_params;
@@ -337,7 +338,8 @@ void computeMain(
     
     inhib_mutation_params.threshold = mutation_params_all.other_threshold[groupID.x].z;
 
-    bool is_me_passed = bool_passed_all[groupID.x] == 1 ? true : false;
+    half rand = rand_half(groupID.x * 10007 + step);
+    bool is_me_passed = rand >= (1.0h - mutation_rate_all[groupID.x]);
     if (is_me_passed) {
         return;
     }
@@ -346,7 +348,7 @@ void computeMain(
         uint search_count = 0;
         uint target_idx = groupID.x + groupIndex;
         while (min_passed_index == -1 && search_count < 20) {
-            int my_passed_index = bool_passed_all[target_idx % total] == 1 ? int(target_idx) : -1;
+            int my_passed_index = mutation_rate_all[target_idx % total] == 1 ? int(target_idx) : -1;
             min_passed_index = calc_max_int(groupIndex, my_passed_index);
             target_idx = (target_idx % total) + TOTAL_N;
             search_count++;
@@ -355,7 +357,7 @@ void computeMain(
     uint base_id = (min_passed_index != -1) ? (uint)min_passed_index % total : groupID.x;
 
     if (groupIndex == 0) {
-        uint seed = groupID.x * 10007u + 42u;
+        uint seed = groupID.x * 10007u + 42u * step;
         half threshold_threshold = mutation_params_all.mutate_threshold[groupID.x].x;
 
         MUT_HALF4(mutation_params_all.sig_pre_threshold, 0.5h, 0.99h, threshold_threshold);

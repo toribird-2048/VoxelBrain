@@ -284,7 +284,7 @@ void computeMain(
     
     RWStructuredBuffer<float2> object_pos_all,
     RWStructuredBuffer<float2> position_all,
-    RWStructuredBuffer<uint> bool_passed_all,
+    RWStructuredBuffer<float> mutation_rate_all,
     RWStructuredBuffer<uint> goal_count_all,
     uniform half dt, // second
     uniform uint step
@@ -292,7 +292,7 @@ void computeMain(
 {
     uint agent_id = groupID.x;
     float world_size = 100.0h;
-    float2 my_pos = 0.0h;
+    float2 my_pos = (-1.0h + 2.0h * rand_half2(agent_id * 10007u + 107u)) * world_size;
     float2 my_obj_pos = (-1.0h + 2.0h * rand_half2(agent_id * 10007u + 1u)) * world_size;
     bool is_me_passed = false;
 
@@ -449,6 +449,7 @@ void computeMain(
             my_dopamine_sum = final_dopamine_sum;
             my_sleep_sum = final_sleep_sum;
         }
+        GroupMemoryBarrierWithGroupSync();
 
 
 
@@ -463,7 +464,7 @@ void computeMain(
 
         if (groupIndex == 0) {
 
-            half2 speed = 10 * half2(
+            half2 speed = 100 * half2(
                 get_output_s(uint3(3, 2, 1)) - get_output_s(uint3(1, 2, 1)),
                 get_output_s(uint3(2, 3, 1)) - get_output_s(uint3(2, 1, 1))
             );
@@ -493,8 +494,8 @@ void computeMain(
 
             my_goal_count += (normalized_diff_abs.x <= norm_threshold.x && normalized_diff_abs.y <= norm_threshold.y) ? 1 : 0;
 
-            set_output_s(uint3(4 + diff_sign.x, 1, 4), half(normalized_diff_abs.x));
-            set_output_s(uint3(4, 1, 4 + diff_sign.y), half(normalized_diff_abs.y));
+            set_output_s(uint3(4 + diff_sign.x, -1, 4), half(normalized_diff_abs.x));
+            set_output_s(uint3(4, -1, 4 + diff_sign.y), half(normalized_diff_abs.y));
         }
     GroupMemoryBarrierWithGroupSync();
     }
@@ -511,7 +512,7 @@ void computeMain(
         position_all[agent_id] = my_pos;
         object_pos_all[agent_id] = my_obj_pos;
         goal_count_all[agent_id] = my_goal_count;
-        bool_passed_all[agent_id] = my_goal_count >= 1 ? 1 : 0;
+        mutation_rate_all[agent_id] = my_goal_count >= 1 ? (my_goal_count >= 2 ? 1.0h : 0.7h) : 0.0h;
     }
 
     for (uint idx_h2 = groupIndex; idx_h2 < TOTAL_NP2H2; idx_h2 += TOTAL_N) {
