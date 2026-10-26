@@ -6,7 +6,9 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "jaxtyping>=0.3.11",
+    "matplotlib>=3.11.2",
     "numpy>=2.5.4",
+    "pandas>=3.1.0",
     "setuptools<81",
     "slangpy>=0.43.1",
     "vnoise>=0.1.0",

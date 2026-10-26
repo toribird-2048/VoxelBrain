@@ -10,6 +10,7 @@
 #define SHIFT_Z (DIM * 2)
 
 #define TOTAL_N (N * N * N)
+#define INHIB_STRIDE ((TOTAL_N + 31) / 32)
 #define P2 (N + 2)
 #define TOTAL_NP2 ((N+2)*(N+2)*(N+2))
 #define TOTAL_NP2H2 (TOTAL_NP2 >> 1) 
@@ -23,8 +24,7 @@ groupshared half dopamine_wave_sums[MAX_WAVE];
 groupshared half my_dopamine_sum;
 groupshared half sleep_wave_sums[MAX_WAVE];
 groupshared half my_sleep_sum;
-
-
+groupshared float my_energy_s;
 
 struct ResourceParams {
     half base_output;
@@ -155,9 +155,7 @@ struct SynapseData {
     void set_tags_27th(half val) {
         tags[27] = val;
     }
-
 }
-
 
 uint3 indexToCoordN(uint index)
 {
@@ -188,13 +186,13 @@ uint coordToIndexNp2(uint3 coord)
 }
 
 half get_output_s(int3 coord) {
-    uint3 target_coord_np2 = coord + 1;
+    uint3 target_coord_np2 = uint3(coord + 1);
     uint index = coordToIndexNp2(target_coord_np2);
     return outputs_s[index];
 } 
 
 void set_output_s(int3 coord, half val) {
-    uint3 target_coord_np2 = coord + 1;
+    uint3 target_coord_np2 = uint3(coord + 1);
     uint index = coordToIndexNp2(target_coord_np2);
     outputs_s[index] = val;
 }
@@ -280,23 +278,16 @@ void computeMain(
     uniform LearningParamsAll learning_params_all,
     RWStructuredBuffer<half> dopamine_sum,
     RWStructuredBuffer<half> sleep_sum,
-
-    
-    RWStructuredBuffer<float2> object_pos_all,
-    RWStructuredBuffer<float2> position_all,
     RWStructuredBuffer<float> mutation_rate_all,
-    RWStructuredBuffer<uint> goal_count_all,
-    uniform half dt, // second
+    uniform half dt,
     uniform uint step
 )
 {
     uint agent_id = groupID.x;
-    float world_size = 100.0h;
-    float2 my_pos = (-1.0h + 2.0h * rand_half2(agent_id * 10007u + 107u)) * world_size;
-    float2 my_obj_pos = (-1.0h + 2.0h * rand_half2(agent_id * 10007u + 1u)) * world_size;
-    bool is_me_passed = false;
 
-    
+    if (groupIndex == 0) {
+        my_energy_s = 0.2h;
+    }
 
     for (uint idx_np2 = groupIndex; idx_np2 < TOTAL_NP2; idx_np2 += TOTAL_N) {
         sig_pre_map_s[idx_np2] = signature_pre_map_np2[groupID.x * TOTAL_NP2 + idx_np2];
@@ -311,12 +302,11 @@ void computeMain(
         synapse_data.set_tags_idx_ui7(idx_ui7, 0u);
     }
 
-    half my_dopamine_map = dopamine_map_all[N * N * N * groupID.x + groupIndex];
-    half my_sleep_map = sleep_map_all[N * N * N * groupID.x + groupIndex];
-    uint packed_val = inhib_map_all[(groupID.x * 16) + (groupIndex >> 5)];
+    half my_dopamine_map = dopamine_map_all[N * N * N * groupID.x + groupIndex] * 0.0h;
+    half my_sleep_map = sleep_map_all[N * N * N * groupID.x + groupIndex] * 0.0h;
+    uint packed_val = inhib_map_all[(groupID.x * INHIB_STRIDE) + (groupIndex >> 5)];
     bool is_inhib = bool((packed_val >> (groupIndex & 31)) & 1);
     int my_inhib = is_inhib ? -1 : 1;
-
 
     my_dopamine_sum = 0.0h;
     my_sleep_sum = 0.0h;
@@ -331,10 +321,10 @@ void computeMain(
     link27th_params.multiplier = link27th_params_all.multiplier[groupID.x];
 
     LearningParams learning_params;
-    learning_params.forget_rate = learning_params_all.forget_rate[groupID.x];
-    learning_params.learning_rate = learning_params_all.learning_rate[groupID.x];
-    learning_params.learning_threshold = learning_params_all.learning_threshold[groupID.x];
-    learning_params.tag_decay = learning_params_all.tag_decay[groupID.x];
+    learning_params.forget_rate = learning_params_all.forget_rate[groupID.x] * 0.0h;
+    learning_params.learning_rate = learning_params_all.learning_rate[groupID.x] * 0.0h;
+    learning_params.learning_threshold = learning_params_all.learning_threshold[groupID.x] * 0.0h;
+    learning_params.tag_decay = learning_params_all.tag_decay[groupID.x] * 0.0h;
 
     uint my_goal_count = 0;
     
@@ -375,8 +365,7 @@ void computeMain(
 
     GroupMemoryBarrierWithGroupSync();
 
-    
-    for (uint inner_step = 0; inner_step < 1000; inner_step++) {
+    for (uint inner_step = 0; inner_step < 10000; inner_step++) {
         half net = 0.0h;
         [unroll]
         for (int dz = -1; dz <= 1; dz++) {
@@ -390,7 +379,7 @@ void computeMain(
                     net += delta_net;
                     tag = saturate((tag + saturate(abs(delta_net))) * (1.0h - learning_params.tag_decay));
 
-                    half delta_weight = learning_params.learning_rate * (my_dopamine_sum * tag + learning_params.learning_rate * my_weight * (1.0h - my_weight) * (my_weight - learning_params.learning_threshold));
+                    half delta_weight = learning_params.forget_rate * (my_dopamine_sum * tag + learning_params.learning_rate * my_weight * (1.0h - my_weight) * (my_weight - learning_params.learning_threshold));
 
                     synapse_data.set_tags(int3(dx, dy, dz), tag);
                     synapse_data.set_weights(int3(dx, dy, dz), my_weight + delta_weight);
@@ -410,7 +399,6 @@ void computeMain(
         synapse_data.set_weights_27th(my_weight_27th + delta_weight_27th);
 
         half output_rate = min(1.0h, resource_params.base_output * exp2(net * resource_params.beta));
-
         half my_output = (1 - my_sleep_sum) * half(my_inhib) * output_rate * R;
 
         set_output_s(groupThreadID, my_output);
@@ -433,7 +421,8 @@ void computeMain(
 
         GroupMemoryBarrierWithGroupSync();
 
-        uint num_waves = TOTAL_N / WaveGetLaneCount();
+        // N=2 (TOTAL_N=8) のときでも最低 1 wave になるよう切り上げ
+        uint num_waves = (TOTAL_N + WaveGetLaneCount() - 1) / WaveGetLaneCount();
         half local_dopamine_sum = 0.0h;
         half local_sleep_sum = 0.0h;
 
@@ -451,85 +440,56 @@ void computeMain(
         }
         GroupMemoryBarrierWithGroupSync();
 
-
-
-
-
-
-
-
-
-
-
-
         if (groupIndex == 0) {
+            float current_sunlight = saturate(sinpi(inner_step * (1.0 / 50.0)));
+            my_energy_s -= 0.001;
+#if DIM == 1
+            // N=2 用 (内部座標は 0..1)
+            half generator_power = get_output_s(int3(1, 0, 1)) - get_output_s(int3(0, 0, 1));
+#else
+            // N>=4 用
+            half generator_power = get_output_s(int3(3, 2, 1)) - get_output_s(int3(1, 2, 1));
+#endif
 
-            half2 speed = 100 * half2(
-                get_output_s(uint3(3, 2, 1)) - get_output_s(uint3(1, 2, 1)),
-                get_output_s(uint3(2, 3, 1)) - get_output_s(uint3(2, 1, 1))
-            );
-            
-            my_pos = clamp(my_pos + speed * dt, -100.0h, 100.0h);
+            my_energy_s -= float(abs(generator_power)) * 0.0;
 
-            float2 diff = my_pos - my_obj_pos;
+            my_energy_s = my_energy_s == 0.0 ? 0.0 : my_energy_s + 0.012 * abs(generator_power) * current_sunlight;
 
-            half K = 100.0h;
+            my_energy_s = saturate(my_energy_s);
 
-            float2 diff_thoreshold = float2(5.0h, 5.0h);
-
-            float2 norm_threshold = diff_thoreshold / (diff_thoreshold + K);
-
-            float2 normalized_diff = diff / (abs(diff) + K);
-
-            int2 diff_sign = int2(
-                normalized_diff.x >= 0 ? 1 : -1,
-                normalized_diff.y >= 0 ? 1 : -1
-            );
-
-            float2 normalized_diff_abs = abs(normalized_diff);
-
-            my_obj_pos = normalized_diff_abs.x <= norm_threshold.x && normalized_diff_abs.y <= norm_threshold.y
-                ? clamp((- 1 + 2 * rand_half2(agent_id + step * 10000u + inner_step * 13u)) * world_size, -world_size, world_size)
-                : my_obj_pos;
-
-            my_goal_count += (normalized_diff_abs.x <= norm_threshold.x && normalized_diff_abs.y <= norm_threshold.y) ? 1 : 0;
-
-            set_output_s(uint3(4 + diff_sign.x, -1, 4), half(normalized_diff_abs.x));
-            set_output_s(uint3(4, -1, 4 + diff_sign.y), half(normalized_diff_abs.y));
+#if DIM == 1
+            // N=2 用: パディング込みの有効範囲 (-1 .. 2) に収める
+            set_output_s(int3(0, -1, 0), half(my_energy_s));
+            set_output_s(int3(1, -1, 0), half(current_sunlight));
+#elif DIM == 2
+            // N=4 用: 中心 2 を基準に (1 or 3)
+            set_output_s(int3(1, -1, 2), half(my_energy_s));
+            set_output_s(int3(3, -1, 2), half(current_sunlight));
+#else
+            // N=8 用: 中心 4 を基準に (3 or 5)
+            set_output_s(int3(3, -1, 4), half(my_energy_s));
+            set_output_s(int3(5, -1, 4), half(current_sunlight));
+#endif
         }
-    GroupMemoryBarrierWithGroupSync();
+        GroupMemoryBarrierWithGroupSync();
     }
-
-
-
-
-
 
     if (groupIndex == 0) {
         dopamine_sum[groupID.x] = my_dopamine_sum;
         sleep_sum[groupID.x] = my_sleep_sum;
 
-        position_all[agent_id] = my_pos;
-        object_pos_all[agent_id] = my_obj_pos;
-        goal_count_all[agent_id] = my_goal_count;
-        mutation_rate_all[agent_id] = my_goal_count >= 1 ? (my_goal_count >= 2 ? 1.0h : 0.7h) : 0.0h;
+        mutation_rate_all[agent_id] = saturate(my_energy_s);
     }
 
     for (uint idx_h2 = groupIndex; idx_h2 < TOTAL_NP2H2; idx_h2 += TOTAL_N) {
         uint2 idx01 = idxNp2h2x_to_indexNp2_01(idx_h2);
-        membrane_all[groupID.x * TOTAL_NP2H2 + idx_h2] = half2(
+        half2 out_pair = half2(
             outputs_s[idx01.x],
             outputs_s[idx01.y]
         );
+        membrane_all[groupID.x * TOTAL_NP2H2 + idx_h2] = out_pair;
+        global_poutputs_all[groupID.x * TOTAL_NP2H2 + idx_h2] = out_pair;
     }
-
-    if (groupIndex < TOTAL_NP2H2) {
-            uint2 idx_np2_01 = idxNp2h2x_to_indexNp2_01(groupIndex);
-            global_poutputs_all[TOTAL_NP2H2 * groupID.x + groupIndex] = half2(
-            outputs_s[idx_np2_01.x],
-            outputs_s[idx_np2_01.y]
-            );
-        }
 
     for (uint idx_ui7 = 0; idx_ui7 < 7; idx_ui7++) {
         synapse_tag_all[groupID.x * (TOTAL_N * 7) + groupIndex * 7 + idx_ui7] = synapse_data.get_tag_idx_ui7(idx_ui7);

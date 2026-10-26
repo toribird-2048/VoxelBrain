@@ -10,6 +10,7 @@
 #define SHIFT_Z (DIM * 2)
 
 #define TOTAL_N (N * N * N)
+#define INHIB_STRIDE ((TOTAL_N + 31) / 32)
 #define P2 (N + 2)
 #define TOTAL_NP2 ((N+2)*(N+2)*(N+2))
 
@@ -146,17 +147,18 @@ void set_inhib(int3 coord_np2, uint step, float val) {
     inhib_map_np2[step & 1][coordToIndexNp2(coord_np2)] = val;
 }
 
+[WaveSize(32)]
 [shader("compute")]
 [numthreads(N, N, N)]
 void computeMain(
     uint groupIndex: SV_GroupIndex,
     uint3 groupThreadID: SV_GroupThreadID,
     uint3 groupID: SV_GroupID,
-    RWStructuredBuffer<half4> sig_pre_map_np2_pout, // m * Np2 * Np2 * Np2 * 4
-    RWStructuredBuffer<half4> sig_post_map_np2_pout, // m * Np2 * Np2 * Np2 * 4
-    RWStructuredBuffer<half> dopamine_map_pout, // m * N * N * N
-    RWStructuredBuffer<half> sleep_map_pout, // m * N * N * N
-    RWStructuredBuffer<uint> inhib_sign_map_pout, // m * N * N * N
+    RWStructuredBuffer<half4> sig_pre_map_np2_pout,
+    RWStructuredBuffer<half4> sig_post_map_np2_pout,
+    RWStructuredBuffer<half> dopamine_map_pout,
+    RWStructuredBuffer<half> sleep_map_pout,
+    RWStructuredBuffer<uint> inhib_sign_map_pout,
     uniform SigPerlinGenes sig_pre_genes,
     uniform SigPerlinGenes sig_post_genes,
     uniform PerlinGenes dopamine_genes,
@@ -168,7 +170,6 @@ void computeMain(
 
     dop_sleep_gen(dopamine_map_pout, dopamine_genes, groupID.x, groupIndex, groupThreadID);
     dop_sleep_gen(sleep_map_pout, sleep_genes, groupID.x, groupIndex, groupThreadID);
-
 
     uint seed_inhib = inhib_genes.seed[groupID.x];
     float base_inhib = inhib_genes.base[groupID.x];
@@ -214,7 +215,7 @@ void computeMain(
     uint4 ballot = WaveActiveBallot(my_inhib);
 
     if (WaveIsFirstLane()) {
-        uint packed_index = (groupID.x * 16) + (groupIndex / WaveGetLaneCount());
+        uint packed_index = (groupID.x * INHIB_STRIDE) + (groupIndex / WaveGetLaneCount());
         inhib_sign_map_pout[packed_index] = ballot.x;
     }
 }

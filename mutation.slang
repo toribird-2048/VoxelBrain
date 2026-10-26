@@ -10,32 +10,32 @@
 #define SHIFT_Z (DIM * 2)
 
 #define TOTAL_N (N * N * N)
+#define INHIB_STRIDE ((TOTAL_N + 31) / 32)
 #define P2 (N + 2)
 #define TOTAL_NP2 ((N+2)*(N+2)*(N+2))
 #define TOTAL_NP2H2 (TOTAL_NP2 >> 1) 
 
 #define MIN_WAVE (16)
+#define MAX_WAVE_SLOTS ((TOTAL_N + MIN_WAVE - 1) / MIN_WAVE)
 
 #define MUT_LINEAR(buf, v_min, v_max, threshold) \
-    buf[groupID.x] = mutate_linear(buf[base_id], v_min, v_max, seed, threshold)
+    buf[groupID.x] = mutate_linear(buf[base_id_s], v_min, v_max, seed, threshold)
 
 #define MUT_HALF4(buf, v_min, v_max, threshold) \
-    buf[groupID.x] = mutate_half4(buf[base_id], v_min, v_max, seed, threshold)
-    
+    buf[groupID.x] = mutate_half4(buf[base_id_s], v_min, v_max, seed, threshold)
 
 #define MUT_LOG(buf, v_min, v_max, threshold) \
-    buf[groupID.x] = mutate_log(buf[base_id], v_min, v_max, seed, threshold)
+    buf[groupID.x] = mutate_log(buf[base_id_s], v_min, v_max, seed, threshold)
 
-    
 #define MUT_UINT(buf, v_min, v_max, threshold) \
-    buf[groupID.x] = mutate_uint(buf[base_id], v_min, v_max, seed, threshold)
+    buf[groupID.x] = mutate_uint(buf[base_id_s], v_min, v_max, seed, threshold)
 
 
-groupshared int wave_passed_max_s[TOTAL_N / MIN_WAVE];
+groupshared int wave_passed_max_s[MAX_WAVE_SLOTS];
 groupshared half2x4 mutation_map_np2[TOTAL_NP2];
 groupshared half2 mutation_map[TOTAL_N];
-
-
+groupshared uint s_min_passed_idx;
+groupshared uint base_id_s;
 
 struct ResourceParams {
     half base_output;
@@ -156,13 +156,13 @@ uint pcg_hash(uint input) {
     return (word >> 22u) ^ word;
 }
 
-half rand_half(uint input, half threshold = 0.0h) { // 0 ~ 1
+half rand_half(uint input, half threshold = 0.0h) {
     uint h1 = pcg_hash(input);
     half rand = half(float(h1) / 4294967295.0);
     return rand >= threshold ? rand : 0.0h;
 }
 
-half4 rand_half4pm(uint input, half4 thresholds) { // -1 ~ 1
+half4 rand_half4pm(uint input, half4 thresholds) {
     uint h1 = pcg_hash(input);
     uint h2 = pcg_hash(h1 + 1u);
     uint h3 = pcg_hash(h2 + 1u);
@@ -195,7 +195,7 @@ int calc_max_int(uint group_idx, int my_val) {
 
     uint laneCount = WaveGetLaneCount();
     uint waveIndex = group_idx / laneCount;
-    uint waveCount = TOTAL_N / laneCount;
+    uint waveCount = (TOTAL_N + laneCount - 1) / laneCount;
 
     if (WaveIsFirstLane()) {
         wave_passed_max_s[waveIndex] = local_wave_max;
@@ -290,6 +290,10 @@ half4 mutate_half4(half4 base_val, half val_min, half val_max, inout uint seed, 
     );
 }
 
+bool mutation_bool(uint group_id_x, uint step, float rate) {
+    return rand_half(group_id_x * 10007 + step) <= rate;
+}
+
 [WaveSize(32)]
 [shader("compute")]
 [numthreads(N, N, N)]
@@ -306,7 +310,7 @@ void computeMain(
     uniform Link27thParamsAll link27th_params_all,
     uniform LearningParamsAll learning_params_all,
     uniform MutationParamsAll mutation_params_all,
-    RWStructuredBuffer<half> mutation_rate_all,
+    RWStructuredBuffer<float> mutation_rate_all,
     uniform uint step,
     uniform uint total
 ) {
@@ -338,202 +342,202 @@ void computeMain(
     
     inhib_mutation_params.threshold = mutation_params_all.other_threshold[groupID.x].z;
 
-    half rand = rand_half(groupID.x * 10007 + step);
-    bool is_me_passed = rand >= (1.0h - mutation_rate_all[groupID.x]);
-    if (is_me_passed) {
-        return;
-    }
-    int min_passed_index = -1;
+    bool is_me_passed = mutation_bool(groupID.x, step, mutation_rate_all[groupID.x]);
     if (!is_me_passed) {
+        if (groupIndex == 0) {
+            s_min_passed_idx = 0xFFFFFFFFu;
+        }
+        GroupMemoryBarrierWithGroupSync();
         uint search_count = 0;
         uint target_idx = groupID.x + groupIndex;
-        while (min_passed_index == -1 && search_count < 20) {
-            int my_passed_index = mutation_rate_all[target_idx % total] == 1 ? int(target_idx) : -1;
-            min_passed_index = calc_max_int(groupIndex, my_passed_index);
-            target_idx = (target_idx % total) + TOTAL_N;
+        while (s_min_passed_idx == 0xFFFFFFFFu && search_count < 40) {
+            bool target_mutation_bool = mutation_bool(target_idx % total, step, mutation_rate_all[target_idx % total]);
+            int my_passed_index = target_mutation_bool ? target_idx : -1;
+            if (target_mutation_bool) {
+                InterlockedMin(s_min_passed_idx, my_passed_index);
+            }
+            GroupMemoryBarrierWithGroupSync();
+            if (s_min_passed_idx != 0xFFFFFFFFu) {
+                break;
+            }
+            target_idx = target_idx + TOTAL_N;
             search_count++;
         }
-    }
-    uint base_id = (min_passed_index != -1) ? (uint)min_passed_index % total : groupID.x;
-
-    if (groupIndex == 0) {
-        uint seed = groupID.x * 10007u + 42u * step;
-        half threshold_threshold = mutation_params_all.mutate_threshold[groupID.x].x;
-
-        MUT_HALF4(mutation_params_all.sig_pre_threshold, 0.5h, 0.99h, threshold_threshold);
-        MUT_HALF4(mutation_params_all.sig_post_threshold, 0.5h, 0.99h, threshold_threshold);
-        MUT_HALF4(mutation_params_all.other_threshold, 0.5h, 0.99h, threshold_threshold);
-
-        uint4 cur_steps = mutation_params_all.steps[base_id];
-        half steps_threshold = mutation_params_all.mutate_threshold[groupID.x].y;
-        mutation_params_all.steps[groupID.x] = uint4(
-            mutate_uint(cur_steps.x, 0, 10, seed, steps_threshold),
-            mutate_uint(cur_steps.y, 0, 10, seed, steps_threshold),
-            mutate_uint(cur_steps.z, 0, 10, seed, steps_threshold),
-            mutate_uint(cur_steps.w, 0, 10, seed, steps_threshold)
-        );
-
-        half diff_threshold = mutation_params_all.mutate_threshold[groupID.x].z;
-        MUT_HALF4(mutation_params_all.sig_pre_diff, 0.001h, 0.037h, diff_threshold);
-        MUT_HALF4(mutation_params_all.sig_post_diff, 0.001h, 0.037h, diff_threshold);
-        MUT_HALF4(mutation_params_all.other_diff, 0.001h, 0.037h, diff_threshold);
-
-        half max_threshold = mutation_params_all.mutate_threshold[groupID.x].w;
-        MUT_HALF4(mutation_params_all.sig_pre_max, 0.005h, 0.2h, max_threshold);
-        MUT_HALF4(mutation_params_all.sig_post_max, 0.005h, 0.2h, max_threshold);
-        MUT_HALF4(mutation_params_all.other_max, 0.005h, 0.2h, max_threshold);
-
-        // --- ResourceParamsAll の変異 ---
-        // base_output は対数スケール！
-        half4 resource_threshold = mutation_params_all.resource_threshold[groupID.x];
-        MUT_LOG(resource_params_all.base_output, 0.0005h, 0.1h, resource_threshold.x);
-        MUT_LINEAR(resource_params_all.beta, 0.1h, 2.0h, resource_threshold.y);
-        MUT_LINEAR(resource_params_all.k_refill, 0.01h, 0.5h, resource_threshold.z);
-
-        // --- Link27thParamsAll の変異 ---
-        // multiplier は奇数制約！
-        half2 link27th_threshold = mutation_params_all.link27th_threshold[groupID.x];
-        link27th_params_all.multiplier[groupID.x] = mutate_odd(link27th_params_all.multiplier[base_id], 1, 511, seed, link27th_threshold.x);
-        MUT_UINT(link27th_params_all.bias, 0, 511, link27th_threshold.y);
-
-        half4 learning_threshold = mutation_params_all.learning_threshold[groupID.x];
-        MUT_LINEAR(learning_params_all.learning_rate, 0.0h, 1.0h, learning_threshold.x);
-        MUT_LINEAR(learning_params_all.forget_rate, 0.0h, 1.0h, learning_threshold.y);
-        MUT_LINEAR(learning_params_all.learning_threshold, 0.0h, 1.0h, learning_threshold.z);
-        MUT_LINEAR(learning_params_all.tag_decay, 0.5h, 0.999h, learning_threshold.w);
-    }
-
-
-
-
-    // sig_pre_generation
-    for (uint idx_np2 = groupIndex; idx_np2 < TOTAL_NP2; idx_np2 += TOTAL_N) {
-        mutation_map_np2[idx_np2][0] = rand_half4pm(idx_np2 + groupID.x, sig_pre_mutation_params.threshold);
-    }
-    GroupMemoryBarrierWithGroupSync();
-    
-    for (uint step = 0; step < sig_pre_mutation_params.steps; step++) {
-        for (uint idx_np2 = groupIndex; idx_np2 < TOTAL_NP2; idx_np2 += TOTAL_N) {
-            half4 neighbor_sum = half4(0.0h, 0.0h, 0.0h, 0.0h);
-            half4 current_val = get_sig_prepost_mut(indexToCoordNp2(idx_np2), int3(0, 0, 0), step);
-            [unroll]
-            for (int dz = -1; dz <= 1; dz++) {
-                [unroll]
-                for (int dy = -1; dy <= 1; dy++) {
-                    [unroll]
-                    for (int dx = -1; dx <= 1; dx++) {
-                        neighbor_sum += get_sig_prepost_mut(indexToCoordNp2(idx_np2), int3(dx, dy, dz), step);
-                    }
-                }
-            }
-            half4 laplacian = neighbor_sum - 27.0h * current_val;
-            half dt = 1.0h / 54.0h;
-            set_sig_prepost_mut(indexToCoordNp2(idx_np2), step + 1, current_val + (sig_pre_mutation_params.diff * laplacian) * dt);
+        if (groupIndex == 0) {
+            base_id_s = (s_min_passed_idx != 0xFFFFFFFFu) ? (uint)s_min_passed_idx % total : groupID.x;
         }
         GroupMemoryBarrierWithGroupSync();
-    }
-    for (uint idx_np2 = groupIndex; idx_np2 < TOTAL_NP2; idx_np2 += TOTAL_N) {
-        signature_pre_map_np2[groupID.x * TOTAL_NP2 + idx_np2] = clamp(signature_pre_map_np2[base_id * TOTAL_NP2 + idx_np2] + sig_pre_mutation_params.max * mutation_map_np2[idx_np2][sig_pre_mutation_params.steps & 1u], -1.0h, 1.0h);
-    }
-
-    GroupMemoryBarrierWithGroupSync();
-
-
-    // sig_post_generation
-    for (uint idx_np2 = groupIndex; idx_np2 < TOTAL_NP2; idx_np2 += TOTAL_N) {
-        mutation_map_np2[idx_np2][0] = rand_half4pm(idx_np2 + groupID.x + 1, sig_post_mutation_params.threshold);
-    }
-    GroupMemoryBarrierWithGroupSync();
-    
-    for (uint step = 0; step < sig_post_mutation_params.steps; step++) {
-        for (uint idx_np2 = groupIndex; idx_np2 < TOTAL_NP2; idx_np2 += TOTAL_N) {
-            half4 neighbor_sum = half4(0.0h, 0.0h, 0.0h, 0.0h);
-            half4 current_val = get_sig_prepost_mut(indexToCoordNp2(idx_np2), int3(0, 0, 0), step);
-            [unroll]
-            for (int dz = -1; dz <= 1; dz++) {
-                [unroll]
-                for (int dy = -1; dy <= 1; dy++) {
-                    [unroll]
-                    for (int dx = -1; dx <= 1; dx++) {
-                        neighbor_sum += get_sig_prepost_mut(indexToCoordNp2(idx_np2), int3(dx, dy, dz), step);
-                    }
-                }
-            }
-            half4 laplacian = neighbor_sum - 27.0h * current_val;
-            half dt = 1.0h / 54.0h;
-            set_sig_prepost_mut(indexToCoordNp2(idx_np2), step + 1, current_val + (sig_post_mutation_params.diff * laplacian) * dt);
-        }
-        GroupMemoryBarrierWithGroupSync();
-    }
-    for (uint idx_np2 = groupIndex; idx_np2 < TOTAL_NP2; idx_np2 += TOTAL_N) {
-        signature_post_map_np2[groupID.x * TOTAL_NP2 + idx_np2] = clamp(signature_post_map_np2[base_id * TOTAL_NP2 + idx_np2] + sig_post_mutation_params.max * mutation_map_np2[idx_np2][sig_post_mutation_params.steps & 1u], -1.0h, 1.0h);
-    }
-
-
-    // dopamine_generation
-    GroupMemoryBarrierWithGroupSync();
-    mutation_map[groupIndex][0] = rand_half(groupIndex + groupID.x + 2, dopamine_mutation_params.threshold);
-    GroupMemoryBarrierWithGroupSync();
         
-    for (uint step = 0; step < dopamine_mutation_params.steps; step++) {
-        half neighbor_sum = 0.0h;
-        half current_val = get_sig_dopslp_mut(indexToCoordN(groupIndex), int3(0, 0, 0), step);
-        [unroll]
-        for (int dz = -1; dz <= 1; dz++) {
-            [unroll]
-            for (int dy = -1; dy <= 1; dy++) {
+        if (groupIndex == 0) {
+            uint seed = groupID.x * 10007u + 42u * step;
+            half threshold_threshold = mutation_params_all.mutate_threshold[groupID.x].x;
+
+            MUT_HALF4(mutation_params_all.sig_pre_threshold, 0.5h, 0.99h, threshold_threshold);
+            MUT_HALF4(mutation_params_all.sig_post_threshold, 0.5h, 0.99h, threshold_threshold);
+            MUT_HALF4(mutation_params_all.other_threshold, 0.5h, 0.99h, threshold_threshold);
+
+            uint4 cur_steps = mutation_params_all.steps[base_id_s];
+            half steps_threshold = mutation_params_all.mutate_threshold[groupID.x].y;
+            mutation_params_all.steps[groupID.x] = uint4(
+                mutate_uint(cur_steps.x, 0, 10, seed, steps_threshold),
+                mutate_uint(cur_steps.y, 0, 10, seed, steps_threshold),
+                mutate_uint(cur_steps.z, 0, 10, seed, steps_threshold),
+                mutate_uint(cur_steps.w, 0, 10, seed, steps_threshold)
+            );
+
+            half diff_threshold = mutation_params_all.mutate_threshold[groupID.x].z;
+            MUT_HALF4(mutation_params_all.sig_pre_diff, 0.001h, 0.037h, diff_threshold);
+            MUT_HALF4(mutation_params_all.sig_post_diff, 0.001h, 0.037h, diff_threshold);
+            MUT_HALF4(mutation_params_all.other_diff, 0.001h, 0.037h, diff_threshold);
+
+            half max_threshold = mutation_params_all.mutate_threshold[groupID.x].w;
+            MUT_HALF4(mutation_params_all.sig_pre_max, 0.005h, 0.2h, max_threshold);
+            MUT_HALF4(mutation_params_all.sig_post_max, 0.005h, 0.2h, max_threshold);
+            MUT_HALF4(mutation_params_all.other_max, 0.005h, 0.2h, max_threshold);
+
+            // --- ResourceParamsAll の変異 ---
+            half4 resource_threshold = mutation_params_all.resource_threshold[groupID.x];
+            MUT_LOG(resource_params_all.base_output, 0.0005h, 0.1h, resource_threshold.x);
+            MUT_LINEAR(resource_params_all.beta, 15.0h, 30.0h, resource_threshold.y);
+            MUT_LINEAR(resource_params_all.k_refill, 0.01h, 0.5h, resource_threshold.z);
+
+            // --- Link27thParamsAll の変異 (上限を TOTAL_N - 1 に動的化) ---
+            half2 link27th_threshold = mutation_params_all.link27th_threshold[groupID.x];
+            link27th_params_all.multiplier[groupID.x] = mutate_odd(link27th_params_all.multiplier[base_id_s], 1, TOTAL_N - 1, seed, link27th_threshold.x);
+            MUT_UINT(link27th_params_all.bias, 0, TOTAL_N - 1, link27th_threshold.y);
+
+            half4 learning_threshold = mutation_params_all.learning_threshold[groupID.x];
+            MUT_LINEAR(learning_params_all.learning_rate, 0.0h, 1.0h, learning_threshold.x);
+            MUT_LINEAR(learning_params_all.forget_rate, 0.0h, 1.0h, learning_threshold.y);
+            MUT_LINEAR(learning_params_all.learning_threshold, 0.0h, 1.0h, learning_threshold.z);
+            MUT_LINEAR(learning_params_all.tag_decay, 0.5h, 0.999h, learning_threshold.w);
+        }
+
+        // sig_pre_generation
+        for (uint idx_np2 = groupIndex; idx_np2 < TOTAL_NP2; idx_np2 += TOTAL_N) {
+            mutation_map_np2[idx_np2][0] = rand_half4pm(idx_np2 + groupID.x, sig_pre_mutation_params.threshold);
+        }
+        GroupMemoryBarrierWithGroupSync();
+        
+        for (uint step = 0; step < sig_pre_mutation_params.steps; step++) {
+            for (uint idx_np2 = groupIndex; idx_np2 < TOTAL_NP2; idx_np2 += TOTAL_N) {
+                half4 neighbor_sum = half4(0.0h, 0.0h, 0.0h, 0.0h);
+                half4 current_val = get_sig_prepost_mut(indexToCoordNp2(idx_np2), int3(0, 0, 0), step);
                 [unroll]
-                for (int dx = -1; dx <= 1; dx++) {
-                    neighbor_sum += get_sig_dopslp_mut(indexToCoordN(groupIndex), int3(dx, dy, dz), step);
+                for (int dz = -1; dz <= 1; dz++) {
+                    [unroll]
+                    for (int dy = -1; dy <= 1; dy++) {
+                        [unroll]
+                        for (int dx = -1; dx <= 1; dx++) {
+                            neighbor_sum += get_sig_prepost_mut(indexToCoordNp2(idx_np2), int3(dx, dy, dz), step);
+                        }
+                    }
+                }
+                half4 laplacian = neighbor_sum - 27.0h * current_val;
+                half dt = 1.0h / 54.0h;
+                set_sig_prepost_mut(indexToCoordNp2(idx_np2), step + 1, current_val + (sig_pre_mutation_params.diff * laplacian) * dt);
+            }
+            GroupMemoryBarrierWithGroupSync();
+        }
+        for (uint idx_np2 = groupIndex; idx_np2 < TOTAL_NP2; idx_np2 += TOTAL_N) {
+            signature_pre_map_np2[groupID.x * TOTAL_NP2 + idx_np2] = clamp(signature_pre_map_np2[base_id_s * TOTAL_NP2 + idx_np2] + sig_pre_mutation_params.max * mutation_map_np2[idx_np2][sig_pre_mutation_params.steps & 1u], -1.0h, 1.0h);
+        }
+
+        GroupMemoryBarrierWithGroupSync();
+
+        // sig_post_generation
+        for (uint idx_np2 = groupIndex; idx_np2 < TOTAL_NP2; idx_np2 += TOTAL_N) {
+            mutation_map_np2[idx_np2][0] = rand_half4pm(idx_np2 + groupID.x + 1, sig_post_mutation_params.threshold);
+        }
+        GroupMemoryBarrierWithGroupSync();
+        
+        for (uint step = 0; step < sig_post_mutation_params.steps; step++) {
+            for (uint idx_np2 = groupIndex; idx_np2 < TOTAL_NP2; idx_np2 += TOTAL_N) {
+                half4 neighbor_sum = half4(0.0h, 0.0h, 0.0h, 0.0h);
+                half4 current_val = get_sig_prepost_mut(indexToCoordNp2(idx_np2), int3(0, 0, 0), step);
+                [unroll]
+                for (int dz = -1; dz <= 1; dz++) {
+                    [unroll]
+                    for (int dy = -1; dy <= 1; dy++) {
+                        [unroll]
+                        for (int dx = -1; dx <= 1; dx++) {
+                            neighbor_sum += get_sig_prepost_mut(indexToCoordNp2(idx_np2), int3(dx, dy, dz), step);
+                        }
+                    }
+                }
+                half4 laplacian = neighbor_sum - 27.0h * current_val;
+                half dt = 1.0h / 54.0h;
+                set_sig_prepost_mut(indexToCoordNp2(idx_np2), step + 1, current_val + (sig_post_mutation_params.diff * laplacian) * dt);
+            }
+            GroupMemoryBarrierWithGroupSync();
+        }
+        for (uint idx_np2 = groupIndex; idx_np2 < TOTAL_NP2; idx_np2 += TOTAL_N) {
+            signature_post_map_np2[groupID.x * TOTAL_NP2 + idx_np2] = clamp(signature_post_map_np2[base_id_s * TOTAL_NP2 + idx_np2] + sig_post_mutation_params.max * mutation_map_np2[idx_np2][sig_post_mutation_params.steps & 1u], -1.0h, 1.0h);
+        }
+
+        // dopamine_generation
+        GroupMemoryBarrierWithGroupSync();
+        mutation_map[groupIndex][0] = rand_half(groupIndex + groupID.x + 2, dopamine_mutation_params.threshold);
+        GroupMemoryBarrierWithGroupSync();
+            
+        for (uint step = 0; step < dopamine_mutation_params.steps; step++) {
+            half neighbor_sum = 0.0h;
+            half current_val = get_sig_dopslp_mut(indexToCoordN(groupIndex), int3(0, 0, 0), step);
+            [unroll]
+            for (int dz = -1; dz <= 1; dz++) {
+                [unroll]
+                for (int dy = -1; dy <= 1; dy++) {
+                    [unroll]
+                    for (int dx = -1; dx <= 1; dx++) {
+                        neighbor_sum += get_sig_dopslp_mut(indexToCoordN(groupIndex), int3(dx, dy, dz), step);
+                    }
                 }
             }
+            half laplacian = neighbor_sum - 27.0h * current_val;
+            half dt = 1.0h / 54.0h;
+            set_sig_dopslp_mut(indexToCoordN(groupIndex), step + 1, current_val + (dopamine_mutation_params.diff * laplacian) * dt);
+            GroupMemoryBarrierWithGroupSync();
         }
-        half laplacian = neighbor_sum - 27.0h * current_val;
-        half dt = 1.0h / 54.0h;
-        set_sig_dopslp_mut(indexToCoordN(groupIndex), step + 1, current_val + (dopamine_mutation_params.diff * laplacian) * dt);
+        dopamine_map_all[groupID.x * TOTAL_N + groupIndex] = saturate(dopamine_map_all[base_id_s * TOTAL_N + groupIndex] + dopamine_mutation_params.max * mutation_map[groupIndex][dopamine_mutation_params.steps & 1u]);
+
+        // sleep_generation
         GroupMemoryBarrierWithGroupSync();
-    }
-    dopamine_map_all[groupID.x * TOTAL_N + groupIndex] = saturate(dopamine_map_all[base_id * TOTAL_N + groupIndex] + dopamine_mutation_params.max * mutation_map[groupIndex][dopamine_mutation_params.steps & 1u]);
+        mutation_map[groupIndex][0] = rand_half(groupIndex + groupID.x + 3, sleep_mutation_params.threshold);
+        GroupMemoryBarrierWithGroupSync();
 
-
-    // sleep_generation
-    GroupMemoryBarrierWithGroupSync();
-    mutation_map[groupIndex][0] = rand_half(groupIndex + groupID.x + 3, sleep_mutation_params.threshold);
-    GroupMemoryBarrierWithGroupSync();
-
-    for (uint step = 0; step < sleep_mutation_params.steps; step++) {
-        half neighbor_sum = 0.0h;
-        half current_val = get_sig_dopslp_mut(indexToCoordN(groupIndex), int3(0, 0, 0), step);
-        [unroll]
-        for (int dz = -1; dz <= 1; dz++) {
+        for (uint step = 0; step < sleep_mutation_params.steps; step++) {
+            half neighbor_sum = 0.0h;
+            half current_val = get_sig_dopslp_mut(indexToCoordN(groupIndex), int3(0, 0, 0), step);
             [unroll]
-            for (int dy = -1; dy <= 1; dy++) {
+            for (int dz = -1; dz <= 1; dz++) {
                 [unroll]
-                for (int dx = -1; dx <= 1; dx++) {
-                    neighbor_sum += get_sig_dopslp_mut(indexToCoordN(groupIndex), int3(dx, dy, dz), step);
+                for (int dy = -1; dy <= 1; dy++) {
+                    [unroll]
+                    for (int dx = -1; dx <= 1; dx++) {
+                        neighbor_sum += get_sig_dopslp_mut(indexToCoordN(groupIndex), int3(dx, dy, dz), step);
+                    }
                 }
             }
+            half laplacian = neighbor_sum - 27.0h * current_val;
+            half dt = 1.0h / 54.0h;
+            set_sig_dopslp_mut(indexToCoordN(groupIndex), step + 1, current_val + (sleep_mutation_params.diff * laplacian) * dt);
+            GroupMemoryBarrierWithGroupSync();
         }
-        half laplacian = neighbor_sum - 27.0h * current_val;
-        half dt = 1.0h / 54.0h;
-        set_sig_dopslp_mut(indexToCoordN(groupIndex), step + 1, current_val + (sleep_mutation_params.diff * laplacian) * dt);
+        sleep_map_all[groupID.x * TOTAL_N + groupIndex] = saturate(sleep_map_all[base_id_s * TOTAL_N + groupIndex] + sleep_mutation_params.max * mutation_map[groupIndex][sleep_mutation_params.steps & 1u]);
+
+        GroupMemoryBarrierWithGroupSync();
+
+        uint packed_val = inhib_map_all[(base_id_s * INHIB_STRIDE) + (groupIndex >> 5)];
+        bool is_me_inhib = bool((packed_val >> (groupIndex & 31)) & 1);
+        bool mutation = rand_half(groupIndex + groupID.x + 4, inhib_mutation_params.threshold) > 0.0h;
+
+        bool my_inhib = is_me_inhib ^ mutation;
+        uint4 ballot = WaveActiveBallot(my_inhib);
+
+        if (WaveIsFirstLane()) {
+            uint packed_index = (groupID.x * INHIB_STRIDE) + (groupIndex / WaveGetLaneCount());
+            inhib_map_all[packed_index] = ballot.x;
+        }
         GroupMemoryBarrierWithGroupSync();
     }
-    sleep_map_all[groupID.x * TOTAL_N + groupIndex] = saturate(sleep_map_all[base_id * TOTAL_N + groupIndex] + sleep_mutation_params.max * mutation_map[groupIndex][sleep_mutation_params.steps & 1u]);
-
-    GroupMemoryBarrierWithGroupSync();
-
-    
-    uint packed_val = inhib_map_all[(base_id * 16) + (groupIndex >> 5)];
-    bool is_me_inhib = bool((packed_val >> (groupIndex & 31)) & 1);
-    bool mutation = rand_half(groupIndex + groupID.x + 4, inhib_mutation_params.threshold) > 0.0h;
-
-    bool my_inhib = is_me_inhib ^ mutation;
-    uint4 ballot = WaveActiveBallot(my_inhib);
-
-    if (WaveIsFirstLane()) {
-        uint packed_index = (groupID.x * 16) + (groupIndex / WaveGetLaneCount());
-        inhib_map_all[packed_index] = ballot.x;
-    }
-    GroupMemoryBarrierWithGroupSync();
 }

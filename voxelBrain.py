@@ -8,14 +8,24 @@ import dataclasses
 import time
 import os
 import signal
+import glob
+import csv
+from datetime import datetime
 
+
+stop_requested = False
 
 def force_exit_handler(signum, frame):
-    print("\n[!] Ctrl+C を検知しました。GPUを待たずに即時強制終了します...")
-    os._exit(0)
-    
-signal.signal(signal.SIGINT, force_exit_handler)
+    global stop_requested
+    if not stop_requested:
+        print("\n[!] Ctrl+C を検知しました！現在のステップ完了後に上位20体を保存して終了します...")
+        print("    (※ GPUを待たずに今すぐ強制終了したい場合は、もう一度 Ctrl+C を押してください)")
+        stop_requested = True
+    else:
+        print("\n[!!] 2回目の Ctrl+C を検知しました。即時強制終了します！")
+        os._exit(1)
 
+signal.signal(signal.SIGINT, force_exit_handler)
 
 @runtime_checkable
 class Generatable(Protocol):
@@ -94,16 +104,17 @@ class R4:
         raise ValueError("Unexpected Error")
 
 class Config:
-    dim: int = 3
+    dim: int = 2  # dim=1 -> N=2, dim=2 -> N=4, dim=3 -> N=8
     N: int = 1 << dim
     P: int = N + 2
     shift_x: int = 0
     shift_y: int = dim
     shift_z: int = dim * 2
     total_cells: int = 1 << (dim * 3)
+    inhib_stride: int = (total_cells + 31) // 32  # 1個体あたりのuint32要素数
     mask: int = N - 1
     
-    m: int = 1 << 13
+    m: int = 1 << 15
     world_size: float = 100.0
     
     class Seed:
@@ -141,13 +152,13 @@ class InhibRange:
 
 
 class Link27thRange:
-    multiplier = R(int, 0, 511, odd=True)
-    bias = R(int, 0, 511)
+    multiplier = R(int, 0, Config.total_cells - 1, odd=True)
+    bias = R(int, 0, Config.total_cells - 1)
 
 
 class NeuronResourceRange:
-    base_output = R(float, 0.001, 0.05, log=True)
-    beta = R(float, 0.2, 1.2)
+    base_output = R(float, 0.001, 0.1, log=True)
+    beta = R(float, 15.0, 30.0)
     k_refill = R(float, 0.02, 0.3)
 
 
@@ -305,7 +316,7 @@ sig_pre_map_np2 = np.zeros(Config.m * Config.P * Config.P * Config.P * 4, dtype=
 sig_post_map_np2 = np.zeros(Config.m * Config.P * Config.P * Config.P * 4, dtype=np.half)
 dopamine_map = np.zeros(Config.m * Config.N * Config.N * Config.N, dtype=np.half)
 sleep_map = np.zeros(Config.m * Config.N * Config.N * Config.N, dtype=np.half)
-inhib_sign_map = np.zeros(Config.m * Config.N * Config.N * Config.N // 32, dtype=np.uint32)
+inhib_sign_map = np.zeros(Config.m * Config.inhib_stride, dtype=np.uint32)
 
 generation_dict = {
     "sig_pre_map_np2_pout": sig_pre_map_np2,
@@ -352,20 +363,8 @@ sleep_sum_buf = device.create_buffer(
     data=np.zeros(Config.m, dtype=np.float16),
     usage=spy.BufferUsage.unordered_access
 )
-pos_buf = device.create_buffer(
-    data=np.zeros((Config.m, 2), dtype=np.float32),
-    usage=spy.BufferUsage.unordered_access,
-)
-obj_pos_buf = device.create_buffer(
-    data=np.random.uniform(-Config.world_size, Config.world_size, size=(Config.m, 2)).astype(np.float32),
-    usage=spy.BufferUsage.unordered_access,
-)
 mutation_rate_buf = device.create_buffer(
     data=np.zeros(Config.m, dtype=np.float32),
-    usage=spy.BufferUsage.unordered_access,
-)
-goal_count_buf = device.create_buffer(
-    data=np.zeros(Config.m, dtype=np.uint32),
     usage=spy.BufferUsage.unordered_access,
 )
 
@@ -374,13 +373,8 @@ shared_link27th_params_buf = cast_and_buffer(genesis_params.link27th_params, dev
 shared_learning_params_buf = cast_and_buffer(genesis_params.learning_params, device)
 shared_mutation_params_buf = cast_and_buffer(create_mutation_params_buffers(Config.m, 42), device)
 
-import glob
 
 def load_and_distribute_all_elites(folder_path: str):
-    """
-    指定フォルダ内のすべての .npz ファイルを読み込み、
-    全エージェント(Config.m体)に均等にインターリーブ（交互）配分する
-    """
     file_list = sorted(glob.glob(os.path.join(folder_path, "*.npz")))
     if not file_list:
         print(f"[!] フォルダ内に .npz ファイルが見つかりません: {folder_path}")
@@ -390,18 +384,10 @@ def load_and_distribute_all_elites(folder_path: str):
     print(f"\n[★] {num_elites} 個のエリート遺伝子を発見しました！")
     print(f"    1系統あたり約 {Config.m // num_elites} 体ずつ、全 {Config.m} 体に均等配分します...")
 
-    # 全ファイルを一括読み込み
     elites = [np.load(f) for f in file_list]
-
-    # -------------------------------------------------------------
-    # 割り当てマップの作成 (0 ~ num_elites - 1 を交互に繰り返す)
-    # [0, 1, 2, ..., K-1, 0, 1, 2, ...]
-    # ※ 交互に配置することで、隣り合う個体が別系統になり多様性が混ざりやすくなる！
-    # -------------------------------------------------------------
     assign = np.arange(Config.m) % num_elites
 
     # --- 1. 空間マップ（脳の配線）の均等配分 ---
-    # 各エリートの配列をスタックして、assignで一気に 8192 体分に展開
     sig_pre_all  = np.stack([e["sig_pre"] for e in elites])[assign].reshape(-1).astype(np.float16)
     sig_post_all = np.stack([e["sig_post"] for e in elites])[assign].reshape(-1).astype(np.float16)
     dopamine_all = np.stack([e["dopamine"] for e in elites])[assign].reshape(-1).astype(np.float16)
@@ -436,8 +422,8 @@ def load_and_distribute_all_elites(folder_path: str):
         np.array([e["learn_rate"] for e in elites], dtype=np.float16)[assign]
     )
     shared_learning_params_buf["forget_rate"].copy_from_numpy(
-            np.array([e["learn_forget"] for e in elites], dtype=np.float16)[assign]
-        )
+        np.array([e["learn_forget"] for e in elites], dtype=np.float16)[assign]
+    )
     shared_learning_params_buf["learning_threshold"].copy_from_numpy(
         np.array([e["learn_threshold"] for e in elites], dtype=np.float16)[assign]
     )
@@ -447,12 +433,8 @@ def load_and_distribute_all_elites(folder_path: str):
 
     print("[★] 全8,192体への多系統エリート配分が完了しました！\n")
 
-# =====================================================================
-# 【エリートの読み込みと配給】
-# 前回の最強個体をロードして、全8,192体の初期値にする！
-# =====================================================================
-LOAD_CHECKPOINT_FOLDER = "backups/elites"  # 読み込みたいファイル
 
+LOAD_CHECKPOINT_FOLDER = "backups/elites"
 load = False
 
 if LOAD_CHECKPOINT_FOLDER and os.path.exists(LOAD_CHECKPOINT_FOLDER) and load is True:
@@ -472,10 +454,7 @@ reasoning_sim_dict = {
     "learning_params_all": shared_learning_params_buf,
     "dopamine_sum": dopamine_sum_buf,
     "sleep_sum": sleep_sum_buf,
-    "object_pos_all": obj_pos_buf,
-    "position_all": pos_buf,
     "mutation_rate_all": mutation_rate_buf,
-    "goal_count_all": goal_count_buf,
     "dt": 0.01,
     "step": 0,
 }
@@ -495,28 +474,99 @@ mutation_dict = {
     "step": 0
 }
 
-import csv
-from datetime import datetime
-
-# 実行開始時の日時でログファイル名を作成
 timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
-log_filename = f"logs/log_stage2_{timestamp_str}.csv"
+log_filename = f"logs/log_solar_{timestamp_str}.csv"
 checkpoint_dir = f"backups/checkpoint_{timestamp_str}"
+top20_dir = os.path.join(checkpoint_dir, "top20")
+os.makedirs("logs", exist_ok=True)
 os.makedirs(checkpoint_dir, exist_ok=True)
+os.makedirs(top20_dir, exist_ok=True)
 
-# CSVヘッダーの書き込み (2回ゴール、3回ゴールの内訳も記録)
+BASE_ENERGY = 0.20
+
 with open(log_filename, mode="w", newline="", encoding="utf-8") as f:
     writer = csv.writer(f)
-    writer.writerow(["step", "elapsed_sec", "passed_ge2", "goals_ge1", "goals_ge3", "total_goals", "max_goals", "top10_goals"])
+    writer.writerow(["step", "elapsed_sec", "passed_ge2", "stay_base", "elite_ge04", "mean_energy", "max_energy", "top10_energy"])
 
-print(f"[+] ステージ2（2回以上で合格）を開始します！")
+print(f"[+] 太陽光発電タスク（N={Config.N}, 初期エネルギー={BASE_ENERGY}）を開始します！")
 print(f"[+] ログ: '{log_filename}'")
 print(f"[+] エリート保存先: '{checkpoint_dir}/'")
 
-TOTAL_STEPS = 3000
-best_max_goals = 0  # 過去最高記録を追跡
 
-for step in range(TOTAL_STEPS):  
+def get_current_energies() -> np.ndarray:
+    """GPUから現在のエネルギー配列を取得する"""
+    raw_bytes = mutation_rate_buf.to_numpy()
+    if raw_bytes.nbytes == Config.m * 2:
+        return raw_bytes.view(np.float16).astype(np.float32)
+    return raw_bytes.view(np.float32)
+
+
+def save_top_k_elites(step_num: int, energies: np.ndarray, k: int = 20):
+    """上位 k 体の遺伝子を一括でGPUから抜き出して保存する"""
+    print(f"\n[+] 終了処理: Step {step_num} 時点の上位 {k} 体を '{top20_dir}/' に保存しています...")
+    device.wait()
+
+    # 上位 k 個体のインデックスを取得（降順）
+    top_indices = np.argsort(energies)[::-1][:k]
+
+    # GPU→CPU転送を1回だけで済ませるため、最初に全配列を取得
+    P_cube_4   = Config.P * Config.P * Config.P * 4
+    N_cube     = Config.N * Config.N * Config.N
+    INHIB_SIZE = Config.inhib_stride
+
+    sig_pre_all  = gen_buf_dict["sig_pre_map_np2_pout"].to_numpy().view(np.float16)
+    sig_post_all = gen_buf_dict["sig_post_map_np2_pout"].to_numpy().view(np.float16)
+    dopamine_all = gen_buf_dict["dopamine_map_pout"].to_numpy().view(np.float16)
+    sleep_all    = gen_buf_dict["sleep_map_pout"].to_numpy().view(np.float16)
+    inhib_all    = gen_buf_dict["inhib_sign_map_pout"].to_numpy().view(np.uint32)
+
+    res_base   = shared_resource_params_buf["base_output"].to_numpy()
+    res_beta   = shared_resource_params_buf["beta"].to_numpy()
+    res_refill = shared_resource_params_buf["k_refill"].to_numpy()
+    link_mult  = shared_link27th_params_buf["multiplier"].to_numpy()
+    link_bias  = shared_link27th_params_buf["bias"].to_numpy()
+    lr_rate    = shared_learning_params_buf["learning_rate"].to_numpy()
+    lr_forget  = shared_learning_params_buf["forget_rate"].to_numpy()
+    lr_thresh  = shared_learning_params_buf["learning_threshold"].to_numpy()
+    lr_decay   = shared_learning_params_buf["tag_decay"].to_numpy()
+
+    for rank, idx in enumerate(top_indices, start=1):
+        idx = int(idx)
+        score = float(energies[idx])
+        save_path = os.path.join(top20_dir, f"rank{rank:02d}_step{step_num}_energy{score:.3f}_id{idx}.npz")
+
+        np.savez_compressed(
+            save_path,
+            step=step_num,
+            score=score,
+            sig_pre=sig_pre_all[idx * P_cube_4 : (idx + 1) * P_cube_4],
+            sig_post=sig_post_all[idx * P_cube_4 : (idx + 1) * P_cube_4],
+            dopamine=dopamine_all[idx * N_cube : (idx + 1) * N_cube],
+            sleep=sleep_all[idx * N_cube : (idx + 1) * N_cube],
+            inhib=inhib_all[idx * INHIB_SIZE : (idx + 1) * INHIB_SIZE],
+            resource_base_output=res_base[idx],
+            resource_beta=res_beta[idx],
+            resource_k_refill=res_refill[idx],
+            link_multiplier=link_mult[idx],
+            link_bias=link_bias[idx],
+            learn_rate=lr_rate[idx],
+            learn_forget=lr_forget[idx],
+            learn_threshold=lr_thresh[idx],
+            learn_decay=lr_decay[idx],
+        )
+
+    print(f"[★] 上位 {k} 体の保存が完了しました！(1位スコア: {energies[top_indices[0]]:.3f} ~ {k}位スコア: {energies[top_indices[-1]]:.3f})")
+
+
+TOTAL_STEPS = 3000
+best_max_energy = BASE_ENERGY + 0.005
+last_completed_step = 0
+latest_energies = np.zeros(Config.m, dtype=np.float32)
+
+for step in range(TOTAL_STEPS):
+    if stop_requested:
+        break
+
     start_time_output = time.perf_counter()
     reasoning_sim_dict["step"] = step
     mutation_dict["step"] = step
@@ -526,6 +576,13 @@ for step in range(TOTAL_STEPS):
         **reasoning_sim_dict
     )
     
+    # ※ 最終ステップやCtrl+C停止時は、変異で上書きされる前の状態で保存したい場合はここで判定
+    if stop_requested:
+        device.wait()
+        latest_energies = get_current_energies()
+        last_completed_step = step
+        break
+
     kernel_mutation.dispatch(
         thread_count=(Config.m * Config.N, Config.N, Config.N),
         **mutation_dict
@@ -536,39 +593,48 @@ for step in range(TOTAL_STEPS):
         end_time_output = time.perf_counter()
         elapsed_time_output = end_time_output - start_time_output
 
-        goal_counts = goal_count_buf.to_numpy().view(np.uint32)
-        total_goals = int(np.sum(goal_counts))
-        max_goals = int(np.max(goal_counts))
+        energies = get_current_energies()
+        latest_energies = energies
+        last_completed_step = step
         
-        # 内訳の集計
-        passed_ge2 = int(np.count_nonzero(goal_counts >= 2))  # 今回の合格エリート
-        goals_ge1  = int(np.count_nonzero(goal_counts >= 1))  # 1回以上ゴール
-        goals_ge3  = int(np.count_nonzero(goal_counts >= 3))  # 3回以上ゴール
-        top10 = np.sort(goal_counts)[::-1][:10].tolist()
+        max_energy  = float(np.max(energies))
+        mean_energy = float(np.mean(energies))
+        
+        gained_count = int(np.count_nonzero(energies > BASE_ENERGY + 0.002))
+        stay_count   = int(np.count_nonzero(np.abs(energies - BASE_ENERGY) <= 0.002))
+        elite_ge04   = int(np.count_nonzero(energies >= 0.40))
+        
+        top10 = [round(float(x), 3) for x in np.sort(energies)[::-1][:10]]
 
-        # コンソール表示 (2回ゴール以上のエリート数をメイン表示)
-        print(f"Step {step:05d} | {elapsed_time_output:.3f}s | エリート(2回+): {passed_ge2:3d}体 | (1回+: {goals_ge1:3d}, 3回+: {goals_ge3:2d}) | Max: {max_goals} | Top10: {top10}")
+        print(
+            f"Step {step:05d} | {elapsed_time_output:.3f}s | "
+            f"黒字(>0.2): {gained_count:4d}体 | (静止=0.2: {stay_count:4d}, 0.4+: {elite_ge04:4d}) | "
+            f"Max: {max_energy:.3f} | Mean: {mean_energy:.3f} | Top5: {top10[:5]}"
+        )
 
-        # CSVに1行追記して即時フラッシュ
         with open(log_filename, mode="a", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow([step, f"{elapsed_time_output:.4f}", passed_ge2, goals_ge1, goals_ge3, total_goals, max_goals, f'"{top10}"'])
+            writer.writerow([
+                step,
+                f"{elapsed_time_output:.4f}",
+                gained_count,
+                stay_count,
+                elite_ge04,
+                f"{mean_energy:.4f}",
+                f"{max_energy:.4f}",
+                f'"{top10}"'
+            ])
             f.flush()
 
-        # -------------------------------------------------------------
-        # 【新機能】最高記録を更新、または3回ゴールが出たらエリートの遺伝子をセーブ！
-        # -------------------------------------------------------------
-        # --- 最高記録エリートの完全保存 (脳マップも丸ごと保存！) ---
-        if max_goals >= best_max_goals or (max_goals >= 3 and step % 50 == 0):
-            best_max_goals = max(best_max_goals, max_goals)
-            best_idx = int(np.argmax(goal_counts))
-            save_path = os.path.join(checkpoint_dir, f"elite_step{step}_score{max_goals}_id{best_idx}.npz")
+        # 途中経過での最高記録更新時の単体保存
+        if max_energy > best_max_energy:
+            best_max_energy = max_energy
+            best_idx = int(np.argmax(energies))
+            save_path = os.path.join(checkpoint_dir, f"best_step{step}_energy{max_energy:.3f}_id{best_idx}.npz")
             
-            # 該当個体(best_idx)の脳マップをGPUから抜き出す
             P_cube_4 = Config.P * Config.P * Config.P * 4
             N_cube   = Config.N * Config.N * Config.N
-            
-            INHIB_SIZE = N_cube // 32
+            INHIB_SIZE = Config.inhib_stride
             
             sig_pre_elite  = gen_buf_dict["sig_pre_map_np2_pout"].to_numpy().view(np.float16)[best_idx * P_cube_4 : (best_idx + 1) * P_cube_4]
             sig_post_elite = gen_buf_dict["sig_post_map_np2_pout"].to_numpy().view(np.float16)[best_idx * P_cube_4 : (best_idx + 1) * P_cube_4]
@@ -576,27 +642,29 @@ for step in range(TOTAL_STEPS):
             sleep_elite    = gen_buf_dict["sleep_map_pout"].to_numpy().view(np.float16)[best_idx * N_cube : (best_idx + 1) * N_cube]
             inhib_elite    = gen_buf_dict["inhib_sign_map_pout"].to_numpy().view(np.uint32)[best_idx * INHIB_SIZE : (best_idx + 1) * INHIB_SIZE]
 
-            # 丸ごと圧縮保存！
             np.savez_compressed(
                 save_path,
                 step=step,
-                score=max_goals,
-                # 脳の空間マップ
+                score=max_energy,
                 sig_pre=sig_pre_elite,
                 sig_post=sig_post_elite,
                 dopamine=dopamine_elite,
                 sleep=sleep_elite,
                 inhib=inhib_elite,
-                # 個体パラメータ
                 resource_base_output=shared_resource_params_buf["base_output"].to_numpy()[best_idx],
                 resource_beta=shared_resource_params_buf["beta"].to_numpy()[best_idx],
                 resource_k_refill=shared_resource_params_buf["k_refill"].to_numpy()[best_idx],
                 link_multiplier=shared_link27th_params_buf["multiplier"].to_numpy()[best_idx],
                 link_bias=shared_link27th_params_buf["bias"].to_numpy()[best_idx],
                 learn_rate=shared_learning_params_buf["learning_rate"].to_numpy()[best_idx],
+                learn_forget=shared_learning_params_buf["forget_rate"].to_numpy()[best_idx],
                 learn_threshold=shared_learning_params_buf["learning_threshold"].to_numpy()[best_idx],
                 learn_decay=shared_learning_params_buf["tag_decay"].to_numpy()[best_idx],
             )
-            print(f"  [★] 完全エリート遺伝子を保存しました -> {save_path}")
+            print(f"  [★] 過去最高エリートを更新・保存しました -> {save_path}")
 
+# =====================================================================
+# ループ終了時（3000ステップ完走 または Ctrl+C 中断時）に上位20体を一括保存
+# =====================================================================
+save_top_k_elites(last_completed_step, latest_energies, k=20)
 print("wow")
