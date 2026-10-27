@@ -1,7 +1,51 @@
+// =============================================================================
+// 静的解析・LSPチェッカー用ダミー定義（Pythonからのビルド時は上書きされます）
+// =============================================================================
 #ifndef DIM
-#error "Config.dim is not defined! Please pass 'dim' in compilation defines."
+#define DIM 2
 #endif
 
+#ifndef ENABLE_LEARNING
+#define ENABLE_LEARNING 0.0h
+#endif
+#ifndef USE_LEARNING
+#define USE_LEARNING 0
+#endif
+
+#ifndef ENABLE_DOPAMINE
+#define ENABLE_DOPAMINE 0.0h
+#endif
+#ifndef USE_DOPAMINE
+#define USE_DOPAMINE 0
+#endif
+
+#ifndef ENABLE_SLEEP
+#define ENABLE_SLEEP 0.0h
+#endif
+#ifndef USE_SLEEP
+#define USE_SLEEP 0
+#endif
+
+#ifndef INITIAL_ENERGY
+#define INITIAL_ENERGY 0.20f
+#endif
+
+#ifndef METABOLIC_COST
+#define METABOLIC_COST 0.0001f
+#endif
+
+#ifndef GEN_COST_RATE
+#define GEN_COST_RATE 0.005f
+#endif
+
+#ifndef SOLAR_GAIN_RATE
+#define SOLAR_GAIN_RATE 0.012f
+#endif
+
+#ifndef SUN_CYCLE_PERIOD
+#define SUN_CYCLE_PERIOD 50.0f
+#endif
+// =============================================================================
 #define N (1 << DIM)
 #define MASK (N - 1)
 
@@ -286,7 +330,7 @@ void computeMain(
     uint agent_id = groupID.x;
 
     if (groupIndex == 0) {
-        my_energy_s = 0.2h;
+        my_energy_s = INITIAL_ENERGY;
     }
 
     for (uint idx_np2 = groupIndex; idx_np2 < TOTAL_NP2; idx_np2 += TOTAL_N) {
@@ -302,8 +346,18 @@ void computeMain(
         synapse_data.set_tags_idx_ui7(idx_ui7, 0u);
     }
 
-    half my_dopamine_map = dopamine_map_all[N * N * N * groupID.x + groupIndex] * 0.0h;
-    half my_sleep_map = sleep_map_all[N * N * N * groupID.x + groupIndex] * 0.0h;
+#if USE_DOPAMINE
+    half my_dopamine_map = dopamine_map_all[N * N * N * groupID.x + groupIndex];
+#else
+    half my_dopamine_map = 0.0h;
+#endif
+
+#if USE_SLEEP
+    half my_sleep_map = sleep_map_all[N * N * N * groupID.x + groupIndex];
+#else
+    half my_sleep_map = 0.0h;
+#endif
+
     uint packed_val = inhib_map_all[(groupID.x * INHIB_STRIDE) + (groupIndex >> 5)];
     bool is_inhib = bool((packed_val >> (groupIndex & 31)) & 1);
     int my_inhib = is_inhib ? -1 : 1;
@@ -321,13 +375,18 @@ void computeMain(
     link27th_params.multiplier = link27th_params_all.multiplier[groupID.x];
 
     LearningParams learning_params;
-    learning_params.forget_rate = learning_params_all.forget_rate[groupID.x] * 0.0h;
-    learning_params.learning_rate = learning_params_all.learning_rate[groupID.x] * 0.0h;
-    learning_params.learning_threshold = learning_params_all.learning_threshold[groupID.x] * 0.0h;
-    learning_params.tag_decay = learning_params_all.tag_decay[groupID.x] * 0.0h;
+#if USE_LEARNING
+    learning_params.forget_rate = learning_params_all.forget_rate[groupID.x];
+    learning_params.learning_rate = learning_params_all.learning_rate[groupID.x];
+    learning_params.learning_threshold = learning_params_all.learning_threshold[groupID.x];
+    learning_params.tag_decay = learning_params_all.tag_decay[groupID.x];
+#else
+    learning_params.forget_rate = 0.0h;
+    learning_params.learning_rate = 0.0h;
+    learning_params.learning_threshold = 0.0h;
+    learning_params.tag_decay = 0.0h;
+#endif
 
-    uint my_goal_count = 0;
-    
     half4 my_post = get_sig_post(groupThreadID);
     [unroll]
     for (int dz = -1; dz <= 1; dz++)
@@ -352,20 +411,17 @@ void computeMain(
     
     half R = 1.0h;
 
+    // ★ oneSim.py と完全一致させる初期化（外周は 0.0h、内部は 0.5h）
     [unroll]
     for (uint idx_np2 = groupIndex; idx_np2 < TOTAL_NP2; idx_np2 += N * N * N) {
-        outputs_s[idx_np2] = 0.5h;
+        outputs_s[idx_np2] = 0.0h;
     }
     GroupMemoryBarrierWithGroupSync();
 
-    [unroll]
-    for (uint idx_np2h2 = groupIndex; idx_np2h2 < TOTAL_NP2H2; idx_np2h2 += N * N * N) {
-        merge_outputs_membrane(groupID.x, membrane_all, idx_np2h2);
-    }
-
+    set_output_s(groupThreadID, 0.5h);
     GroupMemoryBarrierWithGroupSync();
 
-    for (uint inner_step = 0; inner_step < 10000; inner_step++) {
+    for (uint inner_step = 0; inner_step < 1000; inner_step++) {
         half net = 0.0h;
         [unroll]
         for (int dz = -1; dz <= 1; dz++) {
@@ -374,39 +430,44 @@ void computeMain(
                 [unroll]
                 for (int dx = -1; dx <= 1; dx++) {
                     half my_weight = synapse_data.get_weight(int3(dx, dy, dz));
-                    half tag = half(synapse_data.get_tag(int3(dx, dy, dz)));
                     half delta_net = get_output_s(groupThreadID + int3(dx, dy, dz)) * my_weight;
                     net += delta_net;
+
+#if USE_LEARNING
+                    half tag = half(synapse_data.get_tag(int3(dx, dy, dz)));
                     tag = saturate((tag + saturate(abs(delta_net))) * (1.0h - learning_params.tag_decay));
-
-                    half delta_weight = learning_params.forget_rate * (my_dopamine_sum * tag + learning_params.learning_rate * my_weight * (1.0h - my_weight) * (my_weight - learning_params.learning_threshold));
-
+                    half delta_weight = half(ENABLE_LEARNING) * learning_params.forget_rate * (my_dopamine_sum * tag + learning_params.learning_rate * my_weight * (1.0h - my_weight) * (my_weight - learning_params.learning_threshold));
                     synapse_data.set_tags(int3(dx, dy, dz), tag);
-                    synapse_data.set_weights(int3(dx, dy, dz), my_weight + delta_weight);
+                    synapse_data.set_weights(int3(dx, dy, dz), clamp(my_weight + delta_weight, 0.0h, 1.0h));
+#endif
                 }
             }
         }
         uint3 coord_27th = indexToCoordN(groupIndex * link27th_params.multiplier + link27th_params.bias);
         half my_weight_27th = synapse_data.get_weight_27th();
-        half tag_27th = half(synapse_data.get_tag_27th());
         half delta_net = get_output_s(coord_27th) * my_weight_27th;
         net += delta_net;
 
+#if USE_LEARNING
+        half tag_27th = half(synapse_data.get_tag_27th());
         tag_27th = saturate((tag_27th + saturate(abs(delta_net))) * (1.0h - learning_params.tag_decay));
-
-        half delta_weight_27th = learning_params.learning_rate * (my_dopamine_sum * tag_27th + learning_params.learning_rate * my_weight_27th * (1.0h - my_weight_27th) * (my_weight_27th - learning_params.learning_threshold));
+        half delta_weight_27th = half(ENABLE_LEARNING) * learning_params.learning_rate * (my_dopamine_sum * tag_27th + learning_params.learning_rate * my_weight_27th * (1.0h - my_weight_27th) * (my_weight_27th - learning_params.learning_threshold));
         synapse_data.set_tags_27th(tag_27th);
-        synapse_data.set_weights_27th(my_weight_27th + delta_weight_27th);
+        synapse_data.set_weights_27th(clamp(my_weight_27th + delta_weight_27th, 0.0h, 1.0h));
+#endif
 
-        half output_rate = min(1.0h, resource_params.base_output * exp2(net * resource_params.beta));
-        half my_output = (1 - my_sleep_sum) * half(my_inhib) * output_rate * R;
+        half scaled_net = clamp(net * resource_params.beta, -20.0h, 20.0h);
+        half output_rate = min(1.0h, resource_params.base_output * exp2(scaled_net));
+        half my_output = (1.0h - my_sleep_sum) * half(my_inhib) * output_rate * R;
 
+        // ★ Warp間の競合を防ぐため、全員が読み終わるのを待ってから書き込む
+        GroupMemoryBarrierWithGroupSync();
         set_output_s(groupThreadID, my_output);
-
         GroupMemoryBarrierWithGroupSync();
 
         R = saturate(R - output_rate * R + resource_params.k_refill);
 
+#if USE_DOPAMINE || USE_SLEEP
         half my_dopamine = abs(my_output) * my_dopamine_map;
         half my_sleep = abs(my_output) * my_sleep_map;
 
@@ -421,7 +482,6 @@ void computeMain(
 
         GroupMemoryBarrierWithGroupSync();
 
-        // N=2 (TOTAL_N=8) のときでも最低 1 wave になるよう切り上げ
         uint num_waves = (TOTAL_N + WaveGetLaneCount() - 1) / WaveGetLaneCount();
         half local_dopamine_sum = 0.0h;
         half local_sleep_sum = 0.0h;
@@ -435,38 +495,36 @@ void computeMain(
         half final_sleep_sum = saturate(WaveActiveSum(local_sleep_sum));
 
         if (groupIndex == 0) {
-            my_dopamine_sum = final_dopamine_sum;
-            my_sleep_sum = final_sleep_sum;
+            my_dopamine_sum = final_dopamine_sum * half(ENABLE_DOPAMINE);
+            my_sleep_sum = saturate(final_sleep_sum * half(ENABLE_SLEEP));
         }
         GroupMemoryBarrierWithGroupSync();
-
-        if (groupIndex == 0) {
-            float current_sunlight = saturate(sinpi(inner_step * (1.0 / 50.0)));
-            my_energy_s -= 0.001;
-#if DIM == 1
-            // N=2 用 (内部座標は 0..1)
-            half generator_power = get_output_s(int3(1, 0, 1)) - get_output_s(int3(0, 0, 1));
-#else
-            // N>=4 用
-            half generator_power = get_output_s(int3(3, 2, 1)) - get_output_s(int3(1, 2, 1));
 #endif
 
-            my_energy_s -= float(abs(generator_power)) * 0.0;
+        if (groupIndex == 0) {
+            float current_sunlight = saturate(sinpi(inner_step * (1.0 / SUN_CYCLE_PERIOD)));
+#if DIM == 1
+            half generator_power = saturate(get_output_s(int3(1, 0, 1)) - get_output_s(int3(0, 0, 1)));
+#else
+            half generator_power = saturate(get_output_s(int3(3, 2, 1)) - get_output_s(int3(1, 2, 1)));
+#endif
 
-            my_energy_s = my_energy_s == 0.0 ? 0.0 : my_energy_s + 0.012 * abs(generator_power) * current_sunlight;
-
-            my_energy_s = saturate(my_energy_s);
+            if (my_energy_s > 0.0f) {
+                my_energy_s -= METABOLIC_COST;
+                my_energy_s -= float(abs(generator_power)) * GEN_COST_RATE;
+                my_energy_s += SOLAR_GAIN_RATE * abs(generator_power) * current_sunlight;
+                my_energy_s = saturate(my_energy_s);
+            } else {
+                my_energy_s = 0.0f;
+            }
 
 #if DIM == 1
-            // N=2 用: パディング込みの有効範囲 (-1 .. 2) に収める
             set_output_s(int3(0, -1, 0), half(my_energy_s));
             set_output_s(int3(1, -1, 0), half(current_sunlight));
 #elif DIM == 2
-            // N=4 用: 中心 2 を基準に (1 or 3)
             set_output_s(int3(1, -1, 2), half(my_energy_s));
             set_output_s(int3(3, -1, 2), half(current_sunlight));
 #else
-            // N=8 用: 中心 4 を基準に (3 or 5)
             set_output_s(int3(3, -1, 4), half(my_energy_s));
             set_output_s(int3(5, -1, 4), half(current_sunlight));
 #endif

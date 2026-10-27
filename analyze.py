@@ -10,15 +10,19 @@ from matplotlib.animation import FuncAnimation
 # 設定
 # ==============================================================================
 # ★ 生涯学習（ヘブ則・タグ・ドーパミンによる重み更新）を有効にするかどうか
-ENABLE_LIFELONG_LEARNING = False  # False: 重み固定（静的リカレントネット）
+ENABLE_LIFELONG_LEARNING = float(np.clip(float(os.environ.get("ANALYZE_LEARNING", "0.0")), 0.0, 1.0))  # 0.0 ~ 1.0 の連続有効度合い (0.0: 重み固定)
 
-WORLD_SIZE = 100.0
-DT = 0.01
+WORLD_SIZE = float(os.environ.get("ANALYZE_WORLD_SIZE", "100.0"))
+DT = float(os.environ.get("ANALYZE_DT", "0.01"))
 
 # ==============================================================================
 # 1. ファイル選択 ＆ エリート(.npz)読み込み（DIM自動検出）
 # ==============================================================================
 def select_npz_file() -> str:
+    cli_path = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("ANALYZE_NPZ_PATH", "")
+    if cli_path and os.path.exists(cli_path):
+        print(f"[+] 指定ファイルを読み込み中: {cli_path}")
+        return cli_path
     root = tk.Tk()
     root.withdraw()
 
@@ -166,7 +170,7 @@ class VoxelBrainCPU:
             # 【生涯学習の切り替え】
             # ENABLE_LIFELONG_LEARNING = False のときは重み更新をスキップ！
             # ==============================================================
-            if ENABLE_LIFELONG_LEARNING:
+            if ENABLE_LIFELONG_LEARNING > 0.0:
                 self.tags = np.clip(
                     (self.tags + np.clip(np.abs(delta_net), 0.0, 1.0)) * (1.0 - self.params["tag_decay"]),
                     0.0, 1.0
@@ -178,7 +182,7 @@ class VoxelBrainCPU:
                 dw_27th = self.params["learning_rate"] * (
                     self.dopamine_sum * self.tags[:, 27:] + self.params["learning_rate"] * bistable[:, 27:]
                 )
-                self.weights = np.clip(self.weights + np.concatenate([dw_nbr, dw_27th], axis=1), 0.0, 1.0)
+                self.weights = np.clip(self.weights + np.concatenate([dw_nbr, dw_27th], axis=1) * ENABLE_LIFELONG_LEARNING, 0.0, 1.0)
 
             # 発火率と出力
             scaled_net = np.clip(net * self.params["beta"], -20.0, 20.0)
@@ -261,7 +265,7 @@ def main():
     ax_world.legend(loc="lower left")
 
     ax_signals = fig.add_subplot(gs[0, 1])
-    mode_str = "ON" if ENABLE_LIFELONG_LEARNING else "OFF (Fixed Weights)"
+    mode_str = f"{ENABLE_LIFELONG_LEARNING:.2f}" if ENABLE_LIFELONG_LEARNING > 0.0 else "0.00 (Fixed Weights)"
     ax_signals.set_title(f"Neuromodulators [Lifelong Learning: {mode_str}]", fontsize=11)
     dopamine_history, sleep_history = [], []
     line_dopamine, = ax_signals.plot([], [], label="Dopamine Sum", color="darkorange", linewidth=2)

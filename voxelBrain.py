@@ -11,6 +11,23 @@ import signal
 import glob
 import csv
 from datetime import datetime
+import sys
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
+except Exception:
+    pass
+
+from sim_config import (
+    ENABLE_LEARNING,
+    ENABLE_DOPAMINE,
+    ENABLE_SLEEP,
+    INITIAL_ENERGY,
+    METABOLIC_COST,
+    GEN_COST_RATE,
+    SOLAR_GAIN_RATE,
+    SUN_CYCLE_PERIOD,
+)
 
 
 stop_requested = False
@@ -104,7 +121,7 @@ class R4:
         raise ValueError("Unexpected Error")
 
 class Config:
-    dim: int = 2  # dim=1 -> N=2, dim=2 -> N=4, dim=3 -> N=8
+    dim: int = int(os.environ.get("VB_DIM", "2"))  # dim=1 -> N=2, dim=2 -> N=4, dim=3 -> N=8
     N: int = 1 << dim
     P: int = N + 2
     shift_x: int = 0
@@ -114,7 +131,7 @@ class Config:
     inhib_stride: int = (total_cells + 31) // 32  # 1個体あたりのuint32要素数
     mask: int = N - 1
     
-    m: int = 1 << 15
+    m: int = int(os.environ.get("VB_M", str(1 << 15)))
     world_size: float = 100.0
     
     class Seed:
@@ -226,7 +243,21 @@ def cast_and_buffer(ndarray_dict: dict[str, np.ndarray], device: spy.Device, flo
 
 def build_kernel(device, filename: str):
     with open(filename + ".slang", "r", encoding="utf-8") as f:
-        source_code = f"#define DIM {Config.dim}\n" + f.read()
+        defines = (
+            f"#define DIM {Config.dim}\n"
+            f"#define USE_LEARNING {1 if float(ENABLE_LEARNING) > 0.0 else 0}\n"
+            f"#define ENABLE_LEARNING {float(ENABLE_LEARNING)}h\n"
+            f"#define USE_DOPAMINE {1 if float(ENABLE_DOPAMINE) > 0.0 else 0}\n"
+            f"#define ENABLE_DOPAMINE {float(ENABLE_DOPAMINE)}h\n"
+            f"#define USE_SLEEP {1 if float(ENABLE_SLEEP) > 0.0 else 0}\n"
+            f"#define ENABLE_SLEEP {float(ENABLE_SLEEP)}h\n"
+            f"#define INITIAL_ENERGY {INITIAL_ENERGY}f\n"
+            f"#define METABOLIC_COST {METABOLIC_COST}f\n"
+            f"#define GEN_COST_RATE {GEN_COST_RATE}f\n"
+            f"#define SOLAR_GAIN_RATE {SOLAR_GAIN_RATE}f\n"
+            f"#define SUN_CYCLE_PERIOD {SUN_CYCLE_PERIOD}f\n"
+        )
+        source_code = defines + f.read()
     
     module = device.load_module_from_source("kernel" + filename, source_code)
     entry = module.entry_point("computeMain")
@@ -434,8 +465,8 @@ def load_and_distribute_all_elites(folder_path: str):
     print("[★] 全8,192体への多系統エリート配分が完了しました！\n")
 
 
-LOAD_CHECKPOINT_FOLDER = "backups/elites"
-load = False
+LOAD_CHECKPOINT_FOLDER = os.environ.get("VB_LOAD_FOLDER", "backups/elites")
+load = os.environ.get("VB_LOAD_ELITES", "0") == "1"
 
 if LOAD_CHECKPOINT_FOLDER and os.path.exists(LOAD_CHECKPOINT_FOLDER) and load is True:
     load_and_distribute_all_elites(LOAD_CHECKPOINT_FOLDER)
@@ -482,7 +513,7 @@ os.makedirs("logs", exist_ok=True)
 os.makedirs(checkpoint_dir, exist_ok=True)
 os.makedirs(top20_dir, exist_ok=True)
 
-BASE_ENERGY = 0.20
+BASE_ENERGY = INITIAL_ENERGY
 
 with open(log_filename, mode="w", newline="", encoding="utf-8") as f:
     writer = csv.writer(f)
@@ -520,15 +551,15 @@ def save_top_k_elites(step_num: int, energies: np.ndarray, k: int = 20):
     sleep_all    = gen_buf_dict["sleep_map_pout"].to_numpy().view(np.float16)
     inhib_all    = gen_buf_dict["inhib_sign_map_pout"].to_numpy().view(np.uint32)
 
-    res_base   = shared_resource_params_buf["base_output"].to_numpy()
-    res_beta   = shared_resource_params_buf["beta"].to_numpy()
-    res_refill = shared_resource_params_buf["k_refill"].to_numpy()
-    link_mult  = shared_link27th_params_buf["multiplier"].to_numpy()
-    link_bias  = shared_link27th_params_buf["bias"].to_numpy()
-    lr_rate    = shared_learning_params_buf["learning_rate"].to_numpy()
-    lr_forget  = shared_learning_params_buf["forget_rate"].to_numpy()
-    lr_thresh  = shared_learning_params_buf["learning_threshold"].to_numpy()
-    lr_decay   = shared_learning_params_buf["tag_decay"].to_numpy()
+    res_base   = shared_resource_params_buf["base_output"].to_numpy().view(np.float16)
+    res_beta   = shared_resource_params_buf["beta"].to_numpy().view(np.float16)
+    res_refill = shared_resource_params_buf["k_refill"].to_numpy().view(np.float16)
+    link_mult  = shared_link27th_params_buf["multiplier"].to_numpy().view(np.int32)
+    link_bias  = shared_link27th_params_buf["bias"].to_numpy().view(np.int32)
+    lr_rate    = shared_learning_params_buf["learning_rate"].to_numpy().view(np.float16)
+    lr_forget  = shared_learning_params_buf["forget_rate"].to_numpy().view(np.float16)
+    lr_thresh  = shared_learning_params_buf["learning_threshold"].to_numpy().view(np.float16)
+    lr_decay   = shared_learning_params_buf["tag_decay"].to_numpy().view(np.float16)
 
     for rank, idx in enumerate(top_indices, start=1):
         idx = int(idx)
@@ -539,6 +570,9 @@ def save_top_k_elites(step_num: int, energies: np.ndarray, k: int = 20):
             save_path,
             step=step_num,
             score=score,
+            enable_learning=np.float16(ENABLE_LEARNING),
+            enable_dopamine=np.float16(ENABLE_DOPAMINE),
+            enable_sleep=np.float16(ENABLE_SLEEP),
             sig_pre=sig_pre_all[idx * P_cube_4 : (idx + 1) * P_cube_4],
             sig_post=sig_post_all[idx * P_cube_4 : (idx + 1) * P_cube_4],
             dopamine=dopamine_all[idx * N_cube : (idx + 1) * N_cube],
@@ -556,9 +590,12 @@ def save_top_k_elites(step_num: int, energies: np.ndarray, k: int = 20):
         )
 
     print(f"[★] 上位 {k} 体の保存が完了しました！(1位スコア: {energies[top_indices[0]]:.3f} ~ {k}位スコア: {energies[top_indices[-1]]:.3f})")
+    first_rank_path = os.path.join(top20_dir, f"rank01_step{step_num}_energy{float(energies[top_indices[0]]):.3f}_id{int(top_indices[0])}.npz")
+    print(f"  -> {first_rank_path}")
 
 
-TOTAL_STEPS = 3000
+TOTAL_STEPS = int(os.environ.get("VB_TOTAL_STEPS", "50000"))
+STOP_FILE = os.environ.get("VB_STOP_FILE", "")
 best_max_energy = BASE_ENERGY + 0.005
 last_completed_step = 0
 latest_energies = np.zeros(Config.m, dtype=np.float32)
@@ -571,100 +608,112 @@ for step in range(TOTAL_STEPS):
     reasoning_sim_dict["step"] = step
     mutation_dict["step"] = step
     
+    # -----------------------------------------------------------------
+    # 1. まず推論・評価だけを実行する（まだ変異で上書きしない！）
+    # -----------------------------------------------------------------
     kernel_reasoning.dispatch(
         thread_count=(Config.m * Config.N, Config.N, Config.N),
         **reasoning_sim_dict
     )
+    device.wait()
+
+    end_time_output = time.perf_counter()
+    elapsed_time_output = end_time_output - start_time_output
+
+    # -----------------------------------------------------------------
+    # 2. 上書きされる「前」の純粋な状態でエネルギーを取得・集計・保存する！
+    # -----------------------------------------------------------------
+    energies = get_current_energies()
+    latest_energies = energies
+    last_completed_step = step
     
-    # ※ 最終ステップやCtrl+C停止時は、変異で上書きされる前の状態で保存したい場合はここで判定
-    if stop_requested:
-        device.wait()
-        latest_energies = get_current_energies()
-        last_completed_step = step
+    max_energy  = float(np.max(energies))
+    mean_energy = float(np.mean(energies))
+    
+    gained_count = int(np.count_nonzero(energies > BASE_ENERGY + 0.002))
+    stay_count   = int(np.count_nonzero(np.abs(energies - BASE_ENERGY) <= 0.002))
+    elite_ge04   = int(np.count_nonzero(energies >= 0.40))
+    
+    top10 = [round(float(x), 3) for x in np.sort(energies)[::-1][:10]]
+
+    print(
+        f"Step {step:05d} | {elapsed_time_output:.3f}s | "
+        f"黒字(>0.2): {gained_count:4d}体 | (静止=0.2: {stay_count:4d}, 0.4+: {elite_ge04:4d}) | "
+        f"Max: {max_energy:.3f} | Mean: {mean_energy:.3f} | Top5: {top10[:5]}"
+    )
+
+    with open(log_filename, mode="a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            step,
+            f"{elapsed_time_output:.4f}",
+            gained_count,
+            stay_count,
+            elite_ge04,
+            f"{mean_energy:.4f}",
+            f"{max_energy:.4f}",
+            f'"{top10}"'
+        ])
+        f.flush()
+
+    # ★ 変異前の「本物の最高個体」を保存！
+    if max_energy > best_max_energy:
+        best_max_energy = max_energy
+        best_idx = int(np.argmax(energies))
+        save_path = os.path.join(checkpoint_dir, f"best_step{step}_energy{max_energy:.3f}_id{best_idx}.npz")
+        
+        P_cube_4 = Config.P * Config.P * Config.P * 4
+        N_cube   = Config.N * Config.N * Config.N
+        INHIB_SIZE = Config.inhib_stride
+        
+        sig_pre_elite  = gen_buf_dict["sig_pre_map_np2_pout"].to_numpy().view(np.float16)[best_idx * P_cube_4 : (best_idx + 1) * P_cube_4]
+        sig_post_elite = gen_buf_dict["sig_post_map_np2_pout"].to_numpy().view(np.float16)[best_idx * P_cube_4 : (best_idx + 1) * P_cube_4]
+        dopamine_elite = gen_buf_dict["dopamine_map_pout"].to_numpy().view(np.float16)[best_idx * N_cube : (best_idx + 1) * N_cube]
+        sleep_elite    = gen_buf_dict["sleep_map_pout"].to_numpy().view(np.float16)[best_idx * N_cube : (best_idx + 1) * N_cube]
+        inhib_elite    = gen_buf_dict["inhib_sign_map_pout"].to_numpy().view(np.uint32)[best_idx * INHIB_SIZE : (best_idx + 1) * INHIB_SIZE]
+
+        np.savez_compressed(
+            save_path,
+            step=step,
+            score=max_energy,
+            enable_learning=np.float16(ENABLE_LEARNING),
+            enable_dopamine=np.float16(ENABLE_DOPAMINE),
+            enable_sleep=np.float16(ENABLE_SLEEP),
+            sig_pre=sig_pre_elite,
+            sig_post=sig_post_elite,
+            dopamine=dopamine_elite,
+            sleep=sleep_elite,
+            inhib=inhib_elite,
+            resource_base_output=shared_resource_params_buf["base_output"].to_numpy().view(np.float16)[best_idx],
+            resource_beta=shared_resource_params_buf["beta"].to_numpy().view(np.float16)[best_idx],
+            resource_k_refill=shared_resource_params_buf["k_refill"].to_numpy().view(np.float16)[best_idx],
+            link_multiplier=shared_link27th_params_buf["multiplier"].to_numpy().view(np.int32)[best_idx],
+            link_bias=shared_link27th_params_buf["bias"].to_numpy().view(np.int32)[best_idx],
+            learn_rate=shared_learning_params_buf["learning_rate"].to_numpy().view(np.float16)[best_idx],
+            learn_forget=shared_learning_params_buf["forget_rate"].to_numpy().view(np.float16)[best_idx],
+            learn_threshold=shared_learning_params_buf["learning_threshold"].to_numpy().view(np.float16)[best_idx],
+            learn_decay=shared_learning_params_buf["tag_decay"].to_numpy().view(np.float16)[best_idx],
+        )
+        print(f"  [★] 過去最高エリート（変異前・本物）を保存しました -> {save_path}")
+
+    # ★ 最終ステップ、または Ctrl+C が押されていたら「変異（上書き）せず」にループを抜ける！
+    if STOP_FILE and os.path.exists(STOP_FILE):
+        print("\n[!] 停止リクエストを検知しました。現在のステップの上位20体を保存して安全に終了します...")
+        stop_requested = True
+    if stop_requested or step == TOTAL_STEPS - 1:
         break
 
+    # -----------------------------------------------------------------
+    # 3. 最後に次世代への突然変異を実行する
+    # -----------------------------------------------------------------
     kernel_mutation.dispatch(
         thread_count=(Config.m * Config.N, Config.N, Config.N),
         **mutation_dict
     )
-
-    if step % 1 == 0:
-        device.wait()
-        end_time_output = time.perf_counter()
-        elapsed_time_output = end_time_output - start_time_output
-
-        energies = get_current_energies()
-        latest_energies = energies
-        last_completed_step = step
-        
-        max_energy  = float(np.max(energies))
-        mean_energy = float(np.mean(energies))
-        
-        gained_count = int(np.count_nonzero(energies > BASE_ENERGY + 0.002))
-        stay_count   = int(np.count_nonzero(np.abs(energies - BASE_ENERGY) <= 0.002))
-        elite_ge04   = int(np.count_nonzero(energies >= 0.40))
-        
-        top10 = [round(float(x), 3) for x in np.sort(energies)[::-1][:10]]
-
-        print(
-            f"Step {step:05d} | {elapsed_time_output:.3f}s | "
-            f"黒字(>0.2): {gained_count:4d}体 | (静止=0.2: {stay_count:4d}, 0.4+: {elite_ge04:4d}) | "
-            f"Max: {max_energy:.3f} | Mean: {mean_energy:.3f} | Top5: {top10[:5]}"
-        )
-
-        with open(log_filename, mode="a", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                step,
-                f"{elapsed_time_output:.4f}",
-                gained_count,
-                stay_count,
-                elite_ge04,
-                f"{mean_energy:.4f}",
-                f"{max_energy:.4f}",
-                f'"{top10}"'
-            ])
-            f.flush()
-
-        # 途中経過での最高記録更新時の単体保存
-        if max_energy > best_max_energy:
-            best_max_energy = max_energy
-            best_idx = int(np.argmax(energies))
-            save_path = os.path.join(checkpoint_dir, f"best_step{step}_energy{max_energy:.3f}_id{best_idx}.npz")
-            
-            P_cube_4 = Config.P * Config.P * Config.P * 4
-            N_cube   = Config.N * Config.N * Config.N
-            INHIB_SIZE = Config.inhib_stride
-            
-            sig_pre_elite  = gen_buf_dict["sig_pre_map_np2_pout"].to_numpy().view(np.float16)[best_idx * P_cube_4 : (best_idx + 1) * P_cube_4]
-            sig_post_elite = gen_buf_dict["sig_post_map_np2_pout"].to_numpy().view(np.float16)[best_idx * P_cube_4 : (best_idx + 1) * P_cube_4]
-            dopamine_elite = gen_buf_dict["dopamine_map_pout"].to_numpy().view(np.float16)[best_idx * N_cube : (best_idx + 1) * N_cube]
-            sleep_elite    = gen_buf_dict["sleep_map_pout"].to_numpy().view(np.float16)[best_idx * N_cube : (best_idx + 1) * N_cube]
-            inhib_elite    = gen_buf_dict["inhib_sign_map_pout"].to_numpy().view(np.uint32)[best_idx * INHIB_SIZE : (best_idx + 1) * INHIB_SIZE]
-
-            np.savez_compressed(
-                save_path,
-                step=step,
-                score=max_energy,
-                sig_pre=sig_pre_elite,
-                sig_post=sig_post_elite,
-                dopamine=dopamine_elite,
-                sleep=sleep_elite,
-                inhib=inhib_elite,
-                resource_base_output=shared_resource_params_buf["base_output"].to_numpy()[best_idx],
-                resource_beta=shared_resource_params_buf["beta"].to_numpy()[best_idx],
-                resource_k_refill=shared_resource_params_buf["k_refill"].to_numpy()[best_idx],
-                link_multiplier=shared_link27th_params_buf["multiplier"].to_numpy()[best_idx],
-                link_bias=shared_link27th_params_buf["bias"].to_numpy()[best_idx],
-                learn_rate=shared_learning_params_buf["learning_rate"].to_numpy()[best_idx],
-                learn_forget=shared_learning_params_buf["forget_rate"].to_numpy()[best_idx],
-                learn_threshold=shared_learning_params_buf["learning_threshold"].to_numpy()[best_idx],
-                learn_decay=shared_learning_params_buf["tag_decay"].to_numpy()[best_idx],
-            )
-            print(f"  [★] 過去最高エリートを更新・保存しました -> {save_path}")
+    device.wait()
 
 # =====================================================================
-# ループ終了時（3000ステップ完走 または Ctrl+C 中断時）に上位20体を一括保存
+# ループ終了時（変異で上書きされる前の純粋な上位20体を一括保存！）
 # =====================================================================
 save_top_k_elites(last_completed_step, latest_energies, k=20)
 print("wow")
