@@ -350,8 +350,9 @@ def create_mutation_params_buffers(num_groups: int, seed: int = None):
 
     mutate_rate = rng.uniform(0.01, 0.10, size=(num_groups, 4)).astype(np.float16)
 
-    inout_rate = np.zeros((num_groups, 2), dtype=np.float16)
-    inout_rate[:, 0] = rng.uniform(0.02, 0.15, size=num_groups)
+    inout_copy_rate = np.zeros((num_groups, 2), dtype=np.float16)
+    inout_copy_rate[:, 0] = rng.uniform(0.02, 0.15, size=num_groups)
+    inout_copy_rate[:, 1] = rng.uniform(0.02, 0.15, size=num_groups)
 
     return {
         "sig_pre_rate":  sig_pre_rate,
@@ -368,7 +369,7 @@ def create_mutation_params_buffers(num_groups: int, seed: int = None):
         "link27th_rate": link27th_rate,
         "learning_rate": learning_rate,
         "mutate_rate":   mutate_rate,
-        "inout_rate":    inout_rate,
+        "inout_copy_rate":    inout_copy_rate,
     }
 
 

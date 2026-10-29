@@ -59,11 +59,6 @@ groupshared uint base_id_s;        // 変異の元となる親個体のID
 // パラメータ構造体定義 (Struct Definitions)
 // =============================================================================
 
-struct ResourceParams {
-    half base_output;
-    half beta;
-    half k_refill;
-}
 
 struct ResourceParamsAll {
     RWStructuredBuffer<half> base_output;
@@ -71,9 +66,19 @@ struct ResourceParamsAll {
     RWStructuredBuffer<half> k_refill;
 }
 
-struct Link27thParams {
-    uint multiplier;
-    uint bias;
+struct ResourceParams {
+    half base_output;
+    half beta;
+    half k_refill;
+
+    static ResourceParams load(uint agent_id, ResourceParamsAll mut_all) {
+        ResourceParams p;
+        p.base_output = mut_all.base_output[agent_id];
+        p.beta = mut_all.beta[agent_id];
+        p.k_refill = mut_all.k_refill[agent_id];
+
+        return p;
+    }   
 }
 
 struct Link27thParamsAll {
@@ -81,13 +86,18 @@ struct Link27thParamsAll {
     RWStructuredBuffer<uint> bias;
 }
 
-struct LearningParams {
-    half learning_rate;
-    half forget_rate;
-    half learning_threshold;
-    half tag_decay;
-}
+struct Link27thParams {
+    uint multiplier;
+    uint bias;
 
+    static Link27thParams load(uint agent_id, Link27thParamsAll mut_all) {
+        Link27thParams p;
+        p.multiplier = mut_all.multiplier[agent_id];
+        p.bias = mut_all.bias[agent_id];
+
+        return p;
+    }
+}
 struct LearningParamsAll {
     RWStructuredBuffer<half> learning_rate;
     RWStructuredBuffer<half> forget_rate;
@@ -95,44 +105,28 @@ struct LearningParamsAll {
     RWStructuredBuffer<half> tag_decay;
 }
 
-struct SigMutationParams {
-    half4 rate;
-    uint steps;
-    half4 max;
-    half4 diff;
+struct LearningParams {
+    half learning_rate;
+    half forget_rate;
+    half learning_threshold;
+    half tag_decay;
+
+    static LearningParams load(uint agent_id, LearningParamsAll mut_all) {
+        LearningParams p;
+        p.learning_rate = mut_all.learning_rate[agent_id];
+        p.forget_rate = mut_all.forget_rate[agent_id];
+        p.learning_threshold = mut_all.learning_threshold[agent_id];
+        p.tag_decay = mut_all.tag_decay[agent_id];
+
+        return p;
+    }
 }
 
-struct DopSlpMutationParams {
-    half rate;
-    uint steps;
-    half max;
-    half diff;
-}
-
-struct InhibMutationParams {
-    half rate;
-}
-
-struct InoutMutationParams {
-    half2 rate;
-}
-
-struct MutationParamsAll {
-    RWStructuredBuffer<half4> sig_pre_rate;
-    RWStructuredBuffer<half4> sig_post_rate;
-    RWStructuredBuffer<half4> other_rate;    // dopamine / sleep / inhib / unused
-    RWStructuredBuffer<uint4> steps;              // sig_pre / sig_post / dopamine / sleep
-    RWStructuredBuffer<half4> sig_pre_diff;
-    RWStructuredBuffer<half4> sig_post_diff;
-    RWStructuredBuffer<half4> other_diff;         // dopamine / sleep / unused / unused
-    RWStructuredBuffer<half4> sig_pre_max;
-    RWStructuredBuffer<half4> sig_post_max;
-    RWStructuredBuffer<half4> other_max;          // dopamine / sleep / unused / unused
-    RWStructuredBuffer<half4> resource_rate; // base / beta / refill
-    RWStructuredBuffer<half2> link27th_rate; // multiplier / bias
-    RWStructuredBuffer<half4> learning_rate; // rate / forget / rate / tag_decay
-    RWStructuredBuffer<half4> mutate_rate;   // rate / steps / diff / max
-    RWStructuredBuffer<half2> inout_rate; // inout / unused
+struct InoutParamsFiAll {
+    RWStructuredBuffer<int3> light_in_fi;
+    RWStructuredBuffer<int3> battery_in_fi;
+    RWStructuredBuffer<int3> gen_neg_out_fi;
+    RWStructuredBuffer<int3> gen_pos_out_fi;
 }
 
 struct InoutParams {
@@ -194,13 +188,126 @@ struct InoutParams {
         p.gen_pos_out = faceIndex_to_coordOut(gen_pos_out_fi);
         return p;
     }
+
+    static InoutParams load(uint agent_id, InoutParamsFiAll inout_all) {
+        InoutParams p = InoutParams.load_face_index(
+            inout_all.light_in_fi[agent_id],
+            inout_all.battery_in_fi[agent_id],
+            inout_all.gen_neg_out_fi[agent_id],
+            inout_all.gen_pos_out_fi[agent_id]
+        );
+        return p;
+    }
 }
 
-struct InoutParamsFiAll {
-    RWStructuredBuffer<int3> light_in_fi;
-    RWStructuredBuffer<int3> battery_in_fi;
-    RWStructuredBuffer<int3> gen_neg_out_fi;
-    RWStructuredBuffer<int3> gen_pos_out_fi;
+
+
+struct CopyMutation {
+    int3 start_base;
+    uint3 size;
+    int3 end_base;
+    bool3 reverse_xyz;
+    half overwrite_rate;
+}
+
+struct MutationParamsAll {
+    RWStructuredBuffer<half4> sig_pre_rate;
+    RWStructuredBuffer<half4> sig_post_rate;
+    RWStructuredBuffer<half4> other_rate;    // dopamine / sleep / inhib / unused
+    RWStructuredBuffer<uint4> steps;              // sig_pre / sig_post / dopamine / sleep
+    RWStructuredBuffer<half4> sig_pre_diff;
+    RWStructuredBuffer<half4> sig_post_diff;
+    RWStructuredBuffer<half4> other_diff;         // dopamine / sleep / unused / unused
+    RWStructuredBuffer<half4> sig_pre_max;
+    RWStructuredBuffer<half4> sig_post_max;
+    RWStructuredBuffer<half4> other_max;          // dopamine / sleep / unused / unused
+    RWStructuredBuffer<half4> resource_rate; // base / beta / refill
+    RWStructuredBuffer<half2> link27th_rate; // multiplier / bias
+    RWStructuredBuffer<half4> learning_rate; // rate / forget / rate / tag_decay
+    RWStructuredBuffer<half4> mutate_rate;   // rate / steps / diff / max
+    RWStructuredBuffer<half2> inout_copy_rate; // inout / copy
+}
+
+struct SigMutationParams {
+    half4 rate;
+    uint steps;
+    half4 max;
+    half4 diff;
+
+    static SigMutationParams load_pre(uint agent_id, MutationParamsAll mut_all) {
+        SigMutationParams p;
+        p.rate = mut_all.sig_pre_rate[agent_id];
+        p.steps = mut_all.steps[agent_id].x;
+        p.max = mut_all.sig_pre_max[agent_id];
+        p.diff = mut_all.sig_pre_diff[agent_id];
+
+        return p;
+    }
+
+    static SigMutationParams load_post(uint agent_id, MutationParamsAll mut_all) {
+        SigMutationParams p;
+        p.rate = mut_all.sig_post_rate[agent_id];
+        p.steps = mut_all.steps[agent_id].y;
+        p.max = mut_all.sig_post_max[agent_id];
+        p.diff = mut_all.sig_post_diff[agent_id];
+
+        return p;
+    }
+}
+
+struct DopSlpMutationParams {
+    half rate;
+    uint steps;
+    half max;
+    half diff;
+
+    static DopSlpMutationParams load_dop(uint agent_id, MutationParamsAll mut_all) {
+        DopSlpMutationParams p;
+        p.rate = mut_all.other_rate[agent_id].x;
+        p.steps = mut_all.steps[agent_id].z;
+        p.max = mut_all.other_max[agent_id].x;
+        p.diff = mut_all.other_diff[agent_id].x;
+        return p;
+    }
+
+    static DopSlpMutationParams load_slp(uint agent_id, MutationParamsAll mut_all) {
+        DopSlpMutationParams p;
+        p.rate = mut_all.other_rate[agent_id].y;
+        p.steps = mut_all.steps[agent_id].w;
+        p.max = mut_all.other_max[agent_id].y;
+        p.diff = mut_all.other_diff[agent_id].y;
+        return p;
+    }
+}
+
+struct InhibMutationParams {
+    half rate;
+
+    static InhibMutationParams load(uint agent_id, MutationParamsAll mut_all) {
+        InhibMutationParams p;
+        p.rate = mut_all.other_rate[agent_id].z;
+        return p;
+    }
+}
+
+struct InoutMutationParams {
+    half rate;
+
+    static InoutMutationParams load(uint agent_id, MutationParamsAll mut_all) {
+        InoutMutationParams p;
+        p.rate = mut_all.inout_copy_rate[agent_id].x;
+        return p;
+    }
+}
+
+struct CopyMutationParams {
+    half rate;
+
+    static CopyMutationParams load(uint agent_id, MutationParamsAll mut_all) {
+        CopyMutationParams p;
+        p.rate = mut_all.inout_copy_rate[agent_id].y;
+        return p;
+    }
 }
 
 
@@ -232,6 +339,12 @@ uint3 indexToCoordNp2(uint index) {
 uint coordToIndexNp2(uint3 coord) {
     uint P = N + 2;
     return (P * P) * coord.z + P * coord.y + coord.x;
+}
+
+//-1 ~ N
+bool is_valid_indexNp2m(int3 coord) {
+    bool3 tf_xyz = (-1 <= coord) & (coord <= N);
+    return all(tf_xyz);
 }
 
 
@@ -272,6 +385,33 @@ half4 rand_half4pm(uint input, half4 rates) {
         abs(rand.y) >= thresholds.y ? rand.y : 0.0h,
         abs(rand.z) >= thresholds.z ? rand.z : 0.0h,
         abs(rand.w) >= thresholds.w ? rand.w : 0.0h
+    );
+}
+
+// val_min <= n <= val_max
+int randint(int val_min, int val_max, uint input) {
+    uint h = pcg_hash(input);
+    uint range = val_max - val_min + 1;
+    return (h % range) + val_min;
+}
+
+int3 randint3(int val_min, int val_max, uint input) {
+    return int3(
+        randint(val_min, val_max, input),
+        randint(val_min, val_max, input + 1),
+        randint(val_min, val_max, input + 2)
+    );
+}
+
+bool randbool(uint input) {
+    return rand_half(input) <= 0.5;
+}
+
+bool3 randbool3(uint input) {
+    return bool3(
+        randbool(input),
+        randbool(input + 1),
+        randbool(input + 2)
     );
 }
 
@@ -352,10 +492,48 @@ int3 mutate_out_int3(int3 base_val, inout uint seed, half rate) {
     );
 }
 
+// rand <= rate ? true : false
 bool mutation_bool(uint group_id_x, uint step, float rate) {
+    // uint stepにinoutを付けてはならない、この関数は決定論的であることを想定されている。
     return rand_half(group_id_x * 10007 + step) <= rate;
 }
 
+CopyMutation mutation_copy(uint seed) {
+    CopyMutation cm;
+    uint h = pcg_hash(seed);
+    uint h2 = pcg_hash(h + 1u);
+    uint h3 = pcg_hash(h2 + 1u);
+    uint h4 = pcg_hash(h3 + 1u);
+    uint h5 = pcg_hash(h4 + 1u);
+    cm.end_base = randint3(-1, N, h);
+    cm.start_base = randint3(-1, N, h2);
+    cm.reverse_xyz = randbool3(h3);
+    cm.size = randint3(1, N + 2, h4);
+    cm.overwrite_rate = rand_half(h5);
+    return cm;
+}
+
+int3[2] calc_coord_copymut(CopyMutation copy_mutation, uint index) {
+    int3 size = (int3)copy_mutation.size;
+    bool3 reverse_xyz = copy_mutation.reverse_xyz;
+    int3 start_base = copy_mutation.start_base;
+    int3 end_base = copy_mutation.end_base;
+    int3 pre_coord = int3(
+        index % size.x,
+        (index % (size.x * size.y)) / size.x,
+        index / (size.x * size.y)
+    );
+    int3 reversed_coord = int3(
+        reverse_xyz.x ? (size.x - pre_coord.x - 1) : pre_coord.x,
+        reverse_xyz.y ? (size.y - pre_coord.y - 1) : pre_coord.y,
+        reverse_xyz.z ? (size.z - pre_coord.z - 1) : pre_coord.z
+    );
+    int3 result[2] = {
+        start_base + pre_coord,
+        end_base + reversed_coord
+    };
+    return result; 
+}
 
 // =============================================================================
 // ラプラシアン拡散ヘルパー (Laplacian Diffusion Helpers)
@@ -470,35 +648,20 @@ void computeMain(
     // -------------------------------------------------------------------------
     // 1. 各変異パラメータの読み込み
     // -------------------------------------------------------------------------
-    SigMutationParams sig_pre_mutation_params;
-    sig_pre_mutation_params.diff      = mutation_params_all.sig_pre_diff[groupID.x];
-    sig_pre_mutation_params.max       = mutation_params_all.sig_pre_max[groupID.x];
-    sig_pre_mutation_params.steps     = mutation_params_all.steps[groupID.x].x;
-    sig_pre_mutation_params.rate = mutation_params_all.sig_pre_rate[groupID.x];
-    
-    SigMutationParams sig_post_mutation_params;
-    sig_post_mutation_params.diff      = mutation_params_all.sig_post_diff[groupID.x];
-    sig_post_mutation_params.max       = mutation_params_all.sig_post_max[groupID.x];
-    sig_post_mutation_params.steps     = mutation_params_all.steps[groupID.x].y;
-    sig_post_mutation_params.rate = mutation_params_all.sig_post_rate[groupID.x];
-    
-    DopSlpMutationParams dopamine_mutation_params;
-    dopamine_mutation_params.diff      = mutation_params_all.other_diff[groupID.x].x;
-    dopamine_mutation_params.max       = mutation_params_all.other_max[groupID.x].x;
-    dopamine_mutation_params.steps     = mutation_params_all.steps[groupID.x].z;
-    dopamine_mutation_params.rate = mutation_params_all.other_rate[groupID.x].x;
-    
-    DopSlpMutationParams sleep_mutation_params;
-    sleep_mutation_params.diff      = mutation_params_all.other_diff[groupID.x].y;
-    sleep_mutation_params.max       = mutation_params_all.other_max[groupID.x].y;
-    sleep_mutation_params.steps     = mutation_params_all.steps[groupID.x].w;
-    sleep_mutation_params.rate = mutation_params_all.other_rate[groupID.x].y;
-    
-    InhibMutationParams inhib_mutation_params;
-    inhib_mutation_params.rate = mutation_params_all.other_rate[groupID.x].z;
+    uint agent_id = groupID.x;
+    SigMutationParams sig_pre_mutation_params = SigMutationParams.load_pre(agent_id, mutation_params_all);
 
-    InoutMutationParams inout_mutation_params;
-    inout_mutation_params.rate = mutation_params_all.inout_rate[groupID.x];
+    SigMutationParams sig_post_mutation_params = SigMutationParams.load_post(agent_id, mutation_params_all);
+
+    DopSlpMutationParams dopamine_mutation_params = DopSlpMutationParams.load_dop(agent_id, mutation_params_all);
+
+    DopSlpMutationParams sleep_mutation_params = DopSlpMutationParams.load_slp(agent_id, mutation_params_all);
+
+    InhibMutationParams inhib_mutation_params = InhibMutationParams.load(agent_id, mutation_params_all);
+
+    InoutMutationParams inout_mutation_params = InoutMutationParams.load(agent_id, mutation_params_all);
+
+    CopyMutationParams copy_mutation_params = CopyMutationParams.load(agent_id, mutation_params_all);
 
     // -------------------------------------------------------------------------
     // 2. 個体の生存判定とベース個体 (親) の探索
@@ -589,11 +752,11 @@ void computeMain(
             MUT_LINEAR(learning_params_all.tag_decay, 0.5h, 0.999h, learning_rate.w);
 
             // InoutParams の変異
-            half inout_rate = mutation_params_all.inout_rate[groupID.x].x;
-            MUT_IN_INT3(inout_params_fi_all.light_in_fi, inout_rate);
-            MUT_IN_INT3(inout_params_fi_all.battery_in_fi, inout_rate);
-            MUT_OUT_INT3(inout_params_fi_all.gen_neg_out_fi, inout_rate);
-            MUT_OUT_INT3(inout_params_fi_all.gen_pos_out_fi, inout_rate);
+            half inout_copy_rate = mutation_params_all.inout_copy_rate[groupID.x].x;
+            MUT_IN_INT3(inout_params_fi_all.light_in_fi, inout_copy_rate);
+            MUT_IN_INT3(inout_params_fi_all.battery_in_fi, inout_copy_rate);
+            MUT_OUT_INT3(inout_params_fi_all.gen_neg_out_fi, inout_copy_rate);
+            MUT_OUT_INT3(inout_params_fi_all.gen_pos_out_fi, inout_copy_rate);
         }
 
         // ---------------------------------------------------------------------
@@ -696,5 +859,29 @@ void computeMain(
             inhib_map_all[packed_index] = ballot.x;
         }
         GroupMemoryBarrierWithGroupSync();
+
+        // -------------------------------------------------------------------------
+        // SigPrePost コピー型変異
+        // -------------------------------------------------------------------------
+        if (rand_half(agent_id * 11447u + step * 6803u, 1.0h) <= copy_mutation_params.rate) {
+            CopyMutation copy_mutation = mutation_copy(12277u * agent_id + 17u * step);
+            uint3 size = copy_mutation.size;
+            if (groupIndex < size.x * size.y * size.z) {
+                int3 my_startend_coord[2] = calc_coord_copymut(copy_mutation, groupIndex);
+                bool is_valid_start_idx = is_valid_indexNp2m(my_startend_coord[0]);
+                bool is_valid_end_idx = is_valid_indexNp2m(my_startend_coord[1]);
+                if (is_valid_start_idx & is_valid_end_idx) {
+                    half4 my_pre_val = signature_pre_map_np2[base_id_s * TOTAL_NP2 + coordToIndexNp2(uint3(my_startend_coord[0] + 1))];
+                    half4 my_post_val = signature_post_map_np2[base_id_s * TOTAL_NP2 + coordToIndexNp2(uint3(my_startend_coord[0] + 1))];
+                    half4 current_end_pre = signature_pre_map_np2[base_id_s * TOTAL_NP2 + coordToIndexNp2(uint3(my_startend_coord[1] + 1))];
+                    half4 current_end_post = signature_post_map_np2[base_id_s * TOTAL_NP2 + coordToIndexNp2(uint3(my_startend_coord[1] + 1))];
+                    half overwrite_rate = copy_mutation.overwrite_rate;
+                    signature_pre_map_np2[base_id_s * TOTAL_NP2 + coordToIndexNp2(uint3(my_startend_coord[1] + 1))]
+                        = current_end_pre * (1.0h - overwrite_rate) + my_pre_val * overwrite_rate;
+                    signature_post_map_np2[base_id_s * TOTAL_NP2 + coordToIndexNp2(uint3(my_startend_coord[1] + 1))]
+                        = current_end_post * (1.0h - overwrite_rate) + my_post_val * overwrite_rate;
+                }
+            }
+        }
     }
 }
