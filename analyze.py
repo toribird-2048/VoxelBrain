@@ -80,6 +80,12 @@ def load_elite_npz(npz_path: str):
         "tag_decay": float(data["learn_decay"]),
     }
 
+    if "light_in_fi" in data:
+        params["light_in_fi"] = data["light_in_fi"]
+        params["battery_in_fi"] = data["battery_in_fi"]
+        params["gen_neg_out_fi"] = data["gen_neg_out_fi"]
+        params["gen_pos_out_fi"] = data["gen_pos_out_fi"]
+
     spec = {
         "dim": dim,
         "n": n,
