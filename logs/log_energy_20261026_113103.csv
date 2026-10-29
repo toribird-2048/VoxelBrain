@@ -1,2 +1,0 @@
-step,elapsed_sec,passed_ge2,alive_gt0,full_ge09,mean_energy,max_energy,top10_energy
-0,11.4999,0,0,0,0.0000,0.0000,"""[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]"""

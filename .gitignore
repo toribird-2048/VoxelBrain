@@ -1,0 +1,40 @@
+# === Python ===
+__pycache__/
+*.py[cod]
+*$py.class
+.mypy_cache/
+.pytest_cache/
+
+# === Virtual Environment ===
+.venv/
+venv/
+env/
+
+# === Slang / OptiX / GPU Cache ===
+optix7cache.db*
+*.nsys-rep
+
+# === Training Logs & Checkpoints ===
+logs/
+backups/checkpoint_*/
+backups/edited/
+backups/recordings/
+.voxelbrain_stop_signal
+
+# === Visualizations ===
+trends/
+trend.png
+
+# === Scratch / Temporary Files ===
+tmp.py
+scratch/
+
+# === OS / Editors ===
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# === Keep Important Samples ===
+# backups 自体は一部追跡したい場合（handcrafted_v1.npz など）
+!backups/elites/
