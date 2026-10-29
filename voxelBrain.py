@@ -120,6 +120,24 @@ class R4:
             return rng.integers(self.val_min, self.val_max, size=(count, 4), endpoint=True)
         raise ValueError("Unexpected Error")
 
+@dataclass(frozen=True, slots=True)
+class RInoutFi:
+    val_type: type = int
+    val_min: int = -1
+    val_max: int = 5
+    is_output: bool = False
+
+    def generate(self, count: int, seed: int) -> np.ndarray:
+        rng = np.random.default_rng(seed=seed)
+        face = rng.integers(0, 5, size=count, endpoint=True, dtype=np.int32)
+        if self.is_output:
+            u = rng.integers(0, Config.N - 1, size=count, endpoint=True, dtype=np.int32)
+            v = rng.integers(0, Config.N - 1, size=count, endpoint=True, dtype=np.int32)
+        else:
+            u = rng.integers(-1, Config.N, size=count, endpoint=True, dtype=np.int32)
+            v = rng.integers(-1, Config.N, size=count, endpoint=True, dtype=np.int32)
+        return np.stack([face, u, v], axis=-1).astype(np.int32)
+
 class Config:
     dim: int = int(os.environ.get("VB_DIM", "2"))  # dim=1 -> N=2, dim=2 -> N=4, dim=3 -> N=8
     N: int = 1 << dim
@@ -143,6 +161,7 @@ class Config:
         link: int = 6
         res: int = 7
         learn: int = 8
+        inout: int = 9
 
 
 class SigRange:
@@ -186,6 +205,13 @@ class LearningRange:
     tag_decay = R(float, 0.7, 0.99)
 
 
+class InoutFiRange:
+    light_in_fi = RInoutFi(is_output=False)
+    battery_in_fi = RInoutFi(is_output=False)
+    gen_neg_out_fi = RInoutFi(is_output=True)
+    gen_pos_out_fi = RInoutFi(is_output=True)
+
+
 def generate(cls, seed: int) -> dict[str, np.ndarray]:
     params_dict = {}
     rng_seed = seed
@@ -207,6 +233,7 @@ class GenesisParams:
     resource_params: dict[str, np.ndarray]
     link27th_params: dict[str, np.ndarray]
     learning_params: dict[str, np.ndarray]
+    inout_params_fi: dict[str, np.ndarray]
 
     @classmethod
     def new(cls) -> "GenesisParams":
@@ -218,7 +245,8 @@ class GenesisParams:
             inhib_params=generate(InhibRange, Config.Seed.inhib),
             resource_params=generate(NeuronResourceRange, Config.Seed.res),
             link27th_params=generate(Link27thRange, Config.Seed.link),
-            learning_params=generate(LearningRange, Config.Seed.learn)
+            learning_params=generate(LearningRange, Config.Seed.learn),
+            inout_params_fi=generate(InoutFiRange, Config.Seed.inout),
         )
 
 
@@ -285,13 +313,14 @@ def create_buf(device: spy.Device, params: np.ndarray | dict[str, np.ndarray]):
 def create_mutation_params_buffers(num_groups: int, seed: int = None):
     rng = np.random.default_rng(seed)
 
-    sig_pre_threshold  = rng.uniform(0.7, 0.95, size=(num_groups, 4)).astype(np.float16)
-    sig_post_threshold = rng.uniform(0.7, 0.95, size=(num_groups, 4)).astype(np.float16)
+    # 旧 threshold (x) を 1 - x の変異確率 (rate) として設定
+    sig_pre_rate  = rng.uniform(0.05, 0.30, size=(num_groups, 4)).astype(np.float16)
+    sig_post_rate = rng.uniform(0.05, 0.30, size=(num_groups, 4)).astype(np.float16)
     
-    other_threshold = np.zeros((num_groups, 4), dtype=np.float16)
-    other_threshold[:, 0] = rng.uniform(0.6, 0.9, size=num_groups)  # dopamine
-    other_threshold[:, 1] = rng.uniform(0.6, 0.9, size=num_groups)  # sleep
-    other_threshold[:, 2] = rng.uniform(0.8, 0.98, size=num_groups) # inhib (反転確率)
+    other_rate = np.zeros((num_groups, 4), dtype=np.float16)
+    other_rate[:, 0] = rng.uniform(0.10, 0.40, size=num_groups)  # dopamine
+    other_rate[:, 1] = rng.uniform(0.10, 0.40, size=num_groups)  # sleep
+    other_rate[:, 2] = rng.uniform(0.02, 0.20, size=num_groups)  # inhib (反転確率)
 
     steps = rng.integers(0, 6, size=(num_groups, 4), dtype=np.uint32)
 
@@ -310,32 +339,36 @@ def create_mutation_params_buffers(num_groups: int, seed: int = None):
     other_max[:, 0] = rng.uniform(0.01, 0.1, size=num_groups)
     other_max[:, 1] = rng.uniform(0.01, 0.1, size=num_groups)
 
-    resource_threshold = np.zeros((num_groups, 4), dtype=np.float16)
-    resource_threshold[:, 0] = rng.uniform(0.85, 0.98, size=num_groups)
-    resource_threshold[:, 1] = rng.uniform(0.85, 0.98, size=num_groups)
-    resource_threshold[:, 2] = rng.uniform(0.85, 0.98, size=num_groups)
+    resource_rate = np.zeros((num_groups, 4), dtype=np.float16)
+    resource_rate[:, 0] = rng.uniform(0.02, 0.15, size=num_groups)
+    resource_rate[:, 1] = rng.uniform(0.02, 0.15, size=num_groups)
+    resource_rate[:, 2] = rng.uniform(0.02, 0.15, size=num_groups)
 
-    link27th_threshold = rng.uniform(0.85, 0.98, size=(num_groups, 2)).astype(np.float16)
+    link27th_rate = rng.uniform(0.02, 0.15, size=(num_groups, 2)).astype(np.float16)
 
-    learning_threshold = rng.uniform(0.85, 0.98, size=(num_groups, 4)).astype(np.float16)
+    learning_rate = rng.uniform(0.02, 0.15, size=(num_groups, 4)).astype(np.float16)
 
-    mutate_threshold = rng.uniform(0.9, 0.99, size=(num_groups, 4)).astype(np.float16)
+    mutate_rate = rng.uniform(0.01, 0.10, size=(num_groups, 4)).astype(np.float16)
+
+    inout_rate = np.zeros((num_groups, 2), dtype=np.float16)
+    inout_rate[:, 0] = rng.uniform(0.02, 0.15, size=num_groups)
 
     return {
-        "sig_pre_threshold":  sig_pre_threshold,
-        "sig_post_threshold": sig_post_threshold,
-        "other_threshold":    other_threshold,
-        "steps":              steps,
-        "sig_pre_diff":       sig_pre_diff,
-        "sig_post_diff":      sig_post_diff,
-        "other_diff":         other_diff,
-        "sig_pre_max":        sig_pre_max,
-        "sig_post_max":       sig_post_max,
-        "other_max":          other_max,
-        "resource_threshold": resource_threshold,
-        "link27th_threshold": link27th_threshold,
-        "learning_threshold": learning_threshold,
-        "mutate_threshold":   mutate_threshold,
+        "sig_pre_rate":  sig_pre_rate,
+        "sig_post_rate": sig_post_rate,
+        "other_rate":    other_rate,
+        "steps":         steps,
+        "sig_pre_diff":  sig_pre_diff,
+        "sig_post_diff": sig_post_diff,
+        "other_diff":    other_diff,
+        "sig_pre_max":   sig_pre_max,
+        "sig_post_max":  sig_post_max,
+        "other_max":     other_max,
+        "resource_rate": resource_rate,
+        "link27th_rate": link27th_rate,
+        "learning_rate": learning_rate,
+        "mutate_rate":   mutate_rate,
+        "inout_rate":    inout_rate,
     }
 
 
@@ -402,7 +435,32 @@ mutation_rate_buf = device.create_buffer(
 shared_resource_params_buf = cast_and_buffer(genesis_params.resource_params, device)
 shared_link27th_params_buf = cast_and_buffer(genesis_params.link27th_params, device)
 shared_learning_params_buf = cast_and_buffer(genesis_params.learning_params, device)
+shared_inout_params_fi_buf = cast_and_buffer(genesis_params.inout_params_fi, device)
 shared_mutation_params_buf = cast_and_buffer(create_mutation_params_buffers(Config.m, 42), device)
+
+
+def get_default_inout_fi(dim: int) -> dict[str, np.ndarray]:
+    if dim == 1:
+        return {
+            "light_in_fi": np.array([2, 1, 0], dtype=np.int32),
+            "battery_in_fi": np.array([2, 0, 0], dtype=np.int32),
+            "gen_neg_out_fi": np.array([5, 0, 0], dtype=np.int32),
+            "gen_pos_out_fi": np.array([5, 1, 0], dtype=np.int32),
+        }
+    elif dim == 2:
+        return {
+            "light_in_fi": np.array([2, 3, 2], dtype=np.int32),
+            "battery_in_fi": np.array([2, 1, 2], dtype=np.int32),
+            "gen_neg_out_fi": np.array([0, 2, 1], dtype=np.int32),
+            "gen_pos_out_fi": np.array([1, 2, 1], dtype=np.int32),
+        }
+    else:
+        return {
+            "light_in_fi": np.array([2, 5, 4], dtype=np.int32),
+            "battery_in_fi": np.array([2, 3, 4], dtype=np.int32),
+            "gen_neg_out_fi": np.array([0, 2, 1], dtype=np.int32),
+            "gen_pos_out_fi": np.array([1, 2, 1], dtype=np.int32),
+        }
 
 
 def load_and_distribute_all_elites(folder_path: str):
@@ -462,7 +520,15 @@ def load_and_distribute_all_elites(folder_path: str):
         np.array([e["learn_decay"] for e in elites], dtype=np.float16)[assign]
     )
 
-    print("[★] 全8,192体への多系統エリート配分が完了しました！\n")
+    defaults_fi = get_default_inout_fi(Config.dim)
+    for fi_key in ("light_in_fi", "battery_in_fi", "gen_neg_out_fi", "gen_pos_out_fi"):
+        fi_arr = np.stack([
+            np.asarray(e[fi_key], dtype=np.int32).reshape(3) if fi_key in e else defaults_fi[fi_key]
+            for e in elites
+        ])[assign].astype(np.int32)
+        shared_inout_params_fi_buf[fi_key].copy_from_numpy(np.ascontiguousarray(fi_arr))
+
+    print("[★] 全個体への多系統エリート配分が完了しました！\n")
 
 
 LOAD_CHECKPOINT_FOLDER = os.environ.get("VB_LOAD_FOLDER", "backups/elites")
@@ -483,6 +549,7 @@ reasoning_sim_dict = {
     "resource_params_all": shared_resource_params_buf,
     "link27th_params_all": shared_link27th_params_buf,
     "learning_params_all": shared_learning_params_buf,
+    "inout_params_fi_all": shared_inout_params_fi_buf,
     "dopamine_sum": dopamine_sum_buf,
     "sleep_sum": sleep_sum_buf,
     "mutation_rate_all": mutation_rate_buf,
@@ -499,6 +566,7 @@ mutation_dict = {
     "resource_params_all": shared_resource_params_buf,
     "link27th_params_all": shared_link27th_params_buf,
     "learning_params_all": shared_learning_params_buf,
+    "inout_params_fi_all": shared_inout_params_fi_buf,
     "mutation_params_all": shared_mutation_params_buf,
     "mutation_rate_all": mutation_rate_buf,
     "total": Config.m,
@@ -561,6 +629,11 @@ def save_top_k_elites(step_num: int, energies: np.ndarray, k: int = 20):
     lr_thresh  = shared_learning_params_buf["learning_threshold"].to_numpy().view(np.float16)
     lr_decay   = shared_learning_params_buf["tag_decay"].to_numpy().view(np.float16)
 
+    light_in_fi_all    = shared_inout_params_fi_buf["light_in_fi"].to_numpy().view(np.int32).reshape(Config.m, 3)
+    battery_in_fi_all  = shared_inout_params_fi_buf["battery_in_fi"].to_numpy().view(np.int32).reshape(Config.m, 3)
+    gen_neg_out_fi_all = shared_inout_params_fi_buf["gen_neg_out_fi"].to_numpy().view(np.int32).reshape(Config.m, 3)
+    gen_pos_out_fi_all = shared_inout_params_fi_buf["gen_pos_out_fi"].to_numpy().view(np.int32).reshape(Config.m, 3)
+
     for rank, idx in enumerate(top_indices, start=1):
         idx = int(idx)
         score = float(energies[idx])
@@ -587,6 +660,10 @@ def save_top_k_elites(step_num: int, energies: np.ndarray, k: int = 20):
             learn_forget=lr_forget[idx],
             learn_threshold=lr_thresh[idx],
             learn_decay=lr_decay[idx],
+            light_in_fi=light_in_fi_all[idx],
+            battery_in_fi=battery_in_fi_all[idx],
+            gen_neg_out_fi=gen_neg_out_fi_all[idx],
+            gen_pos_out_fi=gen_pos_out_fi_all[idx],
         )
 
     print(f"[★] 上位 {k} 体の保存が完了しました！(1位スコア: {energies[top_indices[0]]:.3f} ~ {k}位スコア: {energies[top_indices[-1]]:.3f})")
@@ -693,6 +770,10 @@ for step in range(TOTAL_STEPS):
             learn_forget=shared_learning_params_buf["forget_rate"].to_numpy().view(np.float16)[best_idx],
             learn_threshold=shared_learning_params_buf["learning_threshold"].to_numpy().view(np.float16)[best_idx],
             learn_decay=shared_learning_params_buf["tag_decay"].to_numpy().view(np.float16)[best_idx],
+            light_in_fi=shared_inout_params_fi_buf["light_in_fi"].to_numpy().view(np.int32).reshape(Config.m, 3)[best_idx],
+            battery_in_fi=shared_inout_params_fi_buf["battery_in_fi"].to_numpy().view(np.int32).reshape(Config.m, 3)[best_idx],
+            gen_neg_out_fi=shared_inout_params_fi_buf["gen_neg_out_fi"].to_numpy().view(np.int32).reshape(Config.m, 3)[best_idx],
+            gen_pos_out_fi=shared_inout_params_fi_buf["gen_pos_out_fi"].to_numpy().view(np.int32).reshape(Config.m, 3)[best_idx],
         )
         print(f"  [★] 過去最高エリート（変異前・本物）を保存しました -> {save_path}")
 

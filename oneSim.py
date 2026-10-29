@@ -40,29 +40,92 @@ STEPS_PER_FRAME = 1
 HISTORY_LEN = 200
 
 
-def get_special_coords_np2(dim: int) -> dict[tuple[int, int, int], str]:
-    """(z, y, x) in P x P x P (0 .. N+1) における特殊セルの役割ラベルを返す"""
+def get_default_inout_fi(dim: int) -> dict[str, np.ndarray]:
+    """各次元における標準の入出力face_index [face, u, v] を返す"""
     if dim == 1:
         return {
-            (1, 0, 1): "⚡Energy入力",
-            (1, 0, 2): "☀️Sun入力",
-            (2, 1, 2): "⚙️Gen+出力",
-            (2, 1, 1): "⚙️Gen-出力",
+            "light_in_fi": np.array([2, 1, 0], dtype=np.int32),
+            "battery_in_fi": np.array([2, 0, 0], dtype=np.int32),
+            "gen_neg_out_fi": np.array([5, 0, 0], dtype=np.int32),
+            "gen_pos_out_fi": np.array([5, 1, 0], dtype=np.int32),
         }
     elif dim == 2:
         return {
-            (3, 0, 2): "⚡Energy入力",
-            (3, 0, 4): "☀️Sun入力",
-            (2, 3, 4): "⚙️Gen+出力",
-            (2, 3, 2): "⚙️Gen-出力",
+            "light_in_fi": np.array([2, 3, 2], dtype=np.int32),
+            "battery_in_fi": np.array([2, 1, 2], dtype=np.int32),
+            "gen_neg_out_fi": np.array([0, 2, 1], dtype=np.int32),
+            "gen_pos_out_fi": np.array([1, 2, 1], dtype=np.int32),
         }
     else:
         return {
-            (5, 0, 4): "⚡Energy入力",
-            (5, 0, 6): "☀️Sun入力",
-            (2, 3, 4): "⚙️Gen+出力",
-            (2, 3, 2): "⚙️Gen-出力",
+            "light_in_fi": np.array([2, 5, 4], dtype=np.int32),
+            "battery_in_fi": np.array([2, 3, 4], dtype=np.int32),
+            "gen_neg_out_fi": np.array([0, 2, 1], dtype=np.int32),
+            "gen_pos_out_fi": np.array([1, 2, 1], dtype=np.int32),
         }
+
+
+def face_index_to_coord_in_p(fi, n: int) -> tuple[int, int, int]:
+    """入力用 face_index (face, u, v) を P空間座標 (z, y, x) [0..N+1] に変換"""
+    face = int(np.clip(int(fi[0]), 0, 5))
+    u = int(np.clip(int(fi[1]), -1, n))
+    v = int(np.clip(int(fi[2]), -1, n))
+    table = (
+        (-1, u, v),
+        (n,  u, v),
+        (u, -1, v),
+        (u, n,  v),
+        (u, v, -1),
+        (u, v, n),
+    )
+    cx, cy, cz = table[face]
+    return (cz + 1, cy + 1, cx + 1)
+
+
+def face_index_to_coord_out_p(fi, n: int) -> tuple[int, int, int]:
+    """出力用 face_index (face, u, v) を P空間座標 (z, y, x) [1..N] に変換"""
+    face = int(np.clip(int(fi[0]), 0, 5))
+    u = int(np.clip(int(fi[1]), 0, n - 1))
+    v = int(np.clip(int(fi[2]), 0, n - 1))
+    table = (
+        (0,     u, v),
+        (n - 1, u, v),
+        (u, 0,     v),
+        (u, n - 1, v),
+        (u, v, 0),
+        (u, v, n - 1),
+    )
+    cx, cy, cz = table[face]
+    return (cz + 1, cy + 1, cx + 1)
+
+
+def get_special_coords_np2(dim: int, params: dict | None = None) -> dict[tuple[int, int, int], str]:
+    """(z, y, x) in P x P x P (0 .. N+1) における特殊セルの役割ラベルを動的に返す"""
+    n = 1 << dim
+    defaults_fi = get_default_inout_fi(dim)
+    if params is None:
+        params = defaults_fi
+
+    light_fi = params.get("light_in_fi", defaults_fi["light_in_fi"])
+    batt_fi = params.get("battery_in_fi", defaults_fi["battery_in_fi"])
+    gen_neg_fi = params.get("gen_neg_out_fi", defaults_fi["gen_neg_out_fi"])
+    gen_pos_fi = params.get("gen_pos_out_fi", defaults_fi["gen_pos_out_fi"])
+
+    coord_light = face_index_to_coord_in_p(light_fi, n)
+    coord_batt = face_index_to_coord_in_p(batt_fi, n)
+    coord_neg = face_index_to_coord_out_p(gen_neg_fi, n)
+    coord_pos = face_index_to_coord_out_p(gen_pos_fi, n)
+
+    res: dict[tuple[int, int, int], list[str]] = {}
+    for coord, label in [
+        (coord_batt, "⚡Energy入力"),
+        (coord_light, "☀️Sun入力"),
+        (coord_pos, "⚙️Gen+出力"),
+        (coord_neg, "⚙️Gen-出力"),
+    ]:
+        res.setdefault(coord, []).append(label)
+
+    return {coord: " / ".join(labels) for coord, labels in res.items()}
 
 
 def format_coord_label(z: int, y: int, x: int, n: int) -> tuple[str, str]:
@@ -208,6 +271,13 @@ def load_elite_npz(npz_path: str):
         "is_corrupted_u8": bool(data["resource_base_output"].dtype == np.uint8),
     }
 
+    defaults_fi = get_default_inout_fi(dim)
+    for k in ("light_in_fi", "battery_in_fi", "gen_neg_out_fi", "gen_pos_out_fi"):
+        if k in data:
+            params[k] = np.asarray(data[k], dtype=np.int32).reshape(3)
+        else:
+            params[k] = defaults_fi[k].copy()
+
     spec = {"dim": dim, "n": n, "p": p, "total_n": total_n, "center": n // 2}
     return sig_pre, sig_post, dopamine_map, sleep_map, inhib, params, spec
 
@@ -247,6 +317,12 @@ class SolarBrainCPU:
         self.dopamine_map = dopamine_map.astype(np.float16)
         self.sleep_map = sleep_map.astype(np.float16)
         self.inhib = inhib.astype(np.float16)
+
+        defaults_fi = get_default_inout_fi(self.dim)
+        self.light_in_p = face_index_to_coord_in_p(params.get("light_in_fi", defaults_fi["light_in_fi"]), self.N)
+        self.battery_in_p = face_index_to_coord_in_p(params.get("battery_in_fi", defaults_fi["battery_in_fi"]), self.N)
+        self.gen_neg_out_p = face_index_to_coord_out_p(params.get("gen_neg_out_fi", defaults_fi["gen_neg_out_fi"]), self.N)
+        self.gen_pos_out_p = face_index_to_coord_out_p(params.get("gen_pos_out_fi", defaults_fi["gen_pos_out_fi"]), self.N)
 
         if not hasattr(self, "synapse_ko_mask") or self.synapse_ko_mask.shape != (self.TOTAL_N, 28):
             self.synapse_ko_mask = np.zeros((self.TOTAL_N, 28), dtype=bool)
@@ -428,10 +504,9 @@ class SolarBrainCPU:
                 sun_f32 = np.float32(np.clip(np.sin(np.pi * np.float32(self.inner_step_counter * (1.0 / SUN_CYCLE_PERIOD))), 0.0, 1.0))
                 self.current_sunlight = float(sun_f32)
 
-                if self.dim == 1:
-                    gen_raw = (self.outputs_np2[2, 1, 2] - self.outputs_np2[2, 1, 1]).astype(np.float16)
-                else:
-                    gen_raw = (self.outputs_np2[2, 3, 4] - self.outputs_np2[2, 3, 2]).astype(np.float16)
+                gpz, gpy, gpx = self.gen_pos_out_p
+                gnz, gny, gnx = self.gen_neg_out_p
+                gen_raw = (self.outputs_np2[gpz, gpy, gpx] - self.outputs_np2[gnz, gny, gnx]).astype(np.float16)
 
                 self.generator_power = float(np.clip(gen_raw, 0.0, 1.0))
 
@@ -448,15 +523,10 @@ class SolarBrainCPU:
                     self.energy = 0.0
 
                 # --- 感覚入力の書き込み（感覚セルがKOされていれば 0.0h） ---
-                if self.dim == 1:
-                    self.outputs_np2[1, 0, 1] = np.float16(0.0) if self.knockout_np2[1, 0, 1] else np.float16(self.energy)
-                    self.outputs_np2[1, 0, 2] = np.float16(0.0) if self.knockout_np2[1, 0, 2] else np.float16(self.current_sunlight)
-                elif self.dim == 2:
-                    self.outputs_np2[3, 0, 2] = np.float16(0.0) if self.knockout_np2[3, 0, 2] else np.float16(self.energy)
-                    self.outputs_np2[3, 0, 4] = np.float16(0.0) if self.knockout_np2[3, 0, 4] else np.float16(self.current_sunlight)
-                else:
-                    self.outputs_np2[5, 0, 4] = np.float16(0.0) if self.knockout_np2[5, 0, 4] else np.float16(self.energy)
-                    self.outputs_np2[5, 0, 6] = np.float16(0.0) if self.knockout_np2[5, 0, 6] else np.float16(self.current_sunlight)
+                bz, by, bx = self.battery_in_p
+                lz, ly, lx = self.light_in_p
+                self.outputs_np2[bz, by, bx] = np.float16(0.0) if self.knockout_np2[bz, by, bx] else np.float16(self.energy)
+                self.outputs_np2[lz, ly, lx] = np.float16(0.0) if self.knockout_np2[lz, ly, lx] else np.float16(self.current_sunlight)
 
                 if record_history:
                     self.step_history.append(self.inner_step_counter)
@@ -593,6 +663,7 @@ class IntegratedBrainStudio:
             "learning_threshold": np.float16(0.5),
             "tag_decay": np.float16(0.9),
         }
+        self.sim_params.update(get_default_inout_fi(self.dim))
         self.spec = {
             "dim": self.dim,
             "n": self.N,
@@ -969,12 +1040,24 @@ class IntegratedBrainStudio:
             ("tag_decay", "tag_decay (0.5~0.999)"),
             ("step", "step (世代番号)"),
             ("score", "score (評価エネルギー)"),
+            ("light_in_fi", "光入力 (f,u,v)"),
+            ("battery_in_fi", "蓄電入力 (f,u,v)"),
+            ("gen_neg_out_fi", "発電-出力 (f,u,v)"),
+            ("gen_pos_out_fi", "発電+出力 (f,u,v)"),
         ]
         for idx, (key, label) in enumerate(specs):
             r, col_base = divmod(idx, 2)
             ttk.Label(p_grid, text=label).grid(row=r, column=col_base * 2, sticky=tk.W, padx=3, pady=2)
-            val = self.meta_step if key == "step" else (self.meta_score if key == "score" else self.sim_params[key])
-            var = tk.StringVar(value=str(val))
+            if key == "step":
+                val = str(self.meta_step)
+            elif key == "score":
+                val = str(self.meta_score)
+            elif key.endswith("_fi"):
+                fi = self.sim_params[key]
+                val = f"{int(fi[0])},{int(fi[1])},{int(fi[2])}"
+            else:
+                val = str(self.sim_params[key])
+            var = tk.StringVar(value=val)
             self.param_vars[key] = var
             ent = ttk.Entry(p_grid, textvariable=var, width=10)
             ent.grid(row=r, column=col_base * 2 + 1, padx=3, pady=2)
@@ -1606,6 +1689,9 @@ class IntegratedBrainStudio:
                     var.set(f"{self.meta_score:.4f}")
                 elif key in ("multiplier", "bias"):
                     var.set(str(int(self.sim_params[key])))
+                elif key.endswith("_fi"):
+                    fi = self.sim_params[key]
+                    var.set(f"{int(fi[0])},{int(fi[1])},{int(fi[2])}")
                 else:
                     var.set(f"{float(self.sim_params[key]):.5g}")
 
@@ -1648,7 +1734,7 @@ class IntegratedBrainStudio:
     def _refresh_cell_inspector(self):
         z, y, x = self.sel_z, self.sel_y, self.sel_x
         is_internal = (1 <= z <= self.N) and (1 <= y <= self.N) and (1 <= x <= self.N)
-        special_map = get_special_coords_np2(self.dim)
+        special_map = get_special_coords_np2(self.dim, getattr(self, "sim_params", None))
         role_str = special_map.get((z, y, x), "")
         n_str, p_str = format_coord_label(z, y, x, self.N)
 
@@ -1747,7 +1833,7 @@ class IntegratedBrainStudio:
         init_weights = self.brain.initial_weights
         syn_ko = self.brain.synapse_ko_mask
         conn_z, conn_y, conn_x = self.brain.conn_z, self.brain.conn_y, self.brain.conn_x
-        special_map = get_special_coords_np2(self.dim)
+        special_map = get_special_coords_np2(self.dim, getattr(self, "sim_params", None))
         is_sel_internal = (1 <= z <= self.N) and (1 <= y <= self.N) and (1 <= x <= self.N)
 
         if is_sel_internal:
@@ -1802,7 +1888,7 @@ class IntegratedBrainStudio:
 
         self._cell_rects: dict[tuple[int, int, int], tuple[float, float, float, float]] = {}
         self._cell_fill_rect_ids: dict[tuple[int, int, int], int] = {}
-        special_map = get_special_coords_np2(self.dim)
+        special_map = get_special_coords_np2(self.dim, getattr(self, "sim_params", None))
         partner_map = self._get_selected_cell_partner_map()
         mode = self.view_mode_var.get()
 
@@ -2577,7 +2663,7 @@ class IntegratedBrainStudio:
         )
         base_energy = tester.energy
 
-        special_map = get_special_coords_np2(self.dim)
+        special_map = get_special_coords_np2(self.dim, getattr(self, "sim_params", None))
         target_coords = list(special_map.keys()) + [
             (iz + 1, iy + 1, ix + 1)
             for iz in range(self.N)
@@ -2662,7 +2748,7 @@ class IntegratedBrainStudio:
         )
         base_energy = tester.energy
 
-        special_map = get_special_coords_np2(self.dim)
+        special_map = get_special_coords_np2(self.dim, getattr(self, "sim_params", None))
         conn_z, conn_y, conn_x = self.brain.conn_z, self.brain.conn_y, self.brain.conn_x
 
         active_synapses = []
@@ -2702,7 +2788,7 @@ class IntegratedBrainStudio:
         self._scan_item_coords.clear()
         self._scan_item_synapses.clear()
 
-        special_map = get_special_coords_np2(self.dim)
+        special_map = get_special_coords_np2(self.dim, getattr(self, "sim_params", None))
         conn_z, conn_y, conn_x = self.brain.conn_z, self.brain.conn_y, self.brain.conn_x
 
         for rank, (drop, ko_e, post_idx, k, w0) in enumerate(results, start=1):
@@ -2785,6 +2871,12 @@ class IntegratedBrainStudio:
             self.enable_learning = float(np.clip(float(self.flag_str_vars["enable_learning"].get()), 0.0, 1.0))
             self.enable_dopamine = float(np.clip(float(self.flag_str_vars["enable_dopamine"].get()), 0.0, 1.0))
             self.enable_sleep = float(np.clip(float(self.flag_str_vars["enable_sleep"].get()), 0.0, 1.0))
+
+            for fi_key in ("light_in_fi", "battery_in_fi", "gen_neg_out_fi", "gen_pos_out_fi"):
+                if fi_key in self.param_vars:
+                    parts = [int(p.strip()) for p in self.param_vars[fi_key].get().split(",")]
+                    if len(parts) == 3:
+                        self.sim_params[fi_key] = np.array(parts, dtype=np.int32)
         except ValueError:
             pass
 
@@ -2869,6 +2961,7 @@ class IntegratedBrainStudio:
             "learning_threshold": np.float16(0.5),
             "tag_decay": np.float16(0.9),
         })
+        self.sim_params.update(get_default_inout_fi(self.dim))
         self._sync_genes_to_brain(force_reset=True)
         self._refresh_all_views()
 
@@ -2933,6 +3026,9 @@ class IntegratedBrainStudio:
 
             for k in ("base_output", "beta", "k_refill", "multiplier", "bias", "learning_rate", "forget_rate", "learning_threshold", "tag_decay"):
                 self.sim_params[k] = params[k]
+            for k in ("light_in_fi", "battery_in_fi", "gen_neg_out_fi", "gen_pos_out_fi"):
+                if k in params:
+                    self.sim_params[k] = params[k]
 
             self.current_file_path = file_path
             self.last_opened_dir = os.path.dirname(os.path.abspath(file_path))
@@ -2985,6 +3081,10 @@ class IntegratedBrainStudio:
             learn_forget=np.float16(self.sim_params["forget_rate"]),
             learn_threshold=np.float16(self.sim_params["learning_threshold"]),
             learn_decay=np.float16(self.sim_params["tag_decay"]),
+            light_in_fi=np.asarray(self.sim_params["light_in_fi"], dtype=np.int32),
+            battery_in_fi=np.asarray(self.sim_params["battery_in_fi"], dtype=np.int32),
+            gen_neg_out_fi=np.asarray(self.sim_params["gen_neg_out_fi"], dtype=np.int32),
+            gen_pos_out_fi=np.asarray(self.sim_params["gen_pos_out_fi"], dtype=np.int32),
         )
         self.current_file_path = save_path
         self.last_opened_dir = os.path.dirname(os.path.abspath(save_path))
@@ -3479,6 +3579,10 @@ class IntegratedBrainStudio:
             learn_forget=np.float16(self.sim_params["forget_rate"]),
             learn_threshold=np.float16(self.sim_params["learning_threshold"]),
             learn_decay=np.float16(self.sim_params["tag_decay"]),
+            light_in_fi=np.asarray(self.sim_params["light_in_fi"], dtype=np.int32),
+            battery_in_fi=np.asarray(self.sim_params["battery_in_fi"], dtype=np.int32),
+            gen_neg_out_fi=np.asarray(self.sim_params["gen_neg_out_fi"], dtype=np.int32),
+            gen_pos_out_fi=np.asarray(self.sim_params["gen_pos_out_fi"], dtype=np.int32),
         )
 
         env = self._build_analyze_env()
