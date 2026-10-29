@@ -327,24 +327,24 @@ uint coordToIndexN(uint3 coord) {
     return (coord.z << SHIFT_Z) | (coord.y << SHIFT_Y) | (coord.x << SHIFT_X);
 }
 
-// (N+2) x (N+2) x (N+2) パディング付きグリッド
-uint3 indexToCoordNp2(uint index) {
+// (N+2) x (N+2) x (N+2) パディング付きグリッド (-1 .. N)
+int3 indexToCoordNp2(uint index) {
     uint P = N + 2;
-    uint x = index % P;
-    uint y = (index / P) % P;
-    uint z = (index / (P * P)) % P;
-    return uint3(x, y, z);
+    int x = int(index % P) - 1;
+    int y = int((index / P) % P) - 1;
+    int z = int(index / (P * P)) - 1;
+    return int3(x, y, z);
 }
 
-uint coordToIndexNp2(uint3 coord) {
+uint coordToIndexNp2(int3 coord) {
     uint P = N + 2;
-    return (P * P) * coord.z + P * coord.y + coord.x;
+    uint3 c = uint3(clamp(coord + 1, 0, int(P - 1)));
+    return (P * P) * c.z + P * c.y + c.x;
 }
 
-//-1 ~ N
+// -1 ~ N
 bool is_valid_indexNp2m(int3 coord) {
-    bool3 tf_xyz = (-1 <= coord) & (coord <= N);
-    return all(tf_xyz);
+    return all(-1 <= coord) && all(coord <= int(N));
 }
 
 
@@ -539,21 +539,21 @@ int3[2] calc_coord_copymut(CopyMutation copy_mutation, uint index) {
 // ラプラシアン拡散ヘルパー (Laplacian Diffusion Helpers)
 // =============================================================================
 
-// --- NP2 グリッド (half4) アクセサ ---
-half4 get_sig_prepost_mut(uint3 center_coord_np2, int3 coord_rel, uint step) {
+// --- NP2 グリッド (half4) アクセサ (-1 .. N) ---
+half4 get_sig_prepost_mut(int3 center_coord_np2, int3 coord_rel, uint step) {
     int3 target_coord_np2 = center_coord_np2 + coord_rel;
-    bool is_valid = all(0 <= target_coord_np2) && all(target_coord_np2 <= (N + 1));
+    bool is_valid = is_valid_indexNp2m(target_coord_np2);
     return is_valid
-        ? mutation_map_np2[coordToIndexNp2(uint3(target_coord_np2))][step & 1u]
+        ? mutation_map_np2[coordToIndexNp2(target_coord_np2)][step & 1u]
         : mutation_map_np2[coordToIndexNp2(center_coord_np2)][step & 1u];
 }
 
-void set_sig_prepost_mut(uint3 center_coord_np2, uint step, half4 val) {
+void set_sig_prepost_mut(int3 center_coord_np2, uint step, half4 val) {
     mutation_map_np2[coordToIndexNp2(center_coord_np2)][step & 1u] = val;
 }
 
 // 3x3x3 近傍のラプラシアンを計算 (NP2 グリッド)
-half4 compute_laplacian_np2(uint3 center_coord_np2, uint step) {
+half4 compute_laplacian_np2(int3 center_coord_np2, uint step) {
     half4 neighbor_sum = half4(0.0h, 0.0h, 0.0h, 0.0h);
     [unroll]
     for (int dz = -1; dz <= 1; dz++) {
@@ -573,7 +573,7 @@ half4 compute_laplacian_np2(uint3 center_coord_np2, uint step) {
 void diffuse_step_np2(uint groupIndex, uint step, half4 diff) {
     const half dt = 1.0h / 54.0h;
     for (uint idx_np2 = groupIndex; idx_np2 < TOTAL_NP2; idx_np2 += TOTAL_N) {
-        uint3 coord = indexToCoordNp2(idx_np2);
+        int3 coord = indexToCoordNp2(idx_np2);
         half4 current_val = get_sig_prepost_mut(coord, int3(0, 0, 0), step);
         half4 laplacian = compute_laplacian_np2(coord, step);
         set_sig_prepost_mut(coord, step + 1, current_val + (diff * laplacian) * dt);
@@ -871,14 +871,16 @@ void computeMain(
                 bool is_valid_start_idx = is_valid_indexNp2m(my_startend_coord[0]);
                 bool is_valid_end_idx = is_valid_indexNp2m(my_startend_coord[1]);
                 if (is_valid_start_idx & is_valid_end_idx) {
-                    half4 my_pre_val = signature_pre_map_np2[base_id_s * TOTAL_NP2 + coordToIndexNp2(uint3(my_startend_coord[0] + 1))];
-                    half4 my_post_val = signature_post_map_np2[base_id_s * TOTAL_NP2 + coordToIndexNp2(uint3(my_startend_coord[0] + 1))];
-                    half4 current_end_pre = signature_pre_map_np2[base_id_s * TOTAL_NP2 + coordToIndexNp2(uint3(my_startend_coord[1] + 1))];
-                    half4 current_end_post = signature_post_map_np2[base_id_s * TOTAL_NP2 + coordToIndexNp2(uint3(my_startend_coord[1] + 1))];
-                    half overwrite_rate = copy_mutation.overwrite_rate;
-                    signature_pre_map_np2[base_id_s * TOTAL_NP2 + coordToIndexNp2(uint3(my_startend_coord[1] + 1))]
+                    uint start_idx = base_id_s * TOTAL_NP2 + coordToIndexNp2(my_startend_coord[0]);
+                    uint end_idx   = groupID.x * TOTAL_NP2 + coordToIndexNp2(my_startend_coord[1]);
+                    half4 my_pre_val       = signature_pre_map_np2[start_idx];
+                    half4 my_post_val      = signature_post_map_np2[start_idx];
+                    half4 current_end_pre  = signature_pre_map_np2[end_idx];
+                    half4 current_end_post = signature_post_map_np2[end_idx];
+                    half overwrite_rate    = copy_mutation.overwrite_rate;
+                    signature_pre_map_np2[end_idx]
                         = current_end_pre * (1.0h - overwrite_rate) + my_pre_val * overwrite_rate;
-                    signature_post_map_np2[base_id_s * TOTAL_NP2 + coordToIndexNp2(uint3(my_startend_coord[1] + 1))]
+                    signature_post_map_np2[end_idx]
                         = current_end_post * (1.0h - overwrite_rate) + my_post_val * overwrite_rate;
                 }
             }

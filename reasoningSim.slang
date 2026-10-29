@@ -299,42 +299,39 @@ uint coordToIndexN(uint3 coord) {
 }
 
 [ForceInline]
-uint3 indexToCoordNp2(uint index) {
-    uint x = index % P2;
-    uint y = (index / P2) % P2;
-    uint z = (index / (P2 * P2)) % P2;
-    return uint3(x, y, z);
+int3 indexToCoordNp2(uint index) {
+    int x = int(index % P2) - 1;
+    int y = int((index / P2) % P2) - 1;
+    int z = int(index / (P2 * P2)) - 1;
+    return int3(x, y, z);
 }
 
 [ForceInline]
-uint coordToIndexNp2(uint3 coord) {
-    return (P2 * P2) * coord.z + P2 * coord.y + coord.x;
+uint coordToIndexNp2(int3 coord) {
+    uint3 c = uint3(clamp(coord + 1, 0, int(P2 - 1)));
+    return (P2 * P2) * c.z + P2 * c.y + c.x;
 }
 
 // 内部座標 (-1 .. N) から共有メモリ outputs_s への読み書き
 [ForceInline]
 half get_output_s(int3 coord) {
-    uint3 target_coord_np2 = uint3(clamp(coord + 1, 0, int(P2 - 1)));
-    return outputs_s[coordToIndexNp2(target_coord_np2)];
+    return outputs_s[coordToIndexNp2(coord)];
 }
 
 [ForceInline]
 void set_output_s(int3 coord, half val) {
-    uint3 target_coord_np2 = uint3(clamp(coord + 1, 0, int(P2 - 1)));
-    outputs_s[coordToIndexNp2(target_coord_np2)] = val;
+    outputs_s[coordToIndexNp2(coord)] = val;
 }
 
 // 内部座標 (-1 .. N) から共有メモリ シグネチャへの読み込み
 [ForceInline]
 half4 get_sig_pre(int3 coord) {
-    uint3 coord_np2 = uint3(coord + 1);
-    return sig_pre_map_s[coordToIndexNp2(coord_np2)];
+    return sig_pre_map_s[coordToIndexNp2(coord)];
 }
 
 [ForceInline]
 half4 get_sig_post(int3 coord) {
-    uint3 coord_np2 = uint3(coord + 1);
-    return sig_post_map_s[coordToIndexNp2(coord_np2)];
+    return sig_post_map_s[coordToIndexNp2(coord)];
 }
 
 // half2パック配列用のインデックス変換ヘルパー
@@ -344,15 +341,15 @@ uint2 idxNp2h2x_to_indexNp2_01(uint idx_np2h2x) {
 }
 
 [ForceInline]
-uint3 idxNp2h2_to_coordNp2(uint2 index_np2h2) {
+int3 idxNp2h2_to_coordNp2(uint2 index_np2h2) {
     uint index_np2 = (index_np2h2.x << 1) | index_np2h2.y;
     return indexToCoordNp2(index_np2);
 }
 
 [ForceInline]
 bool is_internal(uint2 index_np2h2) {
-    uint3 coord_np2 = idxNp2h2_to_coordNp2(index_np2h2);
-    return ((((coord_np2.x - 1) | (coord_np2.y - 1) | (coord_np2.z - 1)) & ~MASK) == 0);
+    int3 coord = idxNp2h2_to_coordNp2(index_np2h2);
+    return all(0 <= coord) && all(coord < int(N));
 }
 
 void merge_outputs_membrane(uint group_id_x, RWStructuredBuffer<half2> membrane_all, uint index_np2h2_x) {
@@ -363,8 +360,8 @@ void merge_outputs_membrane(uint group_id_x, RWStructuredBuffer<half2> membrane_
     outputs_s[idx_np2_01.y] = is_internal(uint2(index_np2h2_x, 1)) ? current_out.y : memb_val.y;
 }
 
-void set_membrane(uint group_id_x, RWStructuredBuffer<half2> membrane_all, uint3 coord_np2, half val) {
-    uint idx_np2 = coordToIndexNp2(coord_np2);
+void set_membrane(uint group_id_x, RWStructuredBuffer<half2> membrane_all, int3 coord, half val) {
+    uint idx_np2 = coordToIndexNp2(coord);
     uint2 idx_np2h2 = uint2(idx_np2 >> 1, idx_np2 & 1);
     half2 current = membrane_all[group_id_x * TOTAL_NP2H2 + idx_np2h2.x];
     membrane_all[group_id_x * TOTAL_NP2H2 + idx_np2h2.x] = (idx_np2h2.y == 0)
