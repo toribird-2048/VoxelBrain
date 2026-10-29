@@ -83,12 +83,12 @@ struct ResourceParamsAll {
     StructuredBuffer<half> k_refill;
 }
 
-struct Link27thParams {
+struct Link28thParams {
     uint multiplier;
     uint bias;
 }
 
-struct Link27thParamsAll {
+struct Link28thParamsAll {
     StructuredBuffer<uint> multiplier;
     StructuredBuffer<uint> bias;
 }
@@ -107,25 +107,16 @@ struct LearningParamsAll {
     StructuredBuffer<half> tag_decay;
 }
 
-struct InoutParams {
-    int3 light_in;
-    int3 battery_in;
-    int3 gen_neg_out;
-    int3 gen_pos_out;
+#ifndef NUM_IN_PORTS
+#define NUM_IN_PORTS 2
+#endif
+#ifndef NUM_OUT_PORTS
+#define NUM_OUT_PORTS 2
+#endif
 
-    static InoutParams load(
-        int3 light_in,
-        int3 battery_in,
-        int3 gen_neg_out,
-        int3 gen_pos_out
-    ) {
-        InoutParams p;
-        p.light_in    = light_in;
-        p.battery_in  = battery_in;
-        p.gen_neg_out = gen_neg_out;
-        p.gen_pos_out = gen_pos_out;
-        return p;
-    }
+struct InoutParams {
+    int3 in_coords[NUM_IN_PORTS];
+    int3 out_coords[NUM_OUT_PORTS];
 
     // 入力セル用: 外周膜の6面 (面座標 = -1 または N, 面内座標 = -1 .. N)
     static int3 faceIndex_to_coordIn(int3 face_index) {
@@ -158,25 +149,25 @@ struct InoutParams {
     }
 
     static InoutParams load_face_index(
-        int3 light_in_fi,
-        int3 battery_in_fi,
-        int3 gen_neg_out_fi,
-        int3 gen_pos_out_fi
+        int3 in_fi[NUM_IN_PORTS],
+        int3 out_fi[NUM_OUT_PORTS]
     ) {
         InoutParams p;
-        p.light_in    = faceIndex_to_coordIn(light_in_fi);
-        p.battery_in  = faceIndex_to_coordIn(battery_in_fi);
-        p.gen_neg_out = faceIndex_to_coordOut(gen_neg_out_fi);
-        p.gen_pos_out = faceIndex_to_coordOut(gen_pos_out_fi);
+        [unroll]
+        for (uint i = 0; i < NUM_IN_PORTS; ++i) {
+            p.in_coords[i] = faceIndex_to_coordIn(in_fi[i]);
+        }
+        [unroll]
+        for (uint j = 0; j < NUM_OUT_PORTS; ++j) {
+            p.out_coords[j] = faceIndex_to_coordOut(out_fi[j]);
+        }
         return p;
     }
 }
 
 struct InoutParamsFiAll {
-    StructuredBuffer<int3> light_in_fi;
-    StructuredBuffer<int3> battery_in_fi;
-    StructuredBuffer<int3> gen_neg_out_fi;
-    StructuredBuffer<int3> gen_pos_out_fi;
+    StructuredBuffer<int3> in_ports_fi;
+    StructuredBuffer<int3> out_ports_fi;
 }
 
 // 各ニューロンが持つ28個のシナプス（近傍3x3x3=27個 ＋ 長距離27thリンク1個）
@@ -280,6 +271,8 @@ groupshared half  my_sleep_sum;                 // 個体全体の睡眠シグ�
 
 groupshared float my_energy_s; // 個体の現在エネルギー残量
 groupshared InoutParams inout_params_s;
+
+groupshared float2 my_pos_s;
 
 
 // =============================================================================
@@ -394,7 +387,7 @@ half2 rand_half2(uint input) {
 void init_synapse_weights(
     uint3 groupThreadID,
     uint groupIndex,
-    Link27thParams link27th_params,
+    Link28thParams link28th_params,
     inout SynapseData synapse_data
 ) {
     [unroll]
@@ -420,7 +413,7 @@ void init_synapse_weights(
     }
 
     // 28番目（長距離リンク）シナプス重みの初期化
-    uint3 sig_27th_coord = indexToCoordN(groupIndex * link27th_params.multiplier + link27th_params.bias);
+    uint3 sig_27th_coord = indexToCoordN(groupIndex * link28th_params.multiplier + link28th_params.bias);
     half4 sig_27th_pre = get_sig_pre(sig_27th_coord);
     half weight_27th = saturate(0.25h * dot(my_post, sig_27th_pre));
     synapse_data.set_weights_27th(weight_27th);
@@ -468,7 +461,14 @@ void reduce_neuromodulators(
 [ForceInline]
 void update_solar_energy_and_sensors(uint inner_step) {
     float current_sunlight = saturate(sinpi(inner_step * (1.0 / SUN_CYCLE_PERIOD)));
-    half generator_power = saturate(get_output_s(inout_params_s.gen_pos_out) - get_output_s(inout_params_s.gen_neg_out));
+    
+    // 出力スロット 0: gen_pos, 1: gen_neg
+    half generator_power = 0.0h;
+    if (NUM_OUT_PORTS >= 2) {
+        generator_power = saturate(get_output_s(inout_params_s.out_coords[0]) - get_output_s(inout_params_s.out_coords[1]));
+    } else if (NUM_OUT_PORTS == 1) {
+        generator_power = saturate(get_output_s(inout_params_s.out_coords[0]));
+    }
 
     if (my_energy_s > 0.0f) {
         my_energy_s -= METABOLIC_COST;
@@ -479,9 +479,13 @@ void update_solar_energy_and_sensors(uint inner_step) {
         my_energy_s = 0.0f;
     }
 
-    // 外周膜の感覚セルへ現在のエネルギーと日照量を書き込む
-    set_output_s(inout_params_s.battery_in, half(my_energy_s));
-    set_output_s(inout_params_s.light_in, half(current_sunlight));
+    // 外周膜の感覚セルへ書き込む (スロット 0: sunlight, 1: battery)
+    if (NUM_IN_PORTS >= 1) {
+        set_output_s(inout_params_s.in_coords[0], half(current_sunlight));
+    }
+    if (NUM_IN_PORTS >= 2) {
+        set_output_s(inout_params_s.in_coords[1], half(my_energy_s));
+    }
 }
 
 // =============================================================================
@@ -503,7 +507,7 @@ void computeMain(
     StructuredBuffer<half4> signature_pre_map_np2,
     StructuredBuffer<half4> signature_post_map_np2,
     uniform ResourceParamsAll resource_params_all,
-    uniform Link27thParamsAll link27th_params_all,
+    uniform Link28thParamsAll link28th_params_all,
     uniform LearningParamsAll learning_params_all,
     uniform InoutParamsFiAll inout_params_fi_all,
     RWStructuredBuffer<half> dopamine_sum,
@@ -518,12 +522,18 @@ void computeMain(
     // --- Step 1: 共有メモリと個体パラメータの初期化 ---
     if (groupIndex == 0) {
         my_energy_s = INITIAL_ENERGY;
-        inout_params_s = InoutParams::load_face_index(
-            inout_params_fi_all.light_in_fi[agent_id],
-            inout_params_fi_all.battery_in_fi[agent_id],
-            inout_params_fi_all.gen_neg_out_fi[agent_id],
-            inout_params_fi_all.gen_pos_out_fi[agent_id]
-        );
+        my_pos_s = float2(0.0, 0.0);
+        int3 my_in_fi[NUM_IN_PORTS];
+        [unroll]
+        for (uint i = 0; i < NUM_IN_PORTS; ++i) {
+            my_in_fi[i] = inout_params_fi_all.in_ports_fi[agent_id * NUM_IN_PORTS + i];
+        }
+        int3 my_out_fi[NUM_OUT_PORTS];
+        [unroll]
+        for (uint j = 0; j < NUM_OUT_PORTS; ++j) {
+            my_out_fi[j] = inout_params_fi_all.out_ports_fi[agent_id * NUM_OUT_PORTS + j];
+        }
+        inout_params_s = InoutParams::load_face_index(my_in_fi, my_out_fi);
     }
 
     for (uint idx_np2 = groupIndex; idx_np2 < TOTAL_NP2; idx_np2 += TOTAL_N) {
@@ -556,9 +566,9 @@ void computeMain(
     resource_params.beta        = resource_params_all.beta[agent_id];
     resource_params.k_refill    = resource_params_all.k_refill[agent_id];
 
-    Link27thParams link27th_params;
-    link27th_params.bias       = link27th_params_all.bias[agent_id];
-    link27th_params.multiplier = link27th_params_all.multiplier[agent_id];
+    Link28thParams link28th_params;
+    link28th_params.bias       = link28th_params_all.bias[agent_id];
+    link28th_params.multiplier = link28th_params_all.multiplier[agent_id];
 
     LearningParams learning_params;
 #if USE_LEARNING
@@ -575,7 +585,7 @@ void computeMain(
 
     // --- Step 2: シナプス重みとニューロン初期状態のセットアップ ---
     SynapseData synapse_data;
-    init_synapse_weights(groupThreadID, groupIndex, link27th_params, synapse_data);
+    init_synapse_weights(groupThreadID, groupIndex, link28th_params, synapse_data);
 
     half R = 1.0h;
 
@@ -589,7 +599,7 @@ void computeMain(
     set_output_s(groupThreadID, 0.5h);
     GroupMemoryBarrierWithGroupSync();
 
-    uint3 coord_27th = indexToCoordN(groupIndex * link27th_params.multiplier + link27th_params.bias);
+    uint3 coord_27th = indexToCoordN(groupIndex * link28th_params.multiplier + link28th_params.bias);
 
     // --- Step 3: 1000ステップの神経・環境ダイナミクスループ ---
     for (uint inner_step = 0; inner_step < INNER_STEPS; inner_step++) {

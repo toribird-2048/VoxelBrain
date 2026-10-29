@@ -80,6 +80,10 @@ def load_elite_npz(npz_path: str):
         "tag_decay": float(data["learn_decay"]),
     }
 
+    if "in_ports_fi" in data:
+        params["in_ports_fi"] = data["in_ports_fi"]
+    if "out_ports_fi" in data:
+        params["out_ports_fi"] = data["out_ports_fi"]
     if "light_in_fi" in data:
         params["light_in_fi"] = data["light_in_fi"]
         params["battery_in_fi"] = data["battery_in_fi"]

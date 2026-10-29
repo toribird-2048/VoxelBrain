@@ -2,6 +2,7 @@
 import os
 import sys
 import time
+import math
 import glob
 import csv
 import shutil
@@ -29,6 +30,8 @@ from sim_config import (
     ENABLE_LEARNING,
     ENABLE_DOPAMINE,
     ENABLE_SLEEP,
+    NUM_IN_PORTS,
+    NUM_OUT_PORTS,
     INITIAL_ENERGY,
     METABOLIC_COST,
     GEN_COST_RATE,
@@ -41,28 +44,36 @@ HISTORY_LEN = 200
 
 
 def get_default_inout_fi(dim: int) -> dict[str, np.ndarray]:
-    """各次元における標準の入出力face_index [face, u, v] を返す"""
+    """各次元における標準の入出力face_index [face, u, v] を返す (固定長スロット方式)"""
+    in_defaults = np.zeros((NUM_IN_PORTS, 3), dtype=np.int32)
+    out_defaults = np.zeros((NUM_OUT_PORTS, 3), dtype=np.int32)
+
     if dim == 1:
-        return {
-            "light_in_fi": np.array([2, 1, 0], dtype=np.int32),
-            "battery_in_fi": np.array([2, 0, 0], dtype=np.int32),
-            "gen_neg_out_fi": np.array([5, 0, 0], dtype=np.int32),
-            "gen_pos_out_fi": np.array([5, 1, 0], dtype=np.int32),
-        }
+        if NUM_IN_PORTS >= 1: in_defaults[0] = [2, 1, 0]
+        if NUM_IN_PORTS >= 2: in_defaults[1] = [2, 0, 0]
+        if NUM_OUT_PORTS >= 1: out_defaults[0] = [5, 1, 0]
+        if NUM_OUT_PORTS >= 2: out_defaults[1] = [5, 0, 0]
     elif dim == 2:
-        return {
-            "light_in_fi": np.array([2, 3, 2], dtype=np.int32),
-            "battery_in_fi": np.array([2, 1, 2], dtype=np.int32),
-            "gen_neg_out_fi": np.array([0, 2, 1], dtype=np.int32),
-            "gen_pos_out_fi": np.array([1, 2, 1], dtype=np.int32),
-        }
+        if NUM_IN_PORTS >= 1: in_defaults[0] = [2, 3, 2]
+        if NUM_IN_PORTS >= 2: in_defaults[1] = [2, 1, 2]
+        if NUM_OUT_PORTS >= 1: out_defaults[0] = [1, 2, 1]
+        if NUM_OUT_PORTS >= 2: out_defaults[1] = [0, 2, 1]
     else:
-        return {
-            "light_in_fi": np.array([2, 5, 4], dtype=np.int32),
-            "battery_in_fi": np.array([2, 3, 4], dtype=np.int32),
-            "gen_neg_out_fi": np.array([0, 2, 1], dtype=np.int32),
-            "gen_pos_out_fi": np.array([1, 2, 1], dtype=np.int32),
-        }
+        if NUM_IN_PORTS >= 1: in_defaults[0] = [2, 5, 4]
+        if NUM_IN_PORTS >= 2: in_defaults[1] = [2, 3, 4]
+        if NUM_OUT_PORTS >= 1: out_defaults[0] = [1, 2, 1]
+        if NUM_OUT_PORTS >= 2: out_defaults[1] = [0, 2, 1]
+
+    res = {
+        "in_ports_fi": in_defaults,
+        "out_ports_fi": out_defaults,
+    }
+    # 後方互換キー
+    if NUM_IN_PORTS >= 1: res["light_in_fi"] = in_defaults[0]
+    if NUM_IN_PORTS >= 2: res["battery_in_fi"] = in_defaults[1]
+    if NUM_OUT_PORTS >= 1: res["gen_pos_out_fi"] = out_defaults[0]
+    if NUM_OUT_PORTS >= 2: res["gen_neg_out_fi"] = out_defaults[1]
+    return res
 
 
 def face_index_to_coord_in_p(fi, n: int) -> tuple[int, int, int]:
@@ -106,24 +117,35 @@ def get_special_coords_np2(dim: int, params: dict | None = None) -> dict[tuple[i
     if params is None:
         params = defaults_fi
 
-    light_fi = params.get("light_in_fi", defaults_fi["light_in_fi"])
-    batt_fi = params.get("battery_in_fi", defaults_fi["battery_in_fi"])
-    gen_neg_fi = params.get("gen_neg_out_fi", defaults_fi["gen_neg_out_fi"])
-    gen_pos_fi = params.get("gen_pos_out_fi", defaults_fi["gen_pos_out_fi"])
+    in_fi = params.get("in_ports_fi")
+    if in_fi is None:
+        in_fi = defaults_fi["in_ports_fi"].copy()
+        if "light_in_fi" in params and NUM_IN_PORTS >= 1: in_fi[0] = params["light_in_fi"]
+        if "battery_in_fi" in params and NUM_IN_PORTS >= 2: in_fi[1] = params["battery_in_fi"]
+    else:
+        in_fi = np.asarray(in_fi, dtype=np.int32).reshape(-1, 3)
 
-    coord_light = face_index_to_coord_in_p(light_fi, n)
-    coord_batt = face_index_to_coord_in_p(batt_fi, n)
-    coord_neg = face_index_to_coord_out_p(gen_neg_fi, n)
-    coord_pos = face_index_to_coord_out_p(gen_pos_fi, n)
+    out_fi = params.get("out_ports_fi")
+    if out_fi is None:
+        out_fi = defaults_fi["out_ports_fi"].copy()
+        if "gen_pos_out_fi" in params and NUM_OUT_PORTS >= 1: out_fi[0] = params["gen_pos_out_fi"]
+        if "gen_neg_out_fi" in params and NUM_OUT_PORTS >= 2: out_fi[1] = params["gen_neg_out_fi"]
+    else:
+        out_fi = np.asarray(out_fi, dtype=np.int32).reshape(-1, 3)
 
     res: dict[tuple[int, int, int], list[str]] = {}
-    for coord, label in [
-        (coord_batt, "⚡Energy入力"),
-        (coord_light, "☀️Sun入力"),
-        (coord_pos, "⚙️Gen+出力"),
-        (coord_neg, "⚙️Gen-出力"),
-    ]:
-        res.setdefault(coord, []).append(label)
+    in_names = ["☀️Sun入力", "⚡Energy入力"]
+    out_names = ["⚙️Gen+出力", "⚙️Gen-出力"]
+
+    for i in range(min(len(in_fi), NUM_IN_PORTS)):
+        coord = face_index_to_coord_in_p(in_fi[i], n)
+        lbl = in_names[i] if i < len(in_names) else f"📥In[{i}]"
+        res.setdefault(coord, []).append(lbl)
+
+    for j in range(min(len(out_fi), NUM_OUT_PORTS)):
+        coord = face_index_to_coord_out_p(out_fi[j], n)
+        lbl = out_names[j] if j < len(out_names) else f"📤Out[{j}]"
+        res.setdefault(coord, []).append(lbl)
 
     return {coord: " / ".join(labels) for coord, labels in res.items()}
 
@@ -272,11 +294,35 @@ def load_elite_npz(npz_path: str):
     }
 
     defaults_fi = get_default_inout_fi(dim)
-    for k in ("light_in_fi", "battery_in_fi", "gen_neg_out_fi", "gen_pos_out_fi"):
-        if k in data:
-            params[k] = np.asarray(data[k], dtype=np.int32).reshape(3)
-        else:
-            params[k] = defaults_fi[k].copy()
+    if "in_ports_fi" in data:
+        loaded_in = np.asarray(data["in_ports_fi"], dtype=np.int32).reshape(-1, 3)
+        in_arr = defaults_fi["in_ports_fi"].copy()
+        n = min(len(loaded_in), NUM_IN_PORTS)
+        in_arr[:n] = loaded_in[:n]
+        params["in_ports_fi"] = in_arr
+    else:
+        in_arr = defaults_fi["in_ports_fi"].copy()
+        if "light_in_fi" in data and NUM_IN_PORTS >= 1: in_arr[0] = np.asarray(data["light_in_fi"], dtype=np.int32).reshape(3)
+        if "battery_in_fi" in data and NUM_IN_PORTS >= 2: in_arr[1] = np.asarray(data["battery_in_fi"], dtype=np.int32).reshape(3)
+        params["in_ports_fi"] = in_arr
+
+    if "out_ports_fi" in data:
+        loaded_out = np.asarray(data["out_ports_fi"], dtype=np.int32).reshape(-1, 3)
+        out_arr = defaults_fi["out_ports_fi"].copy()
+        n = min(len(loaded_out), NUM_OUT_PORTS)
+        out_arr[:n] = loaded_out[:n]
+        params["out_ports_fi"] = out_arr
+    else:
+        out_arr = defaults_fi["out_ports_fi"].copy()
+        if "gen_pos_out_fi" in data and NUM_OUT_PORTS >= 1: out_arr[0] = np.asarray(data["gen_pos_out_fi"], dtype=np.int32).reshape(3)
+        if "gen_neg_out_fi" in data and NUM_OUT_PORTS >= 2: out_arr[1] = np.asarray(data["gen_neg_out_fi"], dtype=np.int32).reshape(3)
+        params["out_ports_fi"] = out_arr
+
+    # 後方互換キー
+    if NUM_IN_PORTS >= 1: params["light_in_fi"] = params["in_ports_fi"][0]
+    if NUM_IN_PORTS >= 2: params["battery_in_fi"] = params["in_ports_fi"][1]
+    if NUM_OUT_PORTS >= 1: params["gen_pos_out_fi"] = params["out_ports_fi"][0]
+    if NUM_OUT_PORTS >= 2: params["gen_neg_out_fi"] = params["out_ports_fi"][1]
 
     spec = {"dim": dim, "n": n, "p": p, "total_n": total_n, "center": n // 2}
     return sig_pre, sig_post, dopamine_map, sleep_map, inhib, params, spec
@@ -299,6 +345,8 @@ class SolarBrainCPU:
         self.knockout_np2 = np.zeros((self.P, self.P, self.P), dtype=bool)
         # シナプス単位の実験切断マスク (TOTAL_N, 28) — sig_pre / sig_post を改変せずに特定結合のみ w=0 に遮断
         self.synapse_ko_mask = np.zeros((self.TOTAL_N, 28), dtype=bool)
+        # 手動感覚入力オーバーライド (slot_idx: value)
+        self.manual_in_overrides: dict[int, float] = {}
 
         idx = np.arange(self.TOTAL_N)
         self.coords_x = (idx >> 0) & (self.N - 1)
@@ -319,10 +367,15 @@ class SolarBrainCPU:
         self.inhib = inhib.astype(np.float16)
 
         defaults_fi = get_default_inout_fi(self.dim)
-        self.light_in_p = face_index_to_coord_in_p(params.get("light_in_fi", defaults_fi["light_in_fi"]), self.N)
-        self.battery_in_p = face_index_to_coord_in_p(params.get("battery_in_fi", defaults_fi["battery_in_fi"]), self.N)
-        self.gen_neg_out_p = face_index_to_coord_out_p(params.get("gen_neg_out_fi", defaults_fi["gen_neg_out_fi"]), self.N)
-        self.gen_pos_out_p = face_index_to_coord_out_p(params.get("gen_pos_out_fi", defaults_fi["gen_pos_out_fi"]), self.N)
+        in_fi = params.get("in_ports_fi", defaults_fi["in_ports_fi"])
+        out_fi = params.get("out_ports_fi", defaults_fi["out_ports_fi"])
+        self.in_coords_p = [face_index_to_coord_in_p(fi, self.N) for fi in in_fi]
+        self.out_coords_p = [face_index_to_coord_out_p(fi, self.N) for fi in out_fi]
+        # 互換用プロパティ
+        self.light_in_p = self.in_coords_p[0] if len(self.in_coords_p) >= 1 else (0, 0, 0)
+        self.battery_in_p = self.in_coords_p[1] if len(self.in_coords_p) >= 2 else (0, 0, 0)
+        self.gen_pos_out_p = self.out_coords_p[0] if len(self.out_coords_p) >= 1 else (1, 1, 1)
+        self.gen_neg_out_p = self.out_coords_p[1] if len(self.out_coords_p) >= 2 else (1, 1, 1)
 
         if not hasattr(self, "synapse_ko_mask") or self.synapse_ko_mask.shape != (self.TOTAL_N, 28):
             self.synapse_ko_mask = np.zeros((self.TOTAL_N, 28), dtype=bool)
@@ -504,9 +557,14 @@ class SolarBrainCPU:
                 sun_f32 = np.float32(np.clip(np.sin(np.pi * np.float32(self.inner_step_counter * (1.0 / SUN_CYCLE_PERIOD))), 0.0, 1.0))
                 self.current_sunlight = float(sun_f32)
 
-                gpz, gpy, gpx = self.gen_pos_out_p
-                gnz, gny, gnx = self.gen_neg_out_p
-                gen_raw = (self.outputs_np2[gpz, gpy, gpx] - self.outputs_np2[gnz, gny, gnx]).astype(np.float16)
+                gen_raw = np.float16(0.0)
+                if len(self.out_coords_p) >= 2:
+                    gpz, gpy, gpx = self.out_coords_p[0]
+                    gnz, gny, gnx = self.out_coords_p[1]
+                    gen_raw = (self.outputs_np2[gpz, gpy, gpx] - self.outputs_np2[gnz, gny, gnx]).astype(np.float16)
+                elif len(self.out_coords_p) == 1:
+                    gpz, gpy, gpx = self.out_coords_p[0]
+                    gen_raw = self.outputs_np2[gpz, gpy, gpx].astype(np.float16)
 
                 self.generator_power = float(np.clip(gen_raw, 0.0, 1.0))
 
@@ -523,10 +581,20 @@ class SolarBrainCPU:
                     self.energy = 0.0
 
                 # --- 感覚入力の書き込み（感覚セルがKOされていれば 0.0h） ---
-                bz, by, bx = self.battery_in_p
-                lz, ly, lx = self.light_in_p
-                self.outputs_np2[bz, by, bx] = np.float16(0.0) if self.knockout_np2[bz, by, bx] else np.float16(self.energy)
-                self.outputs_np2[lz, ly, lx] = np.float16(0.0) if self.knockout_np2[lz, ly, lx] else np.float16(self.current_sunlight)
+                # スロット 0: sunlight, 1: battery
+                if len(self.in_coords_p) >= 1:
+                    lz, ly, lx = self.in_coords_p[0]
+                    self.outputs_np2[lz, ly, lx] = np.float16(0.0) if self.knockout_np2[lz, ly, lx] else np.float16(self.current_sunlight)
+                if len(self.in_coords_p) >= 2:
+                    bz, by, bx = self.in_coords_p[1]
+                    self.outputs_np2[bz, by, bx] = np.float16(0.0) if self.knockout_np2[bz, by, bx] else np.float16(self.energy)
+
+                # 手動感覚入力のオーバーライド反映
+                if hasattr(self, "manual_in_overrides") and self.manual_in_overrides:
+                    for slot_idx, man_val in self.manual_in_overrides.items():
+                        if slot_idx < len(self.in_coords_p):
+                            mz, my, mx = self.in_coords_p[slot_idx]
+                            self.outputs_np2[mz, my, mx] = np.float16(0.0) if self.knockout_np2[mz, my, mx] else np.float16(man_val)
 
                 if record_history:
                     self.step_history.append(self.inner_step_counter)
@@ -601,6 +669,23 @@ class IntegratedBrainStudio:
         self.vb_stop_file: str = os.path.abspath(".voxelbrain_stop_signal")
         self.latest_evolved_npz: str | None = None
         self.latest_csv_log: str | None = None
+
+        # I/O 配線盤 (Modular Patch Bay) 管理状態
+        self.selected_io_port: tuple[str, int] | None = ("in", 0)  # ("in"|"out", index)
+        self.io_wire_hit_boxes: list[dict] = []
+        self.io_in_names = ["☀️ 太陽光 (Sun)", "⚡ 蓄電量 (Battery)"]
+        self.io_out_names = ["⚙️ 発電+ (Gen+)", "⚙️ 発電- (Gen-)"]
+
+        # 3D ボクセル配線マップ管理状態
+        self.inout_3d_yaw: float = 38.0
+        self.inout_3d_pitch: float = 26.0
+        self.inout_3d_zoom: float = 1.0
+        self.inout_3d_pan_x: float = 0.0
+        self.inout_3d_pan_y: float = 0.0
+        self.inout_3d_drag_start: tuple[int, int] | None = None
+        self.inout_3d_drag_moved: bool = False
+        self.inout_3d_hover_target: dict | None = None
+        self.inout_3d_pick_targets: list[dict] = []
 
         # 初期データ準備
         self._init_blank_gene(dim=2)
@@ -808,22 +893,74 @@ class IntegratedBrainStudio:
         self.lbl_status = ttk.Label(toolbar, text="[未保存の新規遺伝子]", foreground="royalblue", font=("", 9, "bold"))
         self.lbl_status.pack(side=tk.LEFT, padx=8)
 
-        # --- メイン分割ペイン ---
-        self.main_paned = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
-        self.main_paned.pack(fill=tk.BOTH, expand=True, padx=4, pady=2)
+        ttk.Button(toolbar, text="⌨️ チートシート [?]", command=self.action_show_shortcuts_dialog).pack(side=tk.RIGHT, padx=4)
 
-        # 左側: Matplotlib リアルタイム可視化パネル
+        # --- ルート大タブ (Notebook): 全体を2つの大画面に分離 ---
+        self.root_notebook = ttk.Notebook(self.root)
+        self.root_notebook.pack(fill=tk.BOTH, expand=True, padx=4, pady=2)
+
+        tab_sim_map = ttk.Frame(self.root_notebook, padding=2)
+        tab_editor_settings = ttk.Frame(self.root_notebook, padding=2)
+
+        self.root_notebook.add(tab_sim_map, text="📊 波形グラフ ＆ 🧠 ボクセル脳マップ")
+        self.root_notebook.add(tab_editor_settings, text="🛠️ 選択セル～統合SimConfig")
+        self.root_notebook.bind("<<NotebookTabChanged>>", self._on_root_tab_changed)
+
+        # -------------------------------------------------------------
+        # 【大タブ1: 波形グラフ ＆ ボクセル脳マップ】
+        # -------------------------------------------------------------
+        self.main_paned = ttk.PanedWindow(tab_sim_map, orient=tk.HORIZONTAL)
+        self.main_paned.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
+
+        # 左側: Matplotlib リアルタイム可視化パネル (広々 60%)
         self.sim_frame = ttk.Frame(self.main_paned)
         self.main_paned.add(self.sim_frame, weight=3)
 
-        # 右側: 遺伝子エディタ ＆ ノッキング実験パネル
-        self.editor_frame = ttk.Frame(self.main_paned, padding=4)
-        self.main_paned.add(self.editor_frame, weight=2)
+        # 右側: 2Dボクセル脳マップパネル (広々 40%)
+        self.map_panel_frame = ttk.Frame(self.main_paned, padding=4)
+        self.main_paned.add(self.map_panel_frame, weight=2)
+        self._build_voxel_map_panel(self.map_panel_frame)
 
-        self._build_editor_panel(self.editor_frame)
+        # -------------------------------------------------------------
+        # 【大タブ2: 選択セル～統合SimConfig】
+        # -------------------------------------------------------------
+        self.editor_frame = tab_editor_settings
+        self.notebook = ttk.Notebook(tab_editor_settings)
+        self.notebook.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
 
-    def _build_editor_panel(self, parent: ttk.Frame):
-        # 上段: スライスグリッドキャンバス (ノッキング＆セル選択)
+        tab_cell = ttk.Frame(self.notebook, padding=6)
+        tab_inout = ttk.Frame(self.notebook, padding=6)
+        tab_params = ttk.Frame(self.notebook, padding=6)
+        tab_ko_scan = ttk.Frame(self.notebook, padding=6)
+        tab_launcher = ttk.Frame(self.notebook, padding=6)
+
+        self.notebook.add(tab_cell, text="🔍 選択セル・配線")
+        self.notebook.add(tab_inout, text="🌐 I/O 3D配線")
+        self.notebook.add(tab_params, text="⚙️ 神経パラメータ")
+        self.notebook.add(tab_ko_scan, text="🧪 ノッキング診断")
+        self.notebook.add(tab_launcher, text="🚀 統合ランチャー・sim_config")
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed)
+
+        self._build_tab_cell(tab_cell)
+        self._build_tab_inout(tab_inout)
+        self._build_tab_params(tab_params)
+        self._build_tab_ko_scan(tab_ko_scan)
+        self._build_tab_launcher(tab_launcher)
+
+    def _on_root_tab_changed(self, event=None):
+        self.root.focus_set()
+        if not hasattr(self, "root_notebook"):
+            return
+        sel = self.root_notebook.select()
+        tab_text = self.root_notebook.tab(sel, "text")
+        if "ボクセル脳マップ" in tab_text:
+            self._redraw_grid_canvas()
+            self._render_matplotlib_state(force_full=True)
+        elif "SimConfig" in tab_text:
+            self._on_notebook_tab_changed()
+
+    def _build_voxel_map_panel(self, parent: ttk.Frame):
+        # スライスグリッドキャンバス (ノッキング＆セル選択)
         grp_grid = ttk.LabelFrame(parent, text="🧠 ボクセル脳マップ (白枠内 = 内部ニューロン x,y=0..N-1 / 外周 = 感覚膜 P=0..N+1)", padding=6)
         grp_grid.pack(fill=tk.BOTH, expand=True, pady=2)
 
@@ -873,25 +1010,12 @@ class IntegratedBrainStudio:
         self.grid_canvas.bind("<Shift-Button-1>", self._on_grid_shift_left_click)
         self.grid_canvas.bind("<Button-3>", self._on_grid_right_click)
 
-        # 下段: タブ切り替え (1. 選択セル＆配線編集 / 2. 個体パラメータ＆一括編集 / 3. ノッキング診断 / 4. 統合ランチャー・sim_config)
-        self.notebook = ttk.Notebook(parent)
-        self.notebook.pack(fill=tk.BOTH, expand=False, pady=4)
-
-        tab_cell = ttk.Frame(self.notebook, padding=6)
-        tab_params = ttk.Frame(self.notebook, padding=6)
-        tab_ko_scan = ttk.Frame(self.notebook, padding=6)
-        tab_launcher = ttk.Frame(self.notebook, padding=6)
-
-        self.notebook.add(tab_cell, text="🔍 選択セル・配線")
-        self.notebook.add(tab_params, text="⚙️ 神経パラメータ")
-        self.notebook.add(tab_ko_scan, text="🧪 ノッキング診断")
-        self.notebook.add(tab_launcher, text="🚀 統合ランチャー・sim_config")
-        self.notebook.bind("<<NotebookTabChanged>>", lambda e: self.root.focus_set())
-
-        self._build_tab_cell(tab_cell)
-        self._build_tab_params(tab_params)
-        self._build_tab_ko_scan(tab_ko_scan)
-        self._build_tab_launcher(tab_launcher)
+        # ボクセルマップ下部に現在選択セル情報をミニバーとして表示
+        mini_status = ttk.Frame(parent)
+        mini_status.pack(fill=tk.X, pady=2)
+        self.lbl_map_sel_info = ttk.Label(mini_status, text="", font=("", 9, "bold"), foreground="#80d8ff")
+        self.lbl_map_sel_info.pack(side=tk.LEFT, padx=4)
+        ttk.Button(mini_status, text="🎯 選択セルの詳細編集へ ➔", command=lambda: self.root_notebook.select(1)).pack(side=tk.RIGHT, padx=4)
 
     def _build_tab_cell(self, parent: ttk.Frame):
         top_info = ttk.Frame(parent)
@@ -1023,6 +1147,803 @@ class IntegratedBrainStudio:
             syn_btn_row2, text="📤 このセルからの全出力を切断/復元", command=self.action_toggle_all_outgoing_synapses
         ).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=1)
 
+    # ==========================================================================
+    # 🔌 I/O 配線盤 (Modular Patch Bay) UI＆配線ロジック ＆ 🌐 3D ボクセル配線マップ
+    # ==========================================================================
+    def _on_notebook_tab_changed(self, event=None):
+        self.root.focus_set()
+        sel = self.notebook.select()
+        tab_text = self.notebook.tab(sel, "text")
+        if "配線" in tab_text:
+            self._refresh_io_port_combobox()
+            self._draw_inout_3d_map()
+            self._update_io_inspector_ui()
+
+    def _build_tab_inout(self, parent: ttk.Frame):
+        # 1. 上部ツールバー: ポート選択 Combobox ＆ 各種操作ボタン
+        tb = ttk.Frame(parent)
+        tb.pack(fill=tk.X, pady=(0, 4))
+
+        ttk.Label(tb, text="🎯 配線ポート:", font=("", 9, "bold"), foreground="#00e5ff").pack(side=tk.LEFT, padx=(2, 4))
+        self.cb_active_io_port_var = tk.StringVar()
+        self.cb_active_io_port = ttk.Combobox(
+            tb,
+            textvariable=self.cb_active_io_port_var,
+            state="readonly",
+            width=26,
+        )
+        self.cb_active_io_port.pack(side=tk.LEFT, padx=(0, 8))
+        self.cb_active_io_port.bind("<<ComboboxSelected>>", self._on_active_io_port_combo_changed)
+
+        ttk.Button(tb, text="➕ In追加", command=self.action_add_in_port).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tb, text="➕ Out追加", command=self.action_add_out_port).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tb, text="🎲 ランダム配線", command=self.action_randomize_inout_wiring).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tb, text="🔄 標準配線", command=self.action_reset_inout_wiring).pack(side=tk.LEFT, padx=2)
+
+        ttk.Button(tb, text="💾 sim_config反映", command=self.action_sync_inout_to_sim_config).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(tb, text="🔄 視点リセット", width=12, command=self.action_reset_inout_3d_view).pack(side=tk.RIGHT, padx=4)
+
+        # 2. メインビュー: 🌐 3D ボクセル配線マップ (画面全体に展開)
+        self.inout_canvas = None  # 2D配線板は廃止し3Dマップに一本化
+
+        map_frame = ttk.Frame(parent)
+        map_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.inout_3d_canvas = tk.Canvas(
+            map_frame,
+            bg="#0c0e14",
+            highlightthickness=1,
+            highlightbackground="#282a36",
+            cursor="crosshair",
+        )
+        self.inout_3d_canvas.pack(fill=tk.BOTH, expand=True)
+        self.inout_3d_canvas.bind("<Button-1>", self._on_inout_3d_click)
+        self.inout_3d_canvas.bind("<B1-Motion>", self._on_inout_3d_drag)
+        self.inout_3d_canvas.bind("<ButtonRelease-1>", self._on_inout_3d_release)
+        self.inout_3d_canvas.bind("<Button-3>", self._on_inout_3d_pan_start)
+        self.inout_3d_canvas.bind("<B3-Motion>", self._on_inout_3d_pan_drag)
+        self.inout_3d_canvas.bind("<MouseWheel>", self._on_inout_3d_wheel)
+        self.inout_3d_canvas.bind("<Motion>", self._on_inout_3d_motion)
+        self.inout_3d_canvas.bind("<Configure>", lambda e: self._draw_inout_3d_map())
+
+        # 3. 下部: 選択ポート配線インスペクター
+        insp = ttk.LabelFrame(parent, text="🛠️ 選択ポートの配線＆信号調整 (3Dマップ上のセルをクリックでも即座に指定可能)", padding=4)
+        insp.pack(fill=tk.X, pady=(4, 0))
+
+        r1 = ttk.Frame(insp)
+        r1.pack(fill=tk.X, pady=2)
+
+        self.lbl_io_selected = ttk.Label(r1, text="選択中: なし", font=("", 9, "bold"), foreground="#00e5ff")
+        self.lbl_io_selected.pack(side=tk.LEFT, padx=(2, 12))
+
+        ttk.Label(r1, text="接続面(Face):", font=("", 8)).pack(side=tk.LEFT, padx=2)
+        self.cb_io_face_var = tk.StringVar()
+        self.cb_io_face = ttk.Combobox(
+            r1,
+            textvariable=self.cb_io_face_var,
+            state="readonly",
+            width=16,
+            values=[
+                "0: -X面 (西/左)",
+                "1: +X面 (東/右)",
+                "2: -Y面 (南/手前)",
+                "3: +Y面 (北/奥)",
+                "4: -Z面 (底/下)",
+                "5: +Z面 (天/上)",
+            ],
+        )
+        self.cb_io_face.pack(side=tk.LEFT, padx=2)
+        self.cb_io_face.bind("<<ComboboxSelected>>", self._on_io_face_changed)
+
+        ttk.Label(r1, text="U:", font=("", 8)).pack(side=tk.LEFT, padx=(8, 2))
+        self.scale_io_u_var = tk.IntVar(value=0)
+        self.scale_io_u = ttk.Scale(r1, from_=-1, to=self.N, orient=tk.HORIZONTAL, variable=self.scale_io_u_var, command=self._on_io_u_changed, length=90)
+        self.scale_io_u.pack(side=tk.LEFT, padx=2)
+        self.lbl_io_u = ttk.Label(r1, text="0", width=3, font=("", 8))
+        self.lbl_io_u.pack(side=tk.LEFT)
+
+        ttk.Label(r1, text="V:", font=("", 8)).pack(side=tk.LEFT, padx=(8, 2))
+        self.scale_io_v_var = tk.IntVar(value=0)
+        self.scale_io_v = ttk.Scale(r1, from_=-1, to=self.N, orient=tk.HORIZONTAL, variable=self.scale_io_v_var, command=self._on_io_v_changed, length=90)
+        self.scale_io_v.pack(side=tk.LEFT, padx=2)
+        self.lbl_io_v = ttk.Label(r1, text="0", width=3, font=("", 8))
+        self.lbl_io_v.pack(side=tk.LEFT)
+
+        self.lbl_io_p_coord = ttk.Label(r1, text="➔ P[?, ?, ?]", font=("", 9, "bold"), foreground="gold")
+        self.lbl_io_p_coord.pack(side=tk.LEFT, padx=(10, 10))
+
+        ttk.Button(r1, text="🎯 このセルへジャンプ", command=self.action_jump_to_io_cell).pack(side=tk.LEFT, padx=4)
+
+        # 2行目: 信号手動注入 ＆ ポート削除
+        r2 = ttk.Frame(insp)
+        r2.pack(fill=tk.X, pady=2)
+
+        self.io_manual_var = tk.BooleanVar(value=False)
+        self.chk_io_manual = ttk.Checkbutton(r2, text="手動テスト注入 (Override):", variable=self.io_manual_var, command=self._on_io_manual_toggle)
+        self.chk_io_manual.pack(side=tk.LEFT, padx=(2, 4))
+
+        self.scale_io_manual_var = tk.DoubleVar(value=0.5)
+        self.scale_io_manual = ttk.Scale(
+            r2,
+            from_=0.0,
+            to=1.0,
+            orient=tk.HORIZONTAL,
+            variable=self.scale_io_manual_var,
+            command=self._on_io_manual_slider,
+            length=140,
+        )
+        self.scale_io_manual.pack(side=tk.LEFT, padx=4)
+
+        self.lbl_io_manual_val = ttk.Label(r2, text="0.50", width=5, font=("", 8))
+        self.lbl_io_manual_val.pack(side=tk.LEFT)
+
+        self.lbl_io_live_val = ttk.Label(r2, text="現在シグナル: 0.000", font=("", 9), foreground="#69f0ae")
+        self.lbl_io_live_val.pack(side=tk.LEFT, padx=(16, 10))
+
+        self.btn_io_delete = ttk.Button(r2, text="🗑️ このポートを削除", command=self.action_remove_selected_port)
+        self.btn_io_delete.pack(side=tk.RIGHT, padx=2)
+
+    def _get_io_port_name(self, port_type: str, slot: int) -> str:
+        if port_type == "in":
+            if slot == 0: return "☀️ 太陽光 (Sun)"
+            elif slot == 1: return "⚡ 蓄電量 (Battery)"
+            else: return f"📥 センサー In[{slot}]"
+        else:
+            if slot == 0: return "⚙️ 発電+ (Gen+)"
+            elif slot == 1: return "⚙️ 発電- (Gen-)"
+            else: return f"📤 モーター Out[{slot}]"
+
+    def _get_io_port_color(self, port_type: str, slot: int) -> str:
+        if port_type == "in":
+            colors = ["#ffb300", "#00e5ff", "#e040fb", "#76ff03", "#ffd600", "#18ffff"]
+            return colors[slot % len(colors)]
+        else:
+            colors = ["#00e676", "#ff1744", "#ff9100", "#d500f9", "#00b0ff", "#ff5252"]
+            return colors[slot % len(colors)]
+
+    def _refresh_io_port_combobox(self):
+        """上部のポート選択 Combobox を現在のポート一覧に更新"""
+        if not hasattr(self, "cb_active_io_port"):
+            return
+        in_ports = self.sim_params.get("in_ports_fi", np.zeros((0, 3), dtype=np.int32))
+        out_ports = self.sim_params.get("out_ports_fi", np.zeros((0, 3), dtype=np.int32))
+
+        items = []
+        selected_text = ""
+        for i in range(len(in_ports)):
+            txt = f"📥 In #{i}: {self._get_io_port_name('in', i)}"
+            items.append(txt)
+            if self.selected_io_port == ("in", i):
+                selected_text = txt
+
+        for i in range(len(out_ports)):
+            txt = f"📤 Out #{i}: {self._get_io_port_name('out', i)}"
+            items.append(txt)
+            if self.selected_io_port == ("out", i):
+                selected_text = txt
+
+        self.cb_active_io_port["values"] = items
+        if selected_text:
+            self.cb_active_io_port.set(selected_text)
+        elif items:
+            self.cb_active_io_port.current(0)
+            self._on_active_io_port_combo_changed(None)
+
+    def _on_active_io_port_combo_changed(self, event=None):
+        """Combobox からポートが選択されたときのハンドラ"""
+        if not hasattr(self, "cb_active_io_port"):
+            return
+        sel_txt = self.cb_active_io_port.get()
+        if not sel_txt:
+            return
+        if "📥 In #" in sel_txt:
+            idx = int(sel_txt.split("📥 In #")[1].split(":")[0])
+            self.selected_io_port = ("in", idx)
+        elif "📤 Out #" in sel_txt:
+            idx = int(sel_txt.split("📤 Out #")[1].split(":")[0])
+            self.selected_io_port = ("out", idx)
+
+        self._update_io_inspector_ui()
+        self._draw_inout_3d_map()
+
+    def _draw_inout_wiring(self):
+        """互換用（2D配線板は3Dマップに一本化）"""
+        pass
+
+    def _on_inout_canvas_click(self, event):
+        """互換用"""
+        pass
+
+    # ==========================================================================
+    # 🌐 3D ボクセル配線マップ (回転・ズーム・セル指定ピッキング)
+    # ==========================================================================
+    def action_reset_inout_3d_view(self):
+        """3D配線マップの視点をリセット"""
+        self.inout_3d_yaw = 38.0
+        self.inout_3d_pitch = 26.0
+        self.inout_3d_zoom = 1.0
+        self.inout_3d_pan_x = 0.0
+        self.inout_3d_pan_y = 0.0
+        self._draw_inout_3d_map()
+
+    def _project_3d_point(self, rx, ry, rz, cx, cy, scale, dist, cos_y, sin_y, cos_p, sin_p, n_norm):
+        # 世界座標: rx = X (東/右), ry = Y (北/奥), rz = Z (天/上)
+        # 1. Yaw: 垂直軸 Z まわりの水平回転
+        x1 = rx * cos_y - ry * sin_y
+        y1 = rx * sin_y + ry * cos_y
+        z1 = rz
+
+        # 2. Pitch: カメラ横軸まわりの見下ろし回転 (Zが画面上、Yが画面奥)
+        xc = x1
+        yc = z1 * cos_p - y1 * sin_p
+        zc = z1 * sin_p + y1 * cos_p
+
+        # 3. 透視投影 (zc が大きいほど奥、小さいほど手前)
+        factor = dist / max(0.1, dist + zc * (2.2 / n_norm))
+        sx = cx + (xc * factor * scale) / n_norm + self.inout_3d_pan_x
+        sy = cy - (yc * factor * scale) / n_norm + self.inout_3d_pan_y
+        return sx, sy, zc, factor
+
+    def _draw_inout_3d_map(self):
+        """回転可能な3Dボクセル配線マップの描画"""
+        cv = getattr(self, "inout_3d_canvas", None)
+        if not cv: return
+
+        w = cv.winfo_width()
+        h = cv.winfo_height()
+        if w < 100: w = max(400, cv.winfo_reqwidth())
+        if h < 50: h = max(240, cv.winfo_reqheight())
+
+        cv.delete("all")
+        self.inout_3d_pick_targets.clear()
+
+        cx = w / 2.0
+        cy = h / 2.0
+
+        rad_y = math.radians(self.inout_3d_yaw)
+        rad_p = math.radians(self.inout_3d_pitch)
+        cos_y, sin_y = math.cos(rad_y), math.sin(rad_y)
+        cos_p, sin_p = math.cos(rad_p), math.sin(rad_p)
+
+        n_norm = max(float(self.N), 2.0)
+        dist = 5.2
+        scale = min(w, h) * 0.44 * self.inout_3d_zoom
+        cen = (self.N - 1.0) / 2.0
+
+        port_type = self.selected_io_port[0] if self.selected_io_port else "in"
+        slot_idx = self.selected_io_port[1] if self.selected_io_port else 0
+        port_name = self._get_io_port_name(port_type, slot_idx)
+        port_col = self._get_io_port_color(port_type, slot_idx)
+
+        # 背景・案内表示 (大画面に合わせて視認性を向上)
+        cv.create_rectangle(0, 0, w, h, fill="#0c0e14", outline="")
+        cv.create_text(16, 12, text=f"🌐 3D ボクセル配線マップ  ｜  📍 接続指定中: #{slot_idx} {port_name}", anchor=tk.NW, fill=port_col, font=("", 11, "bold"))
+        cv.create_text(16, 34, text="点線青: 外周膜(入力面)  /  点線紫: 内部表面(出力面)", anchor=tk.NW, fill="#90a4ae", font=("", 9))
+        cv.create_text(16, h - 16, text="🖱️ [左ドラッグ: 3D回転]  [右ドラッグ: 平行移動]  [ホイール: ズーム]  [クリック: このセルにカチッと配線！]", anchor=tk.SW, fill="#cfd8dc", font=("", 9, "bold"))
+
+        # 1. 座標軸 (原点から X:赤, Y:緑, Z:青)
+        ax_len = cen + 1.8
+        orig_s = self._project_3d_point(-cen, -cen, -cen, cx, cy, scale, dist, cos_y, sin_y, cos_p, sin_p, n_norm)
+        for (dx, dy, dz, col, lbl) in [
+            (ax_len, 0, 0, "#e57373", "+X (東)"),
+            (0, ax_len, 0, "#81c784", "+Y (北)"),
+            (0, 0, ax_len, "#64b5f6", "+Z (天)"),
+        ]:
+            ax_s = self._project_3d_point(-cen + dx, -cen + dy, -cen + dz, cx, cy, scale, dist, cos_y, sin_y, cos_p, sin_p, n_norm)
+            cv.create_line(orig_s[0], orig_s[1], ax_s[0], ax_s[1], fill=col, width=2.0, arrow=tk.LAST)
+            cv.create_text(ax_s[0] + 6, ax_s[1] - 6, text=lbl, fill=col, font=("", 9, "bold"))
+
+        # 2. ワイヤーフレームキューブの描画 (内部ニューロンコア & 外周膜)
+        core_corners = []
+        for cz in (0, self.N - 1):
+            for cy_ in (0, self.N - 1):
+                for cx_ in (0, self.N - 1):
+                    core_corners.append((cx_, cy_, cz))
+
+        def draw_cube_wire(min_val, max_val, col, dash=()):
+            corners = [
+                (min_val, min_val, min_val), (max_val, min_val, min_val),
+                (max_val, max_val, min_val), (min_val, max_val, min_val),
+                (min_val, min_val, max_val), (max_val, min_val, max_val),
+                (max_val, max_val, max_val), (min_val, max_val, max_val),
+            ]
+            s_corners = [self._project_3d_point(c[0] - cen, c[1] - cen, c[2] - cen, cx, cy, scale, dist, cos_y, sin_y, cos_p, sin_p, n_norm) for c in corners]
+            edges = [
+                (0,1), (1,2), (2,3), (3,0),
+                (4,5), (5,6), (6,7), (7,4),
+                (0,4), (1,5), (2,6), (3,7),
+            ]
+            for e in edges:
+                cv.create_line(s_corners[e[0]][0], s_corners[e[0]][1], s_corners[e[1]][0], s_corners[e[1]][1], fill=col, width=1.5, dash=dash)
+
+        # 外周膜枠 (-1 .. N)
+        draw_cube_wire(-1.0, float(self.N), "#00bcd4", dash=(4, 4))
+        # 内部表面枠 (0 .. N-1)
+        draw_cube_wire(0.0, float(self.N - 1), "#9575cd", dash=(3, 3))
+
+        # 3. 表面セルの端子パッド一覧（ピッキング対象）の収集 ＆ Zソート
+        cells_to_render = []
+        in_ports = self.sim_params.get("in_ports_fi", np.zeros((0, 3), dtype=np.int32))
+        out_ports = self.sim_params.get("out_ports_fi", np.zeros((0, 3), dtype=np.int32))
+
+        # 接続中ポートの逆引き辞書 (coord_in -> list of in_ports), (coord_out -> list of out_ports)
+        in_conn_map = {}
+        for ip_idx, fi in enumerate(in_ports):
+            c_p = face_index_to_coord_in_p(fi, self.N)
+            in_conn_map.setdefault(c_p, []).append(ip_idx)
+
+        out_conn_map = {}
+        for op_idx, fi in enumerate(out_ports):
+            c_p = face_index_to_coord_out_p(fi, self.N)
+            out_conn_map.setdefault(c_p, []).append(op_idx)
+
+        # 表面セルグリッドを生成 (選択中ポートの種別に応じて重点配置)
+        if port_type == "in":
+            # 入力用: 外周膜の6面 (face 0..5, u,v in -1..N)
+            for f in range(6):
+                # 表示の過密を防ぐためステップ間隔を調整 (N>=4なら適度に間引きまたは全描画)
+                step = 1 if self.N <= 4 else 2
+                for u in range(-1, self.N + 1, step):
+                    for v in range(-1, self.N + 1, step):
+                        coord_p = face_index_to_coord_in_p((f, u, v), self.N)
+                        pz, py, px = coord_p
+                        # P空間 [0..N+1] からのワールド座標: px-1, py-1, pz-1
+                        wx, wy, wz = float(px - 1), float(py - 1), float(pz - 1)
+                        sx, sy, z2, factor = self._project_3d_point(wx - cen, wy - cen, wz - cen, cx, cy, scale, dist, cos_y, sin_y, cos_p, sin_p, n_norm)
+                        cells_to_render.append({
+                            "type": "in", "face": f, "u": u, "v": v, "p_coord": coord_p,
+                            "sx": sx, "sy": sy, "z2": z2, "factor": factor,
+                            "is_connected": (coord_p in in_conn_map),
+                            "conn_slots": in_conn_map.get(coord_p, []),
+                        })
+        else:
+            # 出力用: 内部表面の6面 (face 0..5, u,v in 0..N-1)
+            for f in range(6):
+                step = 1
+                for u in range(0, self.N, step):
+                    for v in range(0, self.N, step):
+                        coord_p = face_index_to_coord_out_p((f, u, v), self.N)
+                        pz, py, px = coord_p
+                        wx, wy, wz = float(px - 1), float(py - 1), float(pz - 1)
+                        sx, sy, z2, factor = self._project_3d_point(wx - cen, wy - cen, wz - cen, cx, cy, scale, dist, cos_y, sin_y, cos_p, sin_p, n_norm)
+                        cells_to_render.append({
+                            "type": "out", "face": f, "u": u, "v": v, "p_coord": coord_p,
+                            "sx": sx, "sy": sy, "z2": z2, "factor": factor,
+                            "is_connected": (coord_p in out_conn_map),
+                            "conn_slots": out_conn_map.get(coord_p, []),
+                        })
+
+        # Zソート: 奥 (zcが大きい) から手前 (zcが小さい) へ描画
+        cells_to_render.sort(key=lambda item: item["z2"], reverse=True)
+
+        # 描画ループ
+        hover_target = self.inout_3d_hover_target
+        for item in cells_to_render:
+            sx, sy = item["sx"], item["sy"]
+            factor = item["factor"]
+            is_conn = item["is_connected"]
+            conn_slots = item["conn_slots"]
+            is_hover = (hover_target and hover_target.get("p_coord") == item["p_coord"])
+
+            # 接続中ポートの中に選択中ポートが含まれるか
+            is_active_target = False
+            if is_conn:
+                for s in conn_slots:
+                    if (item["type"], s) == self.selected_io_port:
+                        is_active_target = True
+                        break
+
+            # ピッキング判定ヒット半径 (大画面でのクリック操作性を確保)
+            r_hit = max(10.0, 14.0 * factor)
+            self.inout_3d_pick_targets.append({
+                "face": item["face"], "u": item["u"], "v": item["v"],
+                "p_coord": item["p_coord"], "sx": sx, "sy": sy, "r": r_hit, "z2": item["z2"],
+                "type": item["type"],
+            })
+
+            # 端子ノードの描画 (大画面に合わせた見やすい点・文字サイズ)
+            if is_conn:
+                first_slot = conn_slots[0]
+                col = self._get_io_port_color(item["type"], first_slot)
+
+                if is_active_target:
+                    # 選択中ターゲット: 発光リング ＆ 大きめのノード球
+                    p_r = max(5.5, 8.5 * factor)
+                    cv.create_oval(sx - p_r - 3.5, sy - p_r - 3.5, sx + p_r + 3.5, sy + p_r + 3.5, outline="#ffee58", width=2.0)
+                    cv.create_oval(sx - p_r, sy - p_r, sx + p_r, sy + p_r, fill=col, outline="#ffffff", width=2.0)
+
+                    tag_name = self._get_io_port_name(item["type"], first_slot).split(" ")[0]
+                    cv.create_text(sx + p_r + 6, sy - 4, text=f"★{tag_name}", anchor=tk.W, fill="#ffee58", font=("", 9, "bold"))
+                else:
+                    # 他の接続済みポート: しっかり視認できるピン球
+                    p_r = max(4.0, 6.0 * factor)
+                    cv.create_oval(sx - p_r, sy - p_r, sx + p_r, sy + p_r, fill=col, outline="#1a1c24", width=1.5)
+
+                    tag_name = self._get_io_port_name(item["type"], first_slot).split(" ")[0]
+                    cv.create_text(sx + p_r + 5, sy - 3, text=tag_name, anchor=tk.W, fill=col, font=("", 8, "bold"))
+            else:
+                # 通常の未接続表面セル (くっきりしたドット)
+                dot_r = max(2.0, 3.2 * factor)
+                if is_hover:
+                    cv.create_oval(sx - dot_r - 3.0, sy - dot_r - 3.0, sx + dot_r + 3.0, sy + dot_r + 3.0, fill="#00e5ff", outline="#ffffff", width=1.5)
+                else:
+                    d_col = "#263238" if item["type"] == "in" else "#311b92"
+                    cv.create_oval(sx - dot_r, sy - dot_r, sx + dot_r, sy + dot_r, fill=d_col, outline="#37474f", width=1.0)
+
+        # 4. ホバー中のセル情報ツールチップ
+        if hover_target:
+            hsx, hsy = hover_target["sx"], hover_target["sy"]
+            htxt = f"Face {hover_target['face']} (u={hover_target['u']}, v={hover_target['v']}) ➔ P{hover_target['p_coord']}"
+            cv.create_text(hsx, hsy - 20, text=htxt, fill="#00e5ff", font=("", 10, "bold"), bbox=dict(boxstyle="round", facecolor="#10121a", alpha=0.9, edgecolor="#00e5ff"))
+
+    # --- 3Dマップのマウスインタラクション ---
+    def _on_inout_3d_click(self, event):
+        self.inout_3d_drag_start = (event.x, event.y)
+        self.inout_3d_drag_moved = False
+
+    def _on_inout_3d_drag(self, event):
+        if not self.inout_3d_drag_start: return
+        sx, sy = self.inout_3d_drag_start
+        dx = event.x - sx
+        dy = event.y - sy
+        if abs(dx) > 2 or abs(dy) > 2:
+            self.inout_3d_drag_moved = True
+
+        self.inout_3d_yaw = (self.inout_3d_yaw + dx * 0.65) % 360.0
+        self.inout_3d_pitch = float(np.clip(self.inout_3d_pitch - dy * 0.65, -88.0, 88.0))
+        self.inout_3d_drag_start = (event.x, event.y)
+        self._draw_inout_3d_map()
+
+    def _on_inout_3d_pan_start(self, event):
+        self.inout_3d_drag_start = (event.x, event.y)
+
+    def _on_inout_3d_pan_drag(self, event):
+        if not self.inout_3d_drag_start: return
+        sx, sy = self.inout_3d_drag_start
+        self.inout_3d_pan_x += (event.x - sx)
+        self.inout_3d_pan_y += (event.y - sy)
+        self.inout_3d_drag_start = (event.x, event.y)
+        self._draw_inout_3d_map()
+
+    def _on_inout_3d_wheel(self, event):
+        if event.delta > 0:
+            self.inout_3d_zoom = min(3.5, self.inout_3d_zoom * 1.15)
+        else:
+            self.inout_3d_zoom = max(0.4, self.inout_3d_zoom / 1.15)
+        self._draw_inout_3d_map()
+
+    def _on_inout_3d_motion(self, event):
+        ex, ey = event.x, event.y
+        # 手前のターゲット (zcが小さい) を優先して探す
+        best_target = None
+        min_dist = 18.0
+        sorted_targets = sorted(self.inout_3d_pick_targets, key=lambda it: it["z2"])
+        for t in sorted_targets:
+            dist = math.hypot(ex - t["sx"], ey - t["sy"])
+            if dist < t["r"] and dist < min_dist:
+                min_dist = dist
+                best_target = t
+                break
+
+        if best_target != self.inout_3d_hover_target:
+            self.inout_3d_hover_target = best_target
+            self._draw_inout_3d_map()
+
+    def _on_inout_3d_release(self, event):
+        if not self.inout_3d_drag_moved:
+            # クリック判定 ➔ セルピッキング実行！
+            ex, ey = event.x, event.y
+            best_target = None
+            min_dist = 22.0
+            # 手前のセル (zcが小さい＝カメラに近い) を優先
+            sorted_targets = sorted(self.inout_3d_pick_targets, key=lambda it: it["z2"])
+            for t in sorted_targets:
+                dist = math.hypot(ex - t["sx"], ey - t["sy"])
+                if dist < t["r"] and dist < min_dist:
+                    best_target = t
+                    break
+
+            if best_target and self.selected_io_port:
+                port_type, slot = self.selected_io_port
+                target_face = best_target["face"]
+                target_u = best_target["u"]
+                target_v = best_target["v"]
+
+                # 選択ポートの配線をこのセルに直接指定！
+                if port_type == "in":
+                    self.sim_params["in_ports_fi"][slot] = [target_face, target_u, target_v]
+                    if NUM_IN_PORTS >= 1 and slot == 0: self.sim_params["light_in_fi"] = self.sim_params["in_ports_fi"][0]
+                    if NUM_IN_PORTS >= 2 and slot == 1: self.sim_params["battery_in_fi"] = self.sim_params["in_ports_fi"][1]
+                else:
+                    self.sim_params["out_ports_fi"][slot] = [target_face, target_u, target_v]
+                    if NUM_OUT_PORTS >= 1 and slot == 0: self.sim_params["gen_pos_out_fi"] = self.sim_params["out_ports_fi"][0]
+                    if NUM_OUT_PORTS >= 2 and slot == 1: self.sim_params["gen_neg_out_fi"] = self.sim_params["out_ports_fi"][1]
+
+                self._sync_genes_to_brain()
+                self._draw_inout_wiring()
+                self._draw_inout_3d_map()
+                self._update_io_inspector_ui()
+                self._render_matplotlib_state()
+                self._append_vb_log(f"[🌐 3D配線] #{slot} {self._get_io_port_name(port_type, slot)} を Face {target_face} (u={target_u}, v={target_v}) ➔ P{best_target['p_coord']} に接続しました！\n")
+
+        self.inout_3d_drag_start = None
+        self.inout_3d_drag_moved = False
+
+    def _update_io_inspector_ui(self):
+        """選択中ポートの詳細を下部インスペクターに反映"""
+        if not hasattr(self, "lbl_io_selected") or not self.selected_io_port:
+            return
+
+        port_type, slot = self.selected_io_port
+        in_ports = self.sim_params.get("in_ports_fi", np.zeros((0, 3), dtype=np.int32))
+        out_ports = self.sim_params.get("out_ports_fi", np.zeros((0, 3), dtype=np.int32))
+
+        if port_type == "in":
+            if slot >= len(in_ports):
+                self.selected_io_port = ("in", 0) if len(in_ports) > 0 else None
+                return
+            fi = in_ports[slot]
+            coord = face_index_to_coord_in_p(fi, self.N)
+            name = self._get_io_port_name("in", slot)
+            self.scale_io_u.config(from_=-1, to=self.N)
+            self.scale_io_v.config(from_=-1, to=self.N)
+            self.chk_io_manual.config(state="normal")
+            self.scale_io_manual.config(state="normal")
+            is_manual = hasattr(self.brain, "manual_in_overrides") and slot in self.brain.manual_in_overrides
+            self.io_manual_var.set(is_manual)
+            man_val = self.brain.manual_in_overrides.get(slot, 0.5) if is_manual else 0.5
+            self.scale_io_manual_var.set(man_val)
+            self.lbl_io_manual_val.config(text=f"{man_val:.2f}")
+
+            cz, cy, cx = self.brain.in_coords_p[slot] if slot < len(self.brain.in_coords_p) else (0, 0, 0)
+            live_v = float(self.brain.outputs_np2[cz, cy, cx])
+        else:
+            if slot >= len(out_ports):
+                self.selected_io_port = ("out", 0) if len(out_ports) > 0 else None
+                return
+            fi = out_ports[slot]
+            coord = face_index_to_coord_out_p(fi, self.N)
+            name = self._get_io_port_name("out", slot)
+            self.scale_io_u.config(from_=0, to=self.N - 1)
+            self.scale_io_v.config(from_=0, to=self.N - 1)
+            self.chk_io_manual.config(state="disabled")
+            self.scale_io_manual.config(state="disabled")
+            self.io_manual_var.set(False)
+
+            if slot < len(self.brain.out_coords_p):
+                cz, cy, cx = self.brain.out_coords_p[slot]
+                live_v = float(self.brain.outputs_np2[cz, cy, cx])
+            else:
+                live_v = 0.0
+
+        self.lbl_io_selected.config(text=f"選択中: #{slot} {name} ({'入力' if port_type == 'in' else '出力'})")
+        face_idx = int(np.clip(int(fi[0]), 0, 5))
+        self.cb_io_face.current(face_idx)
+
+        self.scale_io_u_var.set(int(fi[1]))
+        self.lbl_io_u.config(text=str(int(fi[1])))
+        self.scale_io_v_var.set(int(fi[2]))
+        self.lbl_io_v.config(text=str(int(fi[2])))
+
+        self.lbl_io_p_coord.config(text=f"➔ P{coord}")
+        self.lbl_io_live_val.config(text=f"現在シグナル: {live_v:+.4f}")
+        self._refresh_io_port_combobox()
+
+    def _on_io_face_changed(self, event=None):
+        if not self.selected_io_port: return
+        port_type, slot = self.selected_io_port
+        face = self.cb_io_face.current()
+        if face < 0: return
+
+        if port_type == "in":
+            self.sim_params["in_ports_fi"][slot, 0] = face
+            if NUM_IN_PORTS >= 1 and slot == 0: self.sim_params["light_in_fi"] = self.sim_params["in_ports_fi"][0]
+            if NUM_IN_PORTS >= 2 and slot == 1: self.sim_params["battery_in_fi"] = self.sim_params["in_ports_fi"][1]
+        else:
+            self.sim_params["out_ports_fi"][slot, 0] = face
+            if NUM_OUT_PORTS >= 1 and slot == 0: self.sim_params["gen_pos_out_fi"] = self.sim_params["out_ports_fi"][0]
+            if NUM_OUT_PORTS >= 2 and slot == 1: self.sim_params["gen_neg_out_fi"] = self.sim_params["out_ports_fi"][1]
+
+        self._sync_genes_to_brain()
+        self._draw_inout_wiring()
+        self._draw_inout_3d_map()
+        self._update_io_inspector_ui()
+        self._render_matplotlib_state()
+
+    def _on_io_u_changed(self, val):
+        if not self.selected_io_port: return
+        port_type, slot = self.selected_io_port
+        u = int(round(float(val)))
+        self.lbl_io_u.config(text=str(u))
+
+        if port_type == "in":
+            self.sim_params["in_ports_fi"][slot, 1] = u
+            if NUM_IN_PORTS >= 1 and slot == 0: self.sim_params["light_in_fi"] = self.sim_params["in_ports_fi"][0]
+            if NUM_IN_PORTS >= 2 and slot == 1: self.sim_params["battery_in_fi"] = self.sim_params["in_ports_fi"][1]
+        else:
+            self.sim_params["out_ports_fi"][slot, 1] = u
+            if NUM_OUT_PORTS >= 1 and slot == 0: self.sim_params["gen_pos_out_fi"] = self.sim_params["out_ports_fi"][0]
+            if NUM_OUT_PORTS >= 2 and slot == 1: self.sim_params["gen_neg_out_fi"] = self.sim_params["out_ports_fi"][1]
+
+        self._sync_genes_to_brain()
+        self._draw_inout_wiring()
+        self._draw_inout_3d_map()
+        self._update_io_inspector_ui()
+        self._render_matplotlib_state()
+
+    def _on_io_v_changed(self, val):
+        if not self.selected_io_port: return
+        port_type, slot = self.selected_io_port
+        v = int(round(float(val)))
+        self.lbl_io_v.config(text=str(v))
+
+        if port_type == "in":
+            self.sim_params["in_ports_fi"][slot, 2] = v
+            if NUM_IN_PORTS >= 1 and slot == 0: self.sim_params["light_in_fi"] = self.sim_params["in_ports_fi"][0]
+            if NUM_IN_PORTS >= 2 and slot == 1: self.sim_params["battery_in_fi"] = self.sim_params["in_ports_fi"][1]
+        else:
+            self.sim_params["out_ports_fi"][slot, 2] = v
+            if NUM_OUT_PORTS >= 1 and slot == 0: self.sim_params["gen_pos_out_fi"] = self.sim_params["out_ports_fi"][0]
+            if NUM_OUT_PORTS >= 2 and slot == 1: self.sim_params["gen_neg_out_fi"] = self.sim_params["out_ports_fi"][1]
+
+        self._sync_genes_to_brain()
+        self._draw_inout_wiring()
+        self._draw_inout_3d_map()
+        self._update_io_inspector_ui()
+        self._render_matplotlib_state()
+
+    def _on_io_manual_toggle(self):
+        if not self.selected_io_port or self.selected_io_port[0] != "in": return
+        slot = self.selected_io_port[1]
+        is_on = self.io_manual_var.get()
+        if is_on:
+            self.brain.manual_in_overrides[slot] = float(self.scale_io_manual_var.get())
+        else:
+            self.brain.manual_in_overrides.pop(slot, None)
+        self._draw_inout_wiring()
+        self._update_io_inspector_ui()
+
+    def _on_io_manual_slider(self, val):
+        if not self.selected_io_port or self.selected_io_port[0] != "in": return
+        slot = self.selected_io_port[1]
+        v = float(val)
+        self.lbl_io_manual_val.config(text=f"{v:.2f}")
+        if self.io_manual_var.get():
+            self.brain.manual_in_overrides[slot] = v
+            self._draw_inout_wiring()
+
+    def action_jump_to_io_cell(self):
+        """配線先セルに2D/3D画面の選択カーソルを移動"""
+        if not self.selected_io_port: return
+        port_type, slot = self.selected_io_port
+        if port_type == "in":
+            fi = self.sim_params["in_ports_fi"][slot]
+            coord = face_index_to_coord_in_p(fi, self.N)
+        else:
+            fi = self.sim_params["out_ports_fi"][slot]
+            coord = face_index_to_coord_out_p(fi, self.N)
+
+        self.sel_z, self.sel_y, self.sel_x = coord
+        self._update_cell_editor_ui()
+        self._render_matplotlib_state(force_full=True)
+        self._draw_2d_slice()
+
+    def action_add_in_port(self):
+        """新しい入力ポートを追加"""
+        global NUM_IN_PORTS
+        in_p = self.sim_params.get("in_ports_fi", np.zeros((0, 3), dtype=np.int32))
+        new_row = np.array([[2, self.N // 2, self.N // 2]], dtype=np.int32)
+        self.sim_params["in_ports_fi"] = np.vstack([in_p, new_row])
+        NUM_IN_PORTS = max(NUM_IN_PORTS, len(self.sim_params["in_ports_fi"]))
+
+        self.selected_io_port = ("in", len(self.sim_params["in_ports_fi"]) - 1)
+        self._sync_genes_to_brain()
+        self._draw_inout_wiring()
+        self._draw_inout_3d_map()
+        self._update_io_inspector_ui()
+        self._render_matplotlib_state()
+        self._append_vb_log(f"[I/O配線盤] 入力ポート #{self.selected_io_port[1]} を追加しました。\n")
+
+    def action_add_out_port(self):
+        """新しい出力ポートを追加"""
+        global NUM_OUT_PORTS
+        out_p = self.sim_params.get("out_ports_fi", np.zeros((0, 3), dtype=np.int32))
+        new_row = np.array([[1, self.N // 2, self.N // 2]], dtype=np.int32)
+        self.sim_params["out_ports_fi"] = np.vstack([out_p, new_row])
+        NUM_OUT_PORTS = max(NUM_OUT_PORTS, len(self.sim_params["out_ports_fi"]))
+
+        self.selected_io_port = ("out", len(self.sim_params["out_ports_fi"]) - 1)
+        self._sync_genes_to_brain()
+        self._draw_inout_wiring()
+        self._draw_inout_3d_map()
+        self._update_io_inspector_ui()
+        self._render_matplotlib_state()
+        self._append_vb_log(f"[I/O配線盤] 出力ポート #{self.selected_io_port[1]} を追加しました。\n")
+
+    def action_remove_selected_port(self):
+        """選択中のポートを削除"""
+        if not self.selected_io_port: return
+        port_type, slot = self.selected_io_port
+
+        if port_type == "in":
+            in_p = self.sim_params["in_ports_fi"]
+            if len(in_p) <= 1:
+                messagebox.showwarning("削除不可", "入力ポートは最低1つ必要です。")
+                return
+            if not messagebox.askyesno("ポート削除", f"入力ポート #{slot} を配線盤から削除しますか？"):
+                return
+            self.sim_params["in_ports_fi"] = np.delete(in_p, slot, axis=0)
+            if hasattr(self.brain, "manual_in_overrides"):
+                self.brain.manual_in_overrides.pop(slot, None)
+            self.selected_io_port = ("in", max(0, slot - 1))
+        else:
+            out_p = self.sim_params["out_ports_fi"]
+            if len(out_p) <= 1:
+                messagebox.showwarning("削除不可", "出力ポートは最低1つ必要です。")
+                return
+            if not messagebox.askyesno("ポート削除", f"出力ポート #{slot} を配線盤から削除しますか？"):
+                return
+            self.sim_params["out_ports_fi"] = np.delete(out_p, slot, axis=0)
+            self.selected_io_port = ("out", max(0, slot - 1))
+
+        self._sync_genes_to_brain()
+        self._draw_inout_wiring()
+        self._draw_inout_3d_map()
+        self._update_io_inspector_ui()
+        self._render_matplotlib_state()
+
+    def action_randomize_inout_wiring(self):
+        """全ポートの配線先セルをランダムにシャッフル"""
+        rng = np.random.default_rng()
+        in_p = self.sim_params["in_ports_fi"]
+        out_p = self.sim_params["out_ports_fi"]
+
+        for i in range(len(in_p)):
+            in_p[i, 0] = rng.integers(0, 5, endpoint=True)
+            in_p[i, 1] = rng.integers(-1, self.N, endpoint=True)
+            in_p[i, 2] = rng.integers(-1, self.N, endpoint=True)
+
+        for j in range(len(out_p)):
+            out_p[j, 0] = rng.integers(0, 5, endpoint=True)
+            out_p[j, 1] = rng.integers(0, self.N - 1, endpoint=True)
+            out_p[j, 2] = rng.integers(0, self.N - 1, endpoint=True)
+
+        self._sync_genes_to_brain()
+        self._draw_inout_wiring()
+        self._draw_inout_3d_map()
+        self._update_io_inspector_ui()
+        self._render_matplotlib_state()
+        self._append_vb_log("[I/O配線盤] 全ポートの接続先セルをランダムに再配線しました。\n")
+
+    def action_reset_inout_wiring(self):
+        """標準配線位置に復帰"""
+        defs = get_default_inout_fi(self.dim)
+        in_p = self.sim_params["in_ports_fi"]
+        out_p = self.sim_params["out_ports_fi"]
+
+        n_in = min(len(in_p), len(defs["in_ports_fi"]))
+        in_p[:n_in] = defs["in_ports_fi"][:n_in]
+        n_out = min(len(out_p), len(defs["out_ports_fi"]))
+        out_p[:n_out] = defs["out_ports_fi"][:n_out]
+
+        self._sync_genes_to_brain()
+        self._draw_inout_wiring()
+        self._draw_inout_3d_map()
+        self._update_io_inspector_ui()
+        self._render_matplotlib_state()
+        self._append_vb_log("[I/O配線盤] 標準の配線位置にリセットしました。\n")
+
+    def action_sync_inout_to_sim_config(self):
+        """現在のポート数を sim_config.py に反映保存"""
+        global NUM_IN_PORTS, NUM_OUT_PORTS
+        NUM_IN_PORTS = len(self.sim_params["in_ports_fi"])
+        NUM_OUT_PORTS = len(self.sim_params["out_ports_fi"])
+        if hasattr(self, "cfg_num_vars") and "NUM_IN_PORTS" in self.cfg_num_vars:
+            self.cfg_num_vars["NUM_IN_PORTS"].set(str(NUM_IN_PORTS))
+            self.cfg_num_vars["NUM_OUT_PORTS"].set(str(NUM_OUT_PORTS))
+        self.action_save_and_apply_sim_config(show_msg=True)
+        messagebox.showinfo("sim_config 反映", f"sim_config.py に以下を反映保存しました:\n\nNUM_IN_PORTS = {NUM_IN_PORTS}\nNUM_OUT_PORTS = {NUM_OUT_PORTS}")
+
     def _build_tab_params(self, parent: ttk.Frame):
         p_grid = ttk.Frame(parent)
         p_grid.pack(fill=tk.X)
@@ -1040,11 +1961,14 @@ class IntegratedBrainStudio:
             ("tag_decay", "tag_decay (0.5~0.999)"),
             ("step", "step (世代番号)"),
             ("score", "score (評価エネルギー)"),
-            ("light_in_fi", "光入力 (f,u,v)"),
-            ("battery_in_fi", "蓄電入力 (f,u,v)"),
-            ("gen_neg_out_fi", "発電-出力 (f,u,v)"),
-            ("gen_pos_out_fi", "発電+出力 (f,u,v)"),
         ]
+        for i in range(NUM_IN_PORTS):
+            lbl = "☀️光入力 (f,u,v)" if i == 0 else ("⚡蓄電入力 (f,u,v)" if i == 1 else f"📥In[{i}] (f,u,v)")
+            specs.append((f"in_fi_{i}", lbl))
+        for j in range(NUM_OUT_PORTS):
+            lbl = "⚙️発電+出力 (f,u,v)" if j == 0 else ("⚙️発電-出力 (f,u,v)" if j == 1 else f"📤Out[{j}] (f,u,v)")
+            specs.append((f"out_fi_{j}", lbl))
+
         for idx, (key, label) in enumerate(specs):
             r, col_base = divmod(idx, 2)
             ttk.Label(p_grid, text=label).grid(row=r, column=col_base * 2, sticky=tk.W, padx=3, pady=2)
@@ -1052,6 +1976,16 @@ class IntegratedBrainStudio:
                 val = str(self.meta_step)
             elif key == "score":
                 val = str(self.meta_score)
+            elif key.startswith("in_fi_"):
+                slot = int(key.split("_")[-1])
+                in_p = self.sim_params.get("in_ports_fi")
+                fi = in_p[slot] if in_p is not None and slot < len(in_p) else [0, 0, 0]
+                val = f"{int(fi[0])},{int(fi[1])},{int(fi[2])}"
+            elif key.startswith("out_fi_"):
+                slot = int(key.split("_")[-1])
+                out_p = self.sim_params.get("out_ports_fi")
+                fi = out_p[slot] if out_p is not None and slot < len(out_p) else [0, 0, 0]
+                val = f"{int(fi[0])},{int(fi[1])},{int(fi[2])}"
             elif key.endswith("_fi"):
                 fi = self.sim_params[key]
                 val = f"{int(fi[0])},{int(fi[1])},{int(fi[2])}"
@@ -1210,6 +2144,8 @@ class IntegratedBrainStudio:
 
         self.cfg_num_vars: dict[str, tk.StringVar] = {}
         cfg_specs = [
+            ("NUM_IN_PORTS", "入力ポート数", NUM_IN_PORTS),
+            ("NUM_OUT_PORTS", "出力ポート数", NUM_OUT_PORTS),
             ("INITIAL_ENERGY", "初期エネルギー", INITIAL_ENERGY),
             ("METABOLIC_COST", "基礎代謝/tick", METABOLIC_COST),
             ("GEN_COST_RATE", "発電コスト係数", GEN_COST_RATE),
@@ -1667,6 +2603,13 @@ class IntegratedBrainStudio:
                     enable_sleep=self.enable_sleep,
                 )
                 self._render_matplotlib_state()
+                try:
+                    cur_tab = self.notebook.tab(self.notebook.select(), "text")
+                    if "配線盤" in cur_tab:
+                        self._draw_inout_wiring()
+                        self._update_io_inspector_ui()
+                except Exception:
+                    pass
                 if self.is_recording_gif:
                     self._capture_gif_frame()
         finally:
@@ -1689,6 +2632,16 @@ class IntegratedBrainStudio:
                     var.set(f"{self.meta_score:.4f}")
                 elif key in ("multiplier", "bias"):
                     var.set(str(int(self.sim_params[key])))
+                elif key.startswith("in_fi_"):
+                    slot = int(key.split("_")[-1])
+                    in_p = self.sim_params.get("in_ports_fi")
+                    fi = in_p[slot] if in_p is not None and slot < len(in_p) else [0, 0, 0]
+                    var.set(f"{int(fi[0])},{int(fi[1])},{int(fi[2])}")
+                elif key.startswith("out_fi_"):
+                    slot = int(key.split("_")[-1])
+                    out_p = self.sim_params.get("out_ports_fi")
+                    fi = out_p[slot] if out_p is not None and slot < len(out_p) else [0, 0, 0]
+                    var.set(f"{int(fi[0])},{int(fi[1])},{int(fi[2])}")
                 elif key.endswith("_fi"):
                     fi = self.sim_params[key]
                     var.set(f"{int(fi[0])},{int(fi[1])},{int(fi[2])}")
@@ -1740,6 +2693,9 @@ class IntegratedBrainStudio:
 
         self.lbl_cell_coord.config(text=f"選択中: {n_str}  |  {p_str}")
         self.lbl_cell_role.config(text=role_str if role_str else ("内部ニューロン" if is_internal else "外周膜セル"))
+        if hasattr(self, "lbl_map_sel_info"):
+            r_label = role_str if role_str else ("内部ニューロン" if is_internal else "外周膜セル")
+            self.lbl_map_sel_info.config(text=f"📍 選択中: {n_str} ({p_str}) ｜ {r_label}")
         self.cell_ko_var.set(bool(self.brain.knockout_np2[z, y, x]))
 
         for c in range(4):
@@ -1825,6 +2781,10 @@ class IntegratedBrainStudio:
                                 values=("📤 出力(此➔Post)", pn_s, w_txt, " ".join(tags_info) if tags_info else "通常結合"),
                             )
                             self._syn_tree_items[item_id] = (post_idx, k, (pz, py, px))
+
+        # I/O 配線盤の同期描画
+        self._draw_inout_wiring()
+        self._update_io_inspector_ui()
 
     def _get_selected_cell_partner_map(self) -> dict[tuple[int, int, int], str]:
         """現在選択中セルとシナプス結合を持つ相手セル座標 -> 状態 ('cut' | 'in' | 'out' | 'both') の辞書を返す"""
@@ -2164,6 +3124,44 @@ class IntegratedBrainStudio:
             self.root.focus_set()
 
         key = event.keysym.lower()
+        is_ctrl = bool(event.state & 0x0004)
+        is_shift = bool(event.state & 0x0001)
+
+        # --- 1. ファイル操作 (Ctrl+S, Ctrl+Shift+S, O, E) ---
+        if is_ctrl and key == "s":
+            if is_shift:
+                self.action_save_as()
+            else:
+                self.action_save_overwrite()
+            return
+        elif key == "o":
+            self.action_open_dialog()
+            return
+        elif key == "e":
+            self.action_load_latest_evolved_elite()
+            return
+        elif key in ("question", "h", "slash") and (key == "question" or not is_ctrl):
+            self.action_show_shortcuts_dialog()
+            return
+
+        # --- 2. 大タブ / サブタブ切り替え ---
+        if is_ctrl:
+            # Ctrl+1..5 で大タブ2のサブタブ直接ジャンプ
+            sub_map = {"1": 0, "2": 1, "3": 2, "4": 3, "5": 4}
+            if key in sub_map and hasattr(self, "notebook") and hasattr(self, "root_notebook"):
+                self.root_notebook.select(1)
+                self.notebook.select(sub_map[key])
+                return
+        else:
+            # 1 / 2 または F1 / F2 で大タブ切り替え
+            if key in ("1", "f1") and hasattr(self, "root_notebook"):
+                self.root_notebook.select(0)
+                return
+            elif key in ("2", "f2") and hasattr(self, "root_notebook"):
+                self.root_notebook.select(1)
+                return
+
+        # --- 3. シミュレーション制御 (Space, 矢印, R, G, 速度) ---
         if key == "space":
             self.action_toggle_pause()
         elif key == "right":
@@ -2178,14 +3176,10 @@ class IntegratedBrainStudio:
             self._render_matplotlib_state()
         elif key == "r":
             self.action_reset_sim()
-        elif key == "k":
-            self.action_toggle_selected_ko()
-        elif key == "c":
-            self.action_toggle_selected_synapse()
-        elif key == "w":
-            self.action_set_wire_src()
         elif key == "g":
             self.action_toggle_gif_recording()
+
+        # --- 4. 機能フラグトグル (L, D, S) ---
         elif key == "l":
             self.enable_learning = 0.0 if self.enable_learning > 0.0 else 1.0
             self.flag_vars["enable_learning"].set(self.enable_learning)
@@ -2201,10 +3195,125 @@ class IntegratedBrainStudio:
             self.flag_vars["enable_sleep"].set(self.enable_sleep)
             self.flag_str_vars["enable_sleep"].set(f"{self.enable_sleep:.2f}")
             self._render_matplotlib_state()
-        elif key == "o":
-            self.action_open_dialog()
-        elif key == "e":
-            self.action_load_latest_evolved_elite()
+
+        # --- 5. ボクセル脳スライス移動 (PageUp, PageDown, Home) ---
+        elif key in ("prior", "pageup"):
+            self.sel_z = min(self.P - 1, self.sel_z + 1)
+            self._refresh_cell_inspector()
+            self._redraw_grid_canvas()
+            self._render_matplotlib_state()
+        elif key in ("next", "pagedown"):
+            self.sel_z = max(0, self.sel_z - 1)
+            self._refresh_cell_inspector()
+            self._redraw_grid_canvas()
+            self._render_matplotlib_state()
+        elif key == "home":
+            self.sel_z = self.P // 2
+            self._refresh_cell_inspector()
+            self._redraw_grid_canvas()
+            self._render_matplotlib_state()
+
+        # --- 6. セル操作 (K, C, W) ---
+        elif key == "k":
+            self.action_toggle_selected_ko()
+        elif key == "c":
+            self.action_toggle_selected_synapse()
+        elif key == "w":
+            self.action_set_wire_src()
+
+        # --- 7. 3D配線マップ操作 (F: 視点リセット, [, ]: ポート切り替え) ---
+        elif key == "f":
+            self.action_reset_inout_3d_view()
+        elif key == "bracketleft":
+            self._cycle_io_port(step=-1)
+        elif key == "bracketright":
+            self._cycle_io_port(step=1)
+
+    def _cycle_io_port(self, step: int = 1):
+        """3D配線マップの対象ポートを前後に切り替え"""
+        if not hasattr(self, "cb_active_io_port"):
+            return
+        vals = self.cb_active_io_port["values"]
+        if not vals:
+            return
+        cur_idx = self.cb_active_io_port.current()
+        new_idx = (cur_idx + step) % len(vals)
+        self.cb_active_io_port.current(new_idx)
+        self._on_active_io_port_combo_changed()
+
+    def action_show_shortcuts_dialog(self):
+        """キーボードショートカット一覧（チートシート）ダイアログを表示"""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("⌨️ OneSim キーボードショートカット・チートシート")
+        dlg.geometry("720x620")
+        dlg.configure(bg="#12141a")
+        dlg.transient(self.root)
+
+        header = tk.Frame(dlg, bg="#1a1c24", pady=10, padx=16)
+        header.pack(fill=tk.X)
+        tk.Label(header, text="⌨️ OneSim 操作チートシート (Cheat Sheet)", font=("", 13, "bold"), fg="#80d8ff", bg="#1a1c24").pack(side=tk.LEFT)
+        tk.Label(header, text="いつでも [?] または [H] で表示可能", font=("", 9), fg="#90a4ae", bg="#1a1c24").pack(side=tk.RIGHT)
+
+        container = tk.Frame(dlg, bg="#12141a", padx=14, pady=10)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        tree = ttk.Treeview(container, columns=("Key", "Action", "Category"), show="headings", height=20)
+        tree.heading("Category", text="カテゴリ")
+        tree.heading("Key", text="キー")
+        tree.heading("Action", text="動作・説明")
+        tree.column("Category", width=120, anchor=tk.W)
+        tree.column("Key", width=130, anchor=tk.CENTER)
+        tree.column("Action", width=420, anchor=tk.W)
+        tree.pack(fill=tk.BOTH, expand=True)
+
+        shortcuts = [
+            # シミュレーション制御
+            ("シミュレーション", "Space", "シミュレーションの一時停止 / 再開"),
+            ("シミュレーション", "→ (Right)", "1ステップコマ送り実行 (手動ステップ)"),
+            ("シミュレーション", "↑ / ↓", "シミュレーション実行速度のアップ / ダウン"),
+            ("シミュレーション", "R", "シミュレーション波形・エネルギーのリセット"),
+            ("シミュレーション", "G", "GIF/MP4 録画の開始 / 停止・保存"),
+            # 画面・タブ切り替え
+            ("画面・タブ切替", "1 または F1", "【大タブ1】 📊 波形グラフ ＆ 🧠 ボクセル脳マップ に切替"),
+            ("画面・タブ切替", "2 または F2", "【大タブ2】 🛠️ 選択セル～統合SimConfig に切替"),
+            ("画面・タブ切替", "Ctrl + 1", "大タブ2: 🔍 選択セル・配線 タブへジャンプ"),
+            ("画面・タブ切替", "Ctrl + 2", "大タブ2: 🌐 I/O 3D配線 タブへジャンプ"),
+            ("画面・タブ切替", "Ctrl + 3", "大タブ2: ⚙️ 神経パラメータ タブへジャンプ"),
+            ("画面・タブ切替", "Ctrl + 4", "大タブ2: 🧪 ノッキング診断 タブへジャンプ"),
+            ("画面・タブ切替", "Ctrl + 5", "大タブ2: 🚀 統合ランチャー・sim_config へジャンプ"),
+            # 機能トグル
+            ("リアルタイム機能", "L", "生涯学習（シナプス可塑性 Plasticity） ON / OFF"),
+            ("リアルタイム機能", "D", "ドーパミン報酬修飾（Dopamine） ON / OFF"),
+            ("リアルタイム機能", "S", "睡眠抑制・集計（Sleep） ON / OFF"),
+            # ボクセル脳操作
+            ("ボクセル脳操作", "PageUp / PageDn", "Zスライスの上下移動 (現在スライス切替)"),
+            ("ボクセル脳操作", "Home", "中央Zスライス (Z=N//2) にジャンプ"),
+            ("ボクセル脳操作", "K", "選択セルの一時ノックアウト (KO) 切替"),
+            ("ボクセル脳操作", "C", "選択シナプス結合の切断 / 復元"),
+            ("ボクセル脳操作", "W", "2セル間クイック配線の始点 (Pre) に設定"),
+            # 3D配線マップ
+            ("3D配線マップ", "F", "3Dマップの視点を初期位置にリセット (Focus)"),
+            ("3D配線マップ", "[ / ]", "配線対象ポートの切り替え (前 / 次)"),
+            ("3D配線マップ", "左ドラッグ", "キューブを 360° グリグリ 3D 回転"),
+            ("3D配線マップ", "右ドラッグ", "3Dマップ画面の平行移動 (パン)"),
+            ("3D配線マップ", "ホイール", "3Dマップのズームイン / ズームアウト"),
+            ("3D配線マップ", "クリック", "選択中ポートの配線をクリックしたセルに直接指定"),
+            # ファイル・一般
+            ("ファイル・一般", "Ctrl + S", "現在の遺伝子を上書き保存"),
+            ("ファイル・一般", "Ctrl + Shift + S", "新規ファイルとして別名保存 (Save As)"),
+            ("ファイル・一般", "O", ".npz 遺伝子ファイルを開く"),
+            ("ファイル・一般", "E", "GPU進化の最新エリート (.npz) を即時読込"),
+            ("ファイル・一般", "? または H", "このショートカット・チートシートを表示"),
+            ("ファイル・一般", "Escape", "入力フォーカス解除 / ウィンドウを閉じる"),
+        ]
+
+        for cat, k, act in shortcuts:
+            tree.insert("", tk.END, values=(k, act, cat))
+
+        btn_row = tk.Frame(dlg, bg="#12141a", pady=8)
+        btn_row.pack(fill=tk.X)
+        ttk.Button(btn_row, text="閉じる (Esc)", command=dlg.destroy).pack(side=tk.RIGHT, padx=14)
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
 
     def _on_speed_change(self):
         try:
@@ -2872,11 +3981,28 @@ class IntegratedBrainStudio:
             self.enable_dopamine = float(np.clip(float(self.flag_str_vars["enable_dopamine"].get()), 0.0, 1.0))
             self.enable_sleep = float(np.clip(float(self.flag_str_vars["enable_sleep"].get()), 0.0, 1.0))
 
-            for fi_key in ("light_in_fi", "battery_in_fi", "gen_neg_out_fi", "gen_pos_out_fi"):
-                if fi_key in self.param_vars:
-                    parts = [int(p.strip()) for p in self.param_vars[fi_key].get().split(",")]
+            if "in_ports_fi" not in self.sim_params:
+                self.sim_params.update(get_default_inout_fi(self.dim))
+
+            for i in range(NUM_IN_PORTS):
+                k = f"in_fi_{i}"
+                if k in self.param_vars:
+                    parts = [int(p.strip()) for p in self.param_vars[k].get().split(",")]
                     if len(parts) == 3:
-                        self.sim_params[fi_key] = np.array(parts, dtype=np.int32)
+                        self.sim_params["in_ports_fi"][i] = np.array(parts, dtype=np.int32)
+
+            for j in range(NUM_OUT_PORTS):
+                k = f"out_fi_{j}"
+                if k in self.param_vars:
+                    parts = [int(p.strip()) for p in self.param_vars[k].get().split(",")]
+                    if len(parts) == 3:
+                        self.sim_params["out_ports_fi"][j] = np.array(parts, dtype=np.int32)
+
+            # 後方互換キーも更新
+            if NUM_IN_PORTS >= 1: self.sim_params["light_in_fi"] = self.sim_params["in_ports_fi"][0]
+            if NUM_IN_PORTS >= 2: self.sim_params["battery_in_fi"] = self.sim_params["in_ports_fi"][1]
+            if NUM_OUT_PORTS >= 1: self.sim_params["gen_pos_out_fi"] = self.sim_params["out_ports_fi"][0]
+            if NUM_OUT_PORTS >= 2: self.sim_params["gen_neg_out_fi"] = self.sim_params["out_ports_fi"][1]
         except ValueError:
             pass
 
@@ -3026,6 +4152,10 @@ class IntegratedBrainStudio:
 
             for k in ("base_output", "beta", "k_refill", "multiplier", "bias", "learning_rate", "forget_rate", "learning_threshold", "tag_decay"):
                 self.sim_params[k] = params[k]
+            if "in_ports_fi" in params:
+                self.sim_params["in_ports_fi"] = params["in_ports_fi"]
+            if "out_ports_fi" in params:
+                self.sim_params["out_ports_fi"] = params["out_ports_fi"]
             for k in ("light_in_fi", "battery_in_fi", "gen_neg_out_fi", "gen_pos_out_fi"):
                 if k in params:
                     self.sim_params[k] = params[k]
@@ -3081,10 +4211,12 @@ class IntegratedBrainStudio:
             learn_forget=np.float16(self.sim_params["forget_rate"]),
             learn_threshold=np.float16(self.sim_params["learning_threshold"]),
             learn_decay=np.float16(self.sim_params["tag_decay"]),
-            light_in_fi=np.asarray(self.sim_params["light_in_fi"], dtype=np.int32),
-            battery_in_fi=np.asarray(self.sim_params["battery_in_fi"], dtype=np.int32),
-            gen_neg_out_fi=np.asarray(self.sim_params["gen_neg_out_fi"], dtype=np.int32),
-            gen_pos_out_fi=np.asarray(self.sim_params["gen_pos_out_fi"], dtype=np.int32),
+            in_ports_fi=np.asarray(self.sim_params.get("in_ports_fi", get_default_inout_fi(self.dim)["in_ports_fi"]), dtype=np.int32),
+            out_ports_fi=np.asarray(self.sim_params.get("out_ports_fi", get_default_inout_fi(self.dim)["out_ports_fi"]), dtype=np.int32),
+            light_in_fi=np.asarray(self.sim_params.get("in_ports_fi", get_default_inout_fi(self.dim)["in_ports_fi"])[0] if NUM_IN_PORTS >= 1 else [0, 0, 0], dtype=np.int32),
+            battery_in_fi=np.asarray(self.sim_params.get("in_ports_fi", get_default_inout_fi(self.dim)["in_ports_fi"])[1] if NUM_IN_PORTS >= 2 else [0, 0, 0], dtype=np.int32),
+            gen_pos_out_fi=np.asarray(self.sim_params.get("out_ports_fi", get_default_inout_fi(self.dim)["out_ports_fi"])[0] if NUM_OUT_PORTS >= 1 else [0, 0, 0], dtype=np.int32),
+            gen_neg_out_fi=np.asarray(self.sim_params.get("out_ports_fi", get_default_inout_fi(self.dim)["out_ports_fi"])[1] if NUM_OUT_PORTS >= 2 else [0, 0, 0], dtype=np.int32),
         )
         self.current_file_path = save_path
         self.last_opened_dir = os.path.dirname(os.path.abspath(save_path))
@@ -3120,6 +4252,7 @@ class IntegratedBrainStudio:
     def action_save_and_apply_sim_config(self, show_msg: bool = True):
         """UI上の sim_config 設定を sim_config.py に書き出し、OneSim 内部の実行時定数にも即時反映する"""
         global ENABLE_LEARNING, ENABLE_DOPAMINE, ENABLE_SLEEP
+        global NUM_IN_PORTS, NUM_OUT_PORTS
         global INITIAL_ENERGY, METABOLIC_COST, GEN_COST_RATE, SOLAR_GAIN_RATE, SUN_CYCLE_PERIOD
 
         try:
@@ -3127,6 +4260,8 @@ class IntegratedBrainStudio:
             en_dop = float(np.clip(float(self.cfg_flag_str_vars["ENABLE_DOPAMINE"].get()), 0.0, 1.0))
             en_slp = float(np.clip(float(self.cfg_flag_str_vars["ENABLE_SLEEP"].get()), 0.0, 1.0))
 
+            num_in = max(1, int(self.cfg_num_vars["NUM_IN_PORTS"].get()))
+            num_out = max(1, int(self.cfg_num_vars["NUM_OUT_PORTS"].get()))
             init_e = float(self.cfg_num_vars["INITIAL_ENERGY"].get())
             meta_c = float(self.cfg_num_vars["METABOLIC_COST"].get())
             gen_c = float(self.cfg_num_vars["GEN_COST_RATE"].get())
@@ -3139,6 +4274,8 @@ class IntegratedBrainStudio:
         ENABLE_LEARNING = en_learn
         ENABLE_DOPAMINE = en_dop
         ENABLE_SLEEP = en_slp
+        NUM_IN_PORTS = num_in
+        NUM_OUT_PORTS = num_out
         INITIAL_ENERGY = init_e
         METABOLIC_COST = meta_c
         GEN_COST_RATE = gen_c
@@ -3175,6 +4312,12 @@ class IntegratedBrainStudio:
             f"ENABLE_SLEEP    = {en_slp}   # 睡眠（Sleep）集計・出力抑制の有効度合い (0.0 ~ 1.0)\n"
             f"\n"
             f"# ==============================================================================\n"
+            f"# 入出力ポート スロット数設定 (固定長スロット方式)\n"
+            f"# ==============================================================================\n"
+            f"NUM_IN_PORTS  = {num_in}   # 感覚入力ポート（外周膜）のスロット数 (0: light_in, 1: battery_in)\n"
+            f"NUM_OUT_PORTS = {num_out}   # 運動出力ポート（内部表面）のスロット数 (0: gen_pos_out, 1: gen_neg_out)\n"
+            f"\n"
+            f"# ==============================================================================\n"
             f"# 太陽光タスク・エネルギーシミュレーション共通パラメータ\n"
             f"# ==============================================================================\n"
             f"INITIAL_ENERGY    = {init_e}     # 初期エネルギー (0.0=餓死, 1.0=満タン)\n"
@@ -3205,7 +4348,7 @@ class IntegratedBrainStudio:
         self._refresh_all_views()
 
         if show_msg:
-            self._append_vb_log(f"[sim_config] 保存＆即時反映完了: E0={init_e}, Meta={meta_c}, Cost={gen_c}, Gain={sol_g}, Period={sun_p}\n")
+            self._append_vb_log(f"[sim_config] 保存＆即時反映完了: InPorts={num_in}, OutPorts={num_out}, E0={init_e}, Meta={meta_c}, Cost={gen_c}, Gain={sol_g}, Period={sun_p}\n")
 
     def action_browse_vb_folder(self):
         init_dir = os.path.abspath(self.vb_folder_var.get())
@@ -3579,10 +4722,12 @@ class IntegratedBrainStudio:
             learn_forget=np.float16(self.sim_params["forget_rate"]),
             learn_threshold=np.float16(self.sim_params["learning_threshold"]),
             learn_decay=np.float16(self.sim_params["tag_decay"]),
-            light_in_fi=np.asarray(self.sim_params["light_in_fi"], dtype=np.int32),
-            battery_in_fi=np.asarray(self.sim_params["battery_in_fi"], dtype=np.int32),
-            gen_neg_out_fi=np.asarray(self.sim_params["gen_neg_out_fi"], dtype=np.int32),
-            gen_pos_out_fi=np.asarray(self.sim_params["gen_pos_out_fi"], dtype=np.int32),
+            in_ports_fi=np.asarray(self.sim_params.get("in_ports_fi", get_default_inout_fi(self.dim)["in_ports_fi"]), dtype=np.int32),
+            out_ports_fi=np.asarray(self.sim_params.get("out_ports_fi", get_default_inout_fi(self.dim)["out_ports_fi"]), dtype=np.int32),
+            light_in_fi=np.asarray(self.sim_params.get("in_ports_fi", get_default_inout_fi(self.dim)["in_ports_fi"])[0] if NUM_IN_PORTS >= 1 else [0, 0, 0], dtype=np.int32),
+            battery_in_fi=np.asarray(self.sim_params.get("in_ports_fi", get_default_inout_fi(self.dim)["in_ports_fi"])[1] if NUM_IN_PORTS >= 2 else [0, 0, 0], dtype=np.int32),
+            gen_pos_out_fi=np.asarray(self.sim_params.get("out_ports_fi", get_default_inout_fi(self.dim)["out_ports_fi"])[0] if NUM_OUT_PORTS >= 1 else [0, 0, 0], dtype=np.int32),
+            gen_neg_out_fi=np.asarray(self.sim_params.get("out_ports_fi", get_default_inout_fi(self.dim)["out_ports_fi"])[1] if NUM_OUT_PORTS >= 2 else [0, 0, 0], dtype=np.int32),
         )
 
         env = self._build_analyze_env()

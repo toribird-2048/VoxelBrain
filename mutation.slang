@@ -81,17 +81,17 @@ struct ResourceParams {
     }   
 }
 
-struct Link27thParamsAll {
+struct Link28thParamsAll {
     RWStructuredBuffer<uint> multiplier;
     RWStructuredBuffer<uint> bias;
 }
 
-struct Link27thParams {
+struct Link28thParams {
     uint multiplier;
     uint bias;
 
-    static Link27thParams load(uint agent_id, Link27thParamsAll mut_all) {
-        Link27thParams p;
+    static Link28thParams load(uint agent_id, Link28thParamsAll mut_all) {
+        Link28thParams p;
         p.multiplier = mut_all.multiplier[agent_id];
         p.bias = mut_all.bias[agent_id];
 
@@ -122,83 +122,68 @@ struct LearningParams {
     }
 }
 
+#ifndef NUM_IN_PORTS
+#define NUM_IN_PORTS 2
+#endif
+#ifndef NUM_OUT_PORTS
+#define NUM_OUT_PORTS 2
+#endif
+
 struct InoutParamsFiAll {
-    RWStructuredBuffer<int3> light_in_fi;
-    RWStructuredBuffer<int3> battery_in_fi;
-    RWStructuredBuffer<int3> gen_neg_out_fi;
-    RWStructuredBuffer<int3> gen_pos_out_fi;
-}
+    RWStructuredBuffer<int3> in_ports_fi;
+    RWStructuredBuffer<int3> out_ports_fi;
+};
 
 struct InoutParams {
-    int3 light_in;
-    int3 battery_in;
-    int3 gen_neg_out;
-    int3 gen_pos_out;
-
-    static InoutParams load(
-        int3 light_in,
-        int3 battery_in,
-        int3 gen_neg_out,
-        int3 gen_pos_out
-    ) {
-        InoutParams p;
-        p.light_in    = light_in;
-        p.battery_in  = battery_in;
-        p.gen_neg_out = gen_neg_out;
-        p.gen_pos_out = gen_pos_out;
-        return p;
-    }
+    int3 in_coords[NUM_IN_PORTS];
+    int3 out_coords[NUM_OUT_PORTS];
 
     // 入力セル用: 外周膜の6面 (面座標 = -1 または N, 面内座標 = -1 .. N)
     static int3 faceIndex_to_coordIn(int3 face_index) {
+        int u = clamp(face_index.y, -1, int(N));
+        int v = clamp(face_index.z, -1, int(N));
         int3 table[6] = {
-            int3(-1, face_index.y, face_index.z),
-            int3(N,  face_index.y, face_index.z),
-            int3(face_index.y, -1, face_index.z),
-            int3(face_index.y, N,  face_index.z),
-            int3(face_index.y, face_index.z, -1),
-            int3(face_index.y, face_index.z, N)
+            int3(-1, u, v),
+            int3(N,  u, v),
+            int3(u, -1, v),
+            int3(u, N,  v),
+            int3(u, v, -1),
+            int3(u, v, N)
         };
         return table[clamp(face_index.x, 0, 5)];
     }
 
     // 出力セル用: 内部ニューロン表面の6面 (面座標 = 0 または N-1, 面内座標 = 0 .. N-1)
     static int3 faceIndex_to_coordOut(int3 face_index) {
+        int u = clamp(face_index.y, 0, int(N - 1));
+        int v = clamp(face_index.z, 0, int(N - 1));
         int3 table[6] = {
-            int3(0,     face_index.y, face_index.z),
-            int3(N - 1, face_index.y, face_index.z),
-            int3(face_index.y, 0,     face_index.z),
-            int3(face_index.y, N - 1, face_index.z),
-            int3(face_index.y, face_index.z, 0),
-            int3(face_index.y, face_index.z, N - 1)
+            int3(0,     u, v),
+            int3(N - 1, u, v),
+            int3(u, 0,     v),
+            int3(u, N - 1, v),
+            int3(u, v, 0),
+            int3(u, v, N - 1)
         };
         return table[clamp(face_index.x, 0, 5)];
     }
 
     static InoutParams load_face_index(
-        int3 light_in_fi,
-        int3 battery_in_fi,
-        int3 gen_neg_out_fi,
-        int3 gen_pos_out_fi
+        int3 in_fi[NUM_IN_PORTS],
+        int3 out_fi[NUM_OUT_PORTS]
     ) {
         InoutParams p;
-        p.light_in    = faceIndex_to_coordIn(light_in_fi);
-        p.battery_in  = faceIndex_to_coordIn(battery_in_fi);
-        p.gen_neg_out = faceIndex_to_coordOut(gen_neg_out_fi);
-        p.gen_pos_out = faceIndex_to_coordOut(gen_pos_out_fi);
+        [unroll]
+        for (uint i = 0; i < NUM_IN_PORTS; ++i) {
+            p.in_coords[i] = faceIndex_to_coordIn(in_fi[i]);
+        }
+        [unroll]
+        for (uint j = 0; j < NUM_OUT_PORTS; ++j) {
+            p.out_coords[j] = faceIndex_to_coordOut(out_fi[j]);
+        }
         return p;
     }
-
-    static InoutParams load(uint agent_id, InoutParamsFiAll inout_all) {
-        InoutParams p = InoutParams.load_face_index(
-            inout_all.light_in_fi[agent_id],
-            inout_all.battery_in_fi[agent_id],
-            inout_all.gen_neg_out_fi[agent_id],
-            inout_all.gen_pos_out_fi[agent_id]
-        );
-        return p;
-    }
-}
+};
 
 
 
@@ -222,7 +207,7 @@ struct MutationParamsAll {
     RWStructuredBuffer<half4> sig_post_max;
     RWStructuredBuffer<half4> other_max;          // dopamine / sleep / unused / unused
     RWStructuredBuffer<half4> resource_rate; // base / beta / refill
-    RWStructuredBuffer<half2> link27th_rate; // multiplier / bias
+    RWStructuredBuffer<half2> link28th_rate; // multiplier / bias
     RWStructuredBuffer<half4> learning_rate; // rate / forget / rate / tag_decay
     RWStructuredBuffer<half4> mutate_rate;   // rate / steps / diff / max
     RWStructuredBuffer<half2> inout_copy_rate; // inout / copy
@@ -637,7 +622,7 @@ void computeMain(
     RWStructuredBuffer<half4> signature_pre_map_np2,
     RWStructuredBuffer<half4> signature_post_map_np2,
     uniform ResourceParamsAll resource_params_all,
-    uniform Link27thParamsAll link27th_params_all,
+    uniform Link28thParamsAll link28th_params_all,
     uniform LearningParamsAll learning_params_all,
     uniform InoutParamsFiAll inout_params_fi_all, //fi: face_index
     uniform MutationParamsAll mutation_params_all,
@@ -739,10 +724,10 @@ void computeMain(
             MUT_LINEAR(resource_params_all.beta, 15.0h, 30.0h, resource_rate.y);
             MUT_LINEAR(resource_params_all.k_refill, 0.01h, 0.5h, resource_rate.z);
 
-            // Link27thParams の変異
-            half2 link27th_rate = mutation_params_all.link27th_rate[groupID.x];
-            link27th_params_all.multiplier[groupID.x] = mutate_odd(link27th_params_all.multiplier[base_id_s], 1, TOTAL_N - 1, seed, link27th_rate.x);
-            MUT_UINT(link27th_params_all.bias, 0, TOTAL_N - 1, link27th_rate.y);
+            // Link28thParams の変異
+            half2 link28th_rate = mutation_params_all.link28th_rate[groupID.x];
+            link28th_params_all.multiplier[groupID.x] = mutate_odd(link28th_params_all.multiplier[base_id_s], 1, TOTAL_N - 1, seed, link28th_rate.x);
+            MUT_UINT(link28th_params_all.bias, 0, TOTAL_N - 1, link28th_rate.y);
 
             // LearningParams の変異
             half4 learning_rate = mutation_params_all.learning_rate[groupID.x];
@@ -751,12 +736,20 @@ void computeMain(
             MUT_LINEAR(learning_params_all.learning_threshold, 0.0h, 1.0h, learning_rate.z);
             MUT_LINEAR(learning_params_all.tag_decay, 0.5h, 0.999h, learning_rate.w);
 
-            // InoutParams の変異
+            // InoutParams の変異 (固定長スロット配列)
             half inout_copy_rate = mutation_params_all.inout_copy_rate[groupID.x].x;
-            MUT_IN_INT3(inout_params_fi_all.light_in_fi, inout_copy_rate);
-            MUT_IN_INT3(inout_params_fi_all.battery_in_fi, inout_copy_rate);
-            MUT_OUT_INT3(inout_params_fi_all.gen_neg_out_fi, inout_copy_rate);
-            MUT_OUT_INT3(inout_params_fi_all.gen_pos_out_fi, inout_copy_rate);
+            [unroll]
+            for (uint i = 0; i < NUM_IN_PORTS; ++i) {
+                uint dst_idx = groupID.x * NUM_IN_PORTS + i;
+                uint src_idx = base_id_s * NUM_IN_PORTS + i;
+                inout_params_fi_all.in_ports_fi[dst_idx] = mutate_in_int3(inout_params_fi_all.in_ports_fi[src_idx], seed, inout_copy_rate);
+            }
+            [unroll]
+            for (uint j = 0; j < NUM_OUT_PORTS; ++j) {
+                uint dst_idx = groupID.x * NUM_OUT_PORTS + j;
+                uint src_idx = base_id_s * NUM_OUT_PORTS + j;
+                inout_params_fi_all.out_ports_fi[dst_idx] = mutate_out_int3(inout_params_fi_all.out_ports_fi[src_idx], seed, inout_copy_rate);
+            }
         }
 
         // ---------------------------------------------------------------------

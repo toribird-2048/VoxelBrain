@@ -22,6 +22,8 @@ from sim_config import (
     ENABLE_LEARNING,
     ENABLE_DOPAMINE,
     ENABLE_SLEEP,
+    NUM_IN_PORTS,
+    NUM_OUT_PORTS,
     INITIAL_ENERGY,
     METABOLIC_COST,
     GEN_COST_RATE,
@@ -187,7 +189,7 @@ class InhibRange:
     threshold = R(float, 0.0, 1.0)
 
 
-class Link27thRange:
+class Link28thRange:
     multiplier = R(int, 0, Config.total_cells - 1, odd=True)
     bias = R(int, 0, Config.total_cells - 1)
 
@@ -206,10 +208,25 @@ class LearningRange:
 
 
 class InoutFiRange:
-    light_in_fi = RInoutFi(is_output=False)
-    battery_in_fi = RInoutFi(is_output=False)
-    gen_neg_out_fi = RInoutFi(is_output=True)
-    gen_pos_out_fi = RInoutFi(is_output=True)
+    @staticmethod
+    def generate(count_agents: int, seed: int) -> dict[str, np.ndarray]:
+        rng = np.random.default_rng(seed=seed)
+        total_in = count_agents * NUM_IN_PORTS
+        in_face = rng.integers(0, 5, size=total_in, endpoint=True, dtype=np.int32)
+        in_u = rng.integers(-1, Config.N, size=total_in, endpoint=True, dtype=np.int32)
+        in_v = rng.integers(-1, Config.N, size=total_in, endpoint=True, dtype=np.int32)
+        in_ports_fi = np.stack([in_face, in_u, in_v], axis=-1).astype(np.int32)
+
+        total_out = count_agents * NUM_OUT_PORTS
+        out_face = rng.integers(0, 5, size=total_out, endpoint=True, dtype=np.int32)
+        out_u = rng.integers(0, Config.N - 1, size=total_out, endpoint=True, dtype=np.int32)
+        out_v = rng.integers(0, Config.N - 1, size=total_out, endpoint=True, dtype=np.int32)
+        out_ports_fi = np.stack([out_face, out_u, out_v], axis=-1).astype(np.int32)
+
+        return {
+            "in_ports_fi": in_ports_fi,
+            "out_ports_fi": out_ports_fi,
+        }
 
 
 def generate(cls, seed: int) -> dict[str, np.ndarray]:
@@ -231,7 +248,7 @@ class GenesisParams:
     sleep_params: dict[str, np.ndarray]
     inhib_params: dict[str, np.ndarray]
     resource_params: dict[str, np.ndarray]
-    link27th_params: dict[str, np.ndarray]
+    link28th_params: dict[str, np.ndarray]
     learning_params: dict[str, np.ndarray]
     inout_params_fi: dict[str, np.ndarray]
 
@@ -244,9 +261,9 @@ class GenesisParams:
             sleep_params=generate(DopSleepRange, Config.Seed.sleep),
             inhib_params=generate(InhibRange, Config.Seed.inhib),
             resource_params=generate(NeuronResourceRange, Config.Seed.res),
-            link27th_params=generate(Link27thRange, Config.Seed.link),
+            link28th_params=generate(Link28thRange, Config.Seed.link),
             learning_params=generate(LearningRange, Config.Seed.learn),
-            inout_params_fi=generate(InoutFiRange, Config.Seed.inout),
+            inout_params_fi=InoutFiRange.generate(Config.m, Config.Seed.inout),
         )
 
 
@@ -273,6 +290,8 @@ def build_kernel(device, filename: str):
     with open(filename + ".slang", "r", encoding="utf-8") as f:
         defines = (
             f"#define DIM {Config.dim}\n"
+            f"#define NUM_IN_PORTS {NUM_IN_PORTS}\n"
+            f"#define NUM_OUT_PORTS {NUM_OUT_PORTS}\n"
             f"#define USE_LEARNING {1 if float(ENABLE_LEARNING) > 0.0 else 0}\n"
             f"#define ENABLE_LEARNING {float(ENABLE_LEARNING)}h\n"
             f"#define USE_DOPAMINE {1 if float(ENABLE_DOPAMINE) > 0.0 else 0}\n"
@@ -344,7 +363,7 @@ def create_mutation_params_buffers(num_groups: int, seed: int = None):
     resource_rate[:, 1] = rng.uniform(0.02, 0.15, size=num_groups)
     resource_rate[:, 2] = rng.uniform(0.02, 0.15, size=num_groups)
 
-    link27th_rate = rng.uniform(0.02, 0.15, size=(num_groups, 2)).astype(np.float16)
+    link28th_rate = rng.uniform(0.02, 0.15, size=(num_groups, 2)).astype(np.float16)
 
     learning_rate = rng.uniform(0.02, 0.15, size=(num_groups, 4)).astype(np.float16)
 
@@ -366,7 +385,7 @@ def create_mutation_params_buffers(num_groups: int, seed: int = None):
         "sig_post_max":  sig_post_max,
         "other_max":     other_max,
         "resource_rate": resource_rate,
-        "link27th_rate": link27th_rate,
+        "link28th_rate": link28th_rate,
         "learning_rate": learning_rate,
         "mutate_rate":   mutate_rate,
         "inout_copy_rate":    inout_copy_rate,
@@ -434,34 +453,40 @@ mutation_rate_buf = device.create_buffer(
 )
 
 shared_resource_params_buf = cast_and_buffer(genesis_params.resource_params, device)
-shared_link27th_params_buf = cast_and_buffer(genesis_params.link27th_params, device)
+shared_link28th_params_buf = cast_and_buffer(genesis_params.link28th_params, device)
 shared_learning_params_buf = cast_and_buffer(genesis_params.learning_params, device)
 shared_inout_params_fi_buf = cast_and_buffer(genesis_params.inout_params_fi, device)
 shared_mutation_params_buf = cast_and_buffer(create_mutation_params_buffers(Config.m, 42), device)
 
 
 def get_default_inout_fi(dim: int) -> dict[str, np.ndarray]:
+    """デフォルトの入出力face_index [face, u, v] を返す。
+    in_ports_fi: shape (NUM_IN_PORTS, 3)
+    out_ports_fi: shape (NUM_OUT_PORTS, 3)
+    """
+    in_defaults = np.zeros((NUM_IN_PORTS, 3), dtype=np.int32)
+    out_defaults = np.zeros((NUM_OUT_PORTS, 3), dtype=np.int32)
+
     if dim == 1:
-        return {
-            "light_in_fi": np.array([2, 1, 0], dtype=np.int32),
-            "battery_in_fi": np.array([2, 0, 0], dtype=np.int32),
-            "gen_neg_out_fi": np.array([5, 0, 0], dtype=np.int32),
-            "gen_pos_out_fi": np.array([5, 1, 0], dtype=np.int32),
-        }
+        if NUM_IN_PORTS >= 1: in_defaults[0] = [2, 1, 0]
+        if NUM_IN_PORTS >= 2: in_defaults[1] = [2, 0, 0]
+        if NUM_OUT_PORTS >= 1: out_defaults[0] = [5, 1, 0]
+        if NUM_OUT_PORTS >= 2: out_defaults[1] = [5, 0, 0]
     elif dim == 2:
-        return {
-            "light_in_fi": np.array([2, 3, 2], dtype=np.int32),
-            "battery_in_fi": np.array([2, 1, 2], dtype=np.int32),
-            "gen_neg_out_fi": np.array([0, 2, 1], dtype=np.int32),
-            "gen_pos_out_fi": np.array([1, 2, 1], dtype=np.int32),
-        }
+        if NUM_IN_PORTS >= 1: in_defaults[0] = [2, 3, 2]
+        if NUM_IN_PORTS >= 2: in_defaults[1] = [2, 1, 2]
+        if NUM_OUT_PORTS >= 1: out_defaults[0] = [1, 2, 1]
+        if NUM_OUT_PORTS >= 2: out_defaults[1] = [0, 2, 1]
     else:
-        return {
-            "light_in_fi": np.array([2, 5, 4], dtype=np.int32),
-            "battery_in_fi": np.array([2, 3, 4], dtype=np.int32),
-            "gen_neg_out_fi": np.array([0, 2, 1], dtype=np.int32),
-            "gen_pos_out_fi": np.array([1, 2, 1], dtype=np.int32),
-        }
+        if NUM_IN_PORTS >= 1: in_defaults[0] = [2, 5, 4]
+        if NUM_IN_PORTS >= 2: in_defaults[1] = [2, 3, 4]
+        if NUM_OUT_PORTS >= 1: out_defaults[0] = [1, 2, 1]
+        if NUM_OUT_PORTS >= 2: out_defaults[1] = [0, 2, 1]
+
+    return {
+        "in_ports_fi": in_defaults,
+        "out_ports_fi": out_defaults,
+    }
 
 
 def load_and_distribute_all_elites(folder_path: str):
@@ -501,10 +526,10 @@ def load_and_distribute_all_elites(folder_path: str):
         np.array([e["resource_k_refill"] for e in elites], dtype=np.float16)[assign]
     )
 
-    shared_link27th_params_buf["multiplier"].copy_from_numpy(
+    shared_link28th_params_buf["multiplier"].copy_from_numpy(
         np.array([e["link_multiplier"] for e in elites], dtype=np.int32)[assign]
     )
-    shared_link27th_params_buf["bias"].copy_from_numpy(
+    shared_link28th_params_buf["bias"].copy_from_numpy(
         np.array([e["link_bias"] for e in elites], dtype=np.int32)[assign]
     )
 
@@ -522,12 +547,39 @@ def load_and_distribute_all_elites(folder_path: str):
     )
 
     defaults_fi = get_default_inout_fi(Config.dim)
-    for fi_key in ("light_in_fi", "battery_in_fi", "gen_neg_out_fi", "gen_pos_out_fi"):
-        fi_arr = np.stack([
-            np.asarray(e[fi_key], dtype=np.int32).reshape(3) if fi_key in e else defaults_fi[fi_key]
-            for e in elites
-        ])[assign].astype(np.int32)
-        shared_inout_params_fi_buf[fi_key].copy_from_numpy(np.ascontiguousarray(fi_arr))
+    in_list = []
+    out_list = []
+    for e in elites:
+        in_arr = np.copy(defaults_fi["in_ports_fi"])
+        out_arr = np.copy(defaults_fi["out_ports_fi"])
+        if "in_ports_fi" in e:
+            loaded_in = np.asarray(e["in_ports_fi"], dtype=np.int32).reshape(-1, 3)
+            n_in = min(len(loaded_in), NUM_IN_PORTS)
+            in_arr[:n_in] = loaded_in[:n_in]
+        else:
+            if "light_in_fi" in e and NUM_IN_PORTS >= 1:
+                in_arr[0] = np.asarray(e["light_in_fi"], dtype=np.int32).reshape(3)
+            if "battery_in_fi" in e and NUM_IN_PORTS >= 2:
+                in_arr[1] = np.asarray(e["battery_in_fi"], dtype=np.int32).reshape(3)
+
+        if "out_ports_fi" in e:
+            loaded_out = np.asarray(e["out_ports_fi"], dtype=np.int32).reshape(-1, 3)
+            n_out = min(len(loaded_out), NUM_OUT_PORTS)
+            out_arr[:n_out] = loaded_out[:n_out]
+        else:
+            if "gen_pos_out_fi" in e and NUM_OUT_PORTS >= 1:
+                out_arr[0] = np.asarray(e["gen_pos_out_fi"], dtype=np.int32).reshape(3)
+            if "gen_neg_out_fi" in e and NUM_OUT_PORTS >= 2:
+                out_arr[1] = np.asarray(e["gen_neg_out_fi"], dtype=np.int32).reshape(3)
+
+        in_list.append(in_arr)
+        out_list.append(out_arr)
+
+    in_all = np.stack(in_list)[assign].reshape(Config.m * NUM_IN_PORTS, 3).astype(np.int32)
+    out_all = np.stack(out_list)[assign].reshape(Config.m * NUM_OUT_PORTS, 3).astype(np.int32)
+
+    shared_inout_params_fi_buf["in_ports_fi"].copy_from_numpy(np.ascontiguousarray(in_all))
+    shared_inout_params_fi_buf["out_ports_fi"].copy_from_numpy(np.ascontiguousarray(out_all))
 
     print("[★] 全個体への多系統エリート配分が完了しました！\n")
 
@@ -548,7 +600,7 @@ reasoning_sim_dict = {
     "signature_pre_map_np2": gen_buf_dict["sig_pre_map_np2_pout"],
     "signature_post_map_np2": gen_buf_dict["sig_post_map_np2_pout"],
     "resource_params_all": shared_resource_params_buf,
-    "link27th_params_all": shared_link27th_params_buf,
+    "link28th_params_all": shared_link28th_params_buf,
     "learning_params_all": shared_learning_params_buf,
     "inout_params_fi_all": shared_inout_params_fi_buf,
     "dopamine_sum": dopamine_sum_buf,
@@ -565,7 +617,7 @@ mutation_dict = {
     "signature_pre_map_np2": gen_buf_dict["sig_pre_map_np2_pout"],
     "signature_post_map_np2": gen_buf_dict["sig_post_map_np2_pout"],
     "resource_params_all": shared_resource_params_buf,
-    "link27th_params_all": shared_link27th_params_buf,
+    "link28th_params_all": shared_link28th_params_buf,
     "learning_params_all": shared_learning_params_buf,
     "inout_params_fi_all": shared_inout_params_fi_buf,
     "mutation_params_all": shared_mutation_params_buf,
@@ -623,17 +675,15 @@ def save_top_k_elites(step_num: int, energies: np.ndarray, k: int = 20):
     res_base   = shared_resource_params_buf["base_output"].to_numpy().view(np.float16)
     res_beta   = shared_resource_params_buf["beta"].to_numpy().view(np.float16)
     res_refill = shared_resource_params_buf["k_refill"].to_numpy().view(np.float16)
-    link_mult  = shared_link27th_params_buf["multiplier"].to_numpy().view(np.int32)
-    link_bias  = shared_link27th_params_buf["bias"].to_numpy().view(np.int32)
+    link_mult  = shared_link28th_params_buf["multiplier"].to_numpy().view(np.int32)
+    link_bias  = shared_link28th_params_buf["bias"].to_numpy().view(np.int32)
     lr_rate    = shared_learning_params_buf["learning_rate"].to_numpy().view(np.float16)
     lr_forget  = shared_learning_params_buf["forget_rate"].to_numpy().view(np.float16)
     lr_thresh  = shared_learning_params_buf["learning_threshold"].to_numpy().view(np.float16)
     lr_decay   = shared_learning_params_buf["tag_decay"].to_numpy().view(np.float16)
 
-    light_in_fi_all    = shared_inout_params_fi_buf["light_in_fi"].to_numpy().view(np.int32).reshape(Config.m, 3)
-    battery_in_fi_all  = shared_inout_params_fi_buf["battery_in_fi"].to_numpy().view(np.int32).reshape(Config.m, 3)
-    gen_neg_out_fi_all = shared_inout_params_fi_buf["gen_neg_out_fi"].to_numpy().view(np.int32).reshape(Config.m, 3)
-    gen_pos_out_fi_all = shared_inout_params_fi_buf["gen_pos_out_fi"].to_numpy().view(np.int32).reshape(Config.m, 3)
+    in_ports_fi_all  = shared_inout_params_fi_buf["in_ports_fi"].to_numpy().view(np.int32).reshape(Config.m, NUM_IN_PORTS, 3)
+    out_ports_fi_all = shared_inout_params_fi_buf["out_ports_fi"].to_numpy().view(np.int32).reshape(Config.m, NUM_OUT_PORTS, 3)
 
     for rank, idx in enumerate(top_indices, start=1):
         idx = int(idx)
@@ -661,10 +711,12 @@ def save_top_k_elites(step_num: int, energies: np.ndarray, k: int = 20):
             learn_forget=lr_forget[idx],
             learn_threshold=lr_thresh[idx],
             learn_decay=lr_decay[idx],
-            light_in_fi=light_in_fi_all[idx],
-            battery_in_fi=battery_in_fi_all[idx],
-            gen_neg_out_fi=gen_neg_out_fi_all[idx],
-            gen_pos_out_fi=gen_pos_out_fi_all[idx],
+            in_ports_fi=in_ports_fi_all[idx],
+            out_ports_fi=out_ports_fi_all[idx],
+            light_in_fi=in_ports_fi_all[idx][0] if NUM_IN_PORTS >= 1 else np.array([0, 0, 0], dtype=np.int32),
+            battery_in_fi=in_ports_fi_all[idx][1] if NUM_IN_PORTS >= 2 else np.array([0, 0, 0], dtype=np.int32),
+            gen_pos_out_fi=out_ports_fi_all[idx][0] if NUM_OUT_PORTS >= 1 else np.array([0, 0, 0], dtype=np.int32),
+            gen_neg_out_fi=out_ports_fi_all[idx][1] if NUM_OUT_PORTS >= 2 else np.array([0, 0, 0], dtype=np.int32),
         )
 
     print(f"[★] 上位 {k} 体の保存が完了しました！(1位スコア: {energies[top_indices[0]]:.3f} ~ {k}位スコア: {energies[top_indices[-1]]:.3f})")
@@ -765,16 +817,18 @@ for step in range(TOTAL_STEPS):
             resource_base_output=shared_resource_params_buf["base_output"].to_numpy().view(np.float16)[best_idx],
             resource_beta=shared_resource_params_buf["beta"].to_numpy().view(np.float16)[best_idx],
             resource_k_refill=shared_resource_params_buf["k_refill"].to_numpy().view(np.float16)[best_idx],
-            link_multiplier=shared_link27th_params_buf["multiplier"].to_numpy().view(np.int32)[best_idx],
-            link_bias=shared_link27th_params_buf["bias"].to_numpy().view(np.int32)[best_idx],
+            link_multiplier=shared_link28th_params_buf["multiplier"].to_numpy().view(np.int32)[best_idx],
+            link_bias=shared_link28th_params_buf["bias"].to_numpy().view(np.int32)[best_idx],
             learn_rate=shared_learning_params_buf["learning_rate"].to_numpy().view(np.float16)[best_idx],
             learn_forget=shared_learning_params_buf["forget_rate"].to_numpy().view(np.float16)[best_idx],
             learn_threshold=shared_learning_params_buf["learning_threshold"].to_numpy().view(np.float16)[best_idx],
             learn_decay=shared_learning_params_buf["tag_decay"].to_numpy().view(np.float16)[best_idx],
-            light_in_fi=shared_inout_params_fi_buf["light_in_fi"].to_numpy().view(np.int32).reshape(Config.m, 3)[best_idx],
-            battery_in_fi=shared_inout_params_fi_buf["battery_in_fi"].to_numpy().view(np.int32).reshape(Config.m, 3)[best_idx],
-            gen_neg_out_fi=shared_inout_params_fi_buf["gen_neg_out_fi"].to_numpy().view(np.int32).reshape(Config.m, 3)[best_idx],
-            gen_pos_out_fi=shared_inout_params_fi_buf["gen_pos_out_fi"].to_numpy().view(np.int32).reshape(Config.m, 3)[best_idx],
+            in_ports_fi=shared_inout_params_fi_buf["in_ports_fi"].to_numpy().view(np.int32).reshape(Config.m, NUM_IN_PORTS, 3)[best_idx],
+            out_ports_fi=shared_inout_params_fi_buf["out_ports_fi"].to_numpy().view(np.int32).reshape(Config.m, NUM_OUT_PORTS, 3)[best_idx],
+            light_in_fi=shared_inout_params_fi_buf["in_ports_fi"].to_numpy().view(np.int32).reshape(Config.m, NUM_IN_PORTS, 3)[best_idx][0] if NUM_IN_PORTS >= 1 else np.array([0, 0, 0], dtype=np.int32),
+            battery_in_fi=shared_inout_params_fi_buf["in_ports_fi"].to_numpy().view(np.int32).reshape(Config.m, NUM_IN_PORTS, 3)[best_idx][1] if NUM_IN_PORTS >= 2 else np.array([0, 0, 0], dtype=np.int32),
+            gen_pos_out_fi=shared_inout_params_fi_buf["out_ports_fi"].to_numpy().view(np.int32).reshape(Config.m, NUM_OUT_PORTS, 3)[best_idx][0] if NUM_OUT_PORTS >= 1 else np.array([0, 0, 0], dtype=np.int32),
+            gen_neg_out_fi=shared_inout_params_fi_buf["out_ports_fi"].to_numpy().view(np.int32).reshape(Config.m, NUM_OUT_PORTS, 3)[best_idx][1] if NUM_OUT_PORTS >= 2 else np.array([0, 0, 0], dtype=np.int32),
         )
         print(f"  [★] 過去最高エリート（変異前・本物）を保存しました -> {save_path}")
 
