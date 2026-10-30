@@ -113,6 +113,12 @@ struct LearningParamsAll {
 #ifndef NUM_OUT_PORTS
 #define NUM_OUT_PORTS 2
 #endif
+#ifndef SPEED_GAIN
+#define SPEED_GAIN 0.05f
+#endif
+#ifndef ROTATE_GAIN
+#define ROTATE_GAIN 0.1f
+#endif
 
 struct InoutParams {
     int3 in_coords[NUM_IN_PORTS];
@@ -273,6 +279,8 @@ groupshared float my_energy_s; // 個体の現在エネルギー残量
 groupshared InoutParams inout_params_s;
 
 groupshared float2 my_pos_s;
+groupshared float my_angle_s;
+groupshared float2 my_obj_s;
 
 
 // =============================================================================
@@ -369,6 +377,11 @@ uint pcg_hash(uint input) {
     return (word >> 22u) ^ word;
 }
 
+half rand_half(uint input) {
+    uint h1 = pcg_hash(input);
+    return half(float(h1) / 4294967295.0);
+}
+
 half2 rand_half2(uint input) {
     uint h1 = pcg_hash(input);
     uint h2 = pcg_hash(h1 + 1u);
@@ -462,7 +475,7 @@ void reduce_neuromodulators(
 void update_solar_energy_and_sensors(uint inner_step) {
     float current_sunlight = saturate(sinpi(inner_step * (1.0 / SUN_CYCLE_PERIOD)));
     
-    // 出力スロット 0: gen_pos, 1: gen_neg
+    // 出力スロット 0: gen_pos, 1: gen_neg, 2: speed_out, 3: rotate_out
     half generator_power = 0.0h;
     if (NUM_OUT_PORTS >= 2) {
         generator_power = saturate(get_output_s(inout_params_s.out_coords[0]) - get_output_s(inout_params_s.out_coords[1]));
@@ -471,9 +484,19 @@ void update_solar_energy_and_sensors(uint inner_step) {
     }
 
     if (my_energy_s > 0.0f) {
+        my_angle_s += (float)get_output_s(inout_params_s.out_coords[3]) * ROTATE_GAIN;
+        float my_speed = (float)get_output_s(inout_params_s.out_coords[2]) * SPEED_GAIN;
+        my_pos_s += float2(cos(my_angle_s), sin(my_angle_s)) * my_speed;
+        my_pos_s = clamp(my_pos_s, -2.0, 2.0);
+
+        float2 diff = my_pos_s - my_obj_s;
+        float dist_dot = dot(diff, diff);
+
+        float energy_coefficient = 2.0 / (1.0 + 0.5 * dist_dot);
+
         my_energy_s -= METABOLIC_COST;
         my_energy_s -= float(abs(generator_power)) * GEN_COST_RATE;
-        my_energy_s += SOLAR_GAIN_RATE * abs(generator_power) * current_sunlight;
+        my_energy_s += SOLAR_GAIN_RATE * abs(generator_power) * current_sunlight * energy_coefficient;
         my_energy_s = saturate(my_energy_s);
     } else {
         my_energy_s = 0.0f;
@@ -523,6 +546,9 @@ void computeMain(
     if (groupIndex == 0) {
         my_energy_s = INITIAL_ENERGY;
         my_pos_s = float2(0.0, 0.0);
+        my_angle_s = 0.0;
+        float obj_rand = 2 * (float)rand_half(12277 * step + 67 * agent_id);
+        my_obj_s = float2(cospi(obj_rand), sinpi(obj_rand));
         int3 my_in_fi[NUM_IN_PORTS];
         [unroll]
         for (uint i = 0; i < NUM_IN_PORTS; ++i) {

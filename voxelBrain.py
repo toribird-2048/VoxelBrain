@@ -29,6 +29,8 @@ from sim_config import (
     GEN_COST_RATE,
     SOLAR_GAIN_RATE,
     SUN_CYCLE_PERIOD,
+    SPEED_GAIN,
+    ROTATE_GAIN,
 )
 
 
@@ -303,6 +305,8 @@ def build_kernel(device, filename: str):
             f"#define GEN_COST_RATE {GEN_COST_RATE}f\n"
             f"#define SOLAR_GAIN_RATE {SOLAR_GAIN_RATE}f\n"
             f"#define SUN_CYCLE_PERIOD {SUN_CYCLE_PERIOD}f\n"
+            f"#define SPEED_GAIN {SPEED_GAIN}f\n"
+            f"#define ROTATE_GAIN {ROTATE_GAIN}f\n"
         )
         source_code = defines + f.read()
     

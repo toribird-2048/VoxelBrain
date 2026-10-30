@@ -89,6 +89,10 @@ def load_elite_npz(npz_path: str):
         params["battery_in_fi"] = data["battery_in_fi"]
         params["gen_neg_out_fi"] = data["gen_neg_out_fi"]
         params["gen_pos_out_fi"] = data["gen_pos_out_fi"]
+    if "speed_out_fi" in data:
+        params["speed_out_fi"] = data["speed_out_fi"]
+    if "rotate_out_fi" in data:
+        params["rotate_out_fi"] = data["rotate_out_fi"]
 
     spec = {
         "dim": dim,

@@ -126,7 +126,7 @@ struct LearningParams {
 #define NUM_IN_PORTS 2
 #endif
 #ifndef NUM_OUT_PORTS
-#define NUM_OUT_PORTS 2
+#define NUM_OUT_PORTS 4
 #endif
 
 struct InoutParamsFiAll {

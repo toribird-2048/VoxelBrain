@@ -20,7 +20,7 @@ matplotlib.use("TkAgg")
 matplotlib.rcParams["font.sans-serif"] = ["Yu Gothic", "Meiryo", "MS Gothic", "DejaVu Sans"]
 matplotlib.rcParams["axes.unicode_minus"] = False
 from matplotlib.figure import Figure
-from matplotlib.patches import Rectangle
+from matplotlib.patches import Rectangle, Circle
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 # ==============================================================================
@@ -37,6 +37,8 @@ from sim_config import (
     GEN_COST_RATE,
     SOLAR_GAIN_RATE,
     SUN_CYCLE_PERIOD,
+    SPEED_GAIN,
+    ROTATE_GAIN,
 )
 
 STEPS_PER_FRAME = 1
@@ -53,16 +55,22 @@ def get_default_inout_fi(dim: int) -> dict[str, np.ndarray]:
         if NUM_IN_PORTS >= 2: in_defaults[1] = [2, 0, 0]
         if NUM_OUT_PORTS >= 1: out_defaults[0] = [5, 1, 0]
         if NUM_OUT_PORTS >= 2: out_defaults[1] = [5, 0, 0]
+        if NUM_OUT_PORTS >= 3: out_defaults[2] = [4, 1, 0]
+        if NUM_OUT_PORTS >= 4: out_defaults[3] = [4, 0, 0]
     elif dim == 2:
         if NUM_IN_PORTS >= 1: in_defaults[0] = [2, 3, 2]
         if NUM_IN_PORTS >= 2: in_defaults[1] = [2, 1, 2]
         if NUM_OUT_PORTS >= 1: out_defaults[0] = [1, 2, 1]
         if NUM_OUT_PORTS >= 2: out_defaults[1] = [0, 2, 1]
+        if NUM_OUT_PORTS >= 3: out_defaults[2] = [3, 2, 1]
+        if NUM_OUT_PORTS >= 4: out_defaults[3] = [2, 2, 1]
     else:
         if NUM_IN_PORTS >= 1: in_defaults[0] = [2, 5, 4]
         if NUM_IN_PORTS >= 2: in_defaults[1] = [2, 3, 4]
-        if NUM_OUT_PORTS >= 1: out_defaults[0] = [1, 2, 1]
-        if NUM_OUT_PORTS >= 2: out_defaults[1] = [0, 2, 1]
+        if NUM_OUT_PORTS >= 1: out_defaults[0] = [1, 4, 3]
+        if NUM_OUT_PORTS >= 2: out_defaults[1] = [0, 4, 3]
+        if NUM_OUT_PORTS >= 3: out_defaults[2] = [3, 4, 3]
+        if NUM_OUT_PORTS >= 4: out_defaults[3] = [2, 4, 3]
 
     res = {
         "in_ports_fi": in_defaults,
@@ -73,6 +81,8 @@ def get_default_inout_fi(dim: int) -> dict[str, np.ndarray]:
     if NUM_IN_PORTS >= 2: res["battery_in_fi"] = in_defaults[1]
     if NUM_OUT_PORTS >= 1: res["gen_pos_out_fi"] = out_defaults[0]
     if NUM_OUT_PORTS >= 2: res["gen_neg_out_fi"] = out_defaults[1]
+    if NUM_OUT_PORTS >= 3: res["speed_out_fi"] = out_defaults[2]
+    if NUM_OUT_PORTS >= 4: res["rotate_out_fi"] = out_defaults[3]
     return res
 
 
@@ -130,12 +140,14 @@ def get_special_coords_np2(dim: int, params: dict | None = None) -> dict[tuple[i
         out_fi = defaults_fi["out_ports_fi"].copy()
         if "gen_pos_out_fi" in params and NUM_OUT_PORTS >= 1: out_fi[0] = params["gen_pos_out_fi"]
         if "gen_neg_out_fi" in params and NUM_OUT_PORTS >= 2: out_fi[1] = params["gen_neg_out_fi"]
+        if "speed_out_fi" in params and NUM_OUT_PORTS >= 3: out_fi[2] = params["speed_out_fi"]
+        if "rotate_out_fi" in params and NUM_OUT_PORTS >= 4: out_fi[3] = params["rotate_out_fi"]
     else:
         out_fi = np.asarray(out_fi, dtype=np.int32).reshape(-1, 3)
 
     res: dict[tuple[int, int, int], list[str]] = {}
     in_names = ["☀️Sun入力", "⚡Energy入力"]
-    out_names = ["⚙️Gen+出力", "⚙️Gen-出力"]
+    out_names = ["⚙️Gen+出力", "⚙️Gen-出力", "🚀Speed出力", "🔄Rotate出力"]
 
     for i in range(min(len(in_fi), NUM_IN_PORTS)):
         coord = face_index_to_coord_in_p(in_fi[i], n)
@@ -316,6 +328,8 @@ def load_elite_npz(npz_path: str):
         out_arr = defaults_fi["out_ports_fi"].copy()
         if "gen_pos_out_fi" in data and NUM_OUT_PORTS >= 1: out_arr[0] = np.asarray(data["gen_pos_out_fi"], dtype=np.int32).reshape(3)
         if "gen_neg_out_fi" in data and NUM_OUT_PORTS >= 2: out_arr[1] = np.asarray(data["gen_neg_out_fi"], dtype=np.int32).reshape(3)
+        if "speed_out_fi" in data and NUM_OUT_PORTS >= 3: out_arr[2] = np.asarray(data["speed_out_fi"], dtype=np.int32).reshape(3)
+        if "rotate_out_fi" in data and NUM_OUT_PORTS >= 4: out_arr[3] = np.asarray(data["rotate_out_fi"], dtype=np.int32).reshape(3)
         params["out_ports_fi"] = out_arr
 
     # 後方互換キー
@@ -323,6 +337,8 @@ def load_elite_npz(npz_path: str):
     if NUM_IN_PORTS >= 2: params["battery_in_fi"] = params["in_ports_fi"][1]
     if NUM_OUT_PORTS >= 1: params["gen_pos_out_fi"] = params["out_ports_fi"][0]
     if NUM_OUT_PORTS >= 2: params["gen_neg_out_fi"] = params["out_ports_fi"][1]
+    if NUM_OUT_PORTS >= 3: params["speed_out_fi"] = params["out_ports_fi"][2]
+    if NUM_OUT_PORTS >= 4: params["rotate_out_fi"] = params["out_ports_fi"][3]
 
     spec = {"dim": dim, "n": n, "p": p, "total_n": total_n, "center": n // 2}
     return sig_pre, sig_post, dopamine_map, sleep_map, inhib, params, spec
@@ -376,6 +392,8 @@ class SolarBrainCPU:
         self.battery_in_p = self.in_coords_p[1] if len(self.in_coords_p) >= 2 else (0, 0, 0)
         self.gen_pos_out_p = self.out_coords_p[0] if len(self.out_coords_p) >= 1 else (1, 1, 1)
         self.gen_neg_out_p = self.out_coords_p[1] if len(self.out_coords_p) >= 2 else (1, 1, 1)
+        self.speed_out_p = self.out_coords_p[2] if len(self.out_coords_p) >= 3 else (1, 1, 1)
+        self.rotate_out_p = self.out_coords_p[3] if len(self.out_coords_p) >= 4 else (1, 1, 1)
 
         if not hasattr(self, "synapse_ko_mask") or self.synapse_ko_mask.shape != (self.TOTAL_N, 28):
             self.synapse_ko_mask = np.zeros((self.TOTAL_N, 28), dtype=bool)
@@ -467,12 +485,21 @@ class SolarBrainCPU:
         self.generator_power = 0.0
         self.net_delta_energy = 0.0
 
+        # reasoningSim.slang 準拠の身体性・移動パラメータ
+        self.pos = np.array([0.0, 0.0], dtype=np.float32)
+        self.angle = 0.0
+        self.obj_pos = np.array([0.0, 1.0], dtype=np.float32)
+        self.speed = 0.0
+        self.rotate = 0.0
+        self.energy_coeff = 1.0
+
         self.step_history = []
         self.sun_history = []
         self.gen_history = []
         self.energy_history = []
         self.dopamine_history = []
         self.sleep_history = []
+        self.pos_history = [self.pos.copy()]
 
     def step(self, inner_steps=1, enable_learning=0.0, enable_dopamine=0.0, enable_sleep=0.0, record_history=True):
         base_output = np.float16(self.params["base_output"])
@@ -568,17 +595,40 @@ class SolarBrainCPU:
 
                 self.generator_power = float(np.clip(gen_raw, 0.0, 1.0))
 
-                cost = float(np.float32(METABOLIC_COST) + np.float32(self.generator_power) * np.float32(GEN_COST_RATE))
-                gain = float(np.float32(SOLAR_GAIN_RATE) * np.float32(self.generator_power) * sun_f32)
-                self.net_delta_energy = gain - cost
+                # 出力スロット 3: rotate_out, スロット 2: speed_out (reasoningSim.slang と完全同期)
+                self.rotate = 0.0
+                self.speed = 0.0
+                if len(self.out_coords_p) >= 4:
+                    rz, ry, rx = self.out_coords_p[3]
+                    self.rotate = float(self.outputs_np2[rz, ry, rx])
+                if len(self.out_coords_p) >= 3:
+                    sz, sy, sx = self.out_coords_p[2]
+                    self.speed = float(self.outputs_np2[sz, sy, sx])
+
                 if self.energy > 0.0:
+                    self.angle += self.rotate * ROTATE_GAIN
+                    self.pos += np.array([np.cos(self.angle), np.sin(self.angle)], dtype=np.float32) * (self.speed * SPEED_GAIN)
+                    self.pos = np.clip(self.pos, -2.0, 2.0)
+
+                    diff = self.pos - self.obj_pos
+                    dist_dot = float(np.dot(diff, diff))
+                    self.energy_coeff = float(2.0 / (1.0 + 0.5 * dist_dot))
+
+                    cost = float(np.float32(METABOLIC_COST) + np.float32(self.generator_power) * np.float32(GEN_COST_RATE))
+                    gain = float(np.float32(SOLAR_GAIN_RATE) * np.float32(self.generator_power) * sun_f32 * np.float32(self.energy_coeff))
+                    self.net_delta_energy = gain - cost
+
                     e_f32 = np.float32(self.energy)
                     e_f32 = np.float32(e_f32 - np.float32(METABOLIC_COST))
                     e_f32 = np.float32(e_f32 - np.float32(self.generator_power) * np.float32(GEN_COST_RATE))
-                    e_f32 = np.float32(e_f32 + np.float32(SOLAR_GAIN_RATE) * np.float32(self.generator_power) * sun_f32)
+                    e_f32 = np.float32(e_f32 + np.float32(gain))
                     self.energy = float(np.clip(e_f32, 0.0, 1.0))
                 else:
                     self.energy = 0.0
+                    self.net_delta_energy = 0.0
+                    diff = self.pos - self.obj_pos
+                    dist_dot = float(np.dot(diff, diff))
+                    self.energy_coeff = float(2.0 / (1.0 + 0.5 * dist_dot))
 
                 # --- 感覚入力の書き込み（感覚セルがKOされていれば 0.0h） ---
                 # スロット 0: sunlight, 1: battery
@@ -603,6 +653,9 @@ class SolarBrainCPU:
                     self.energy_history.append(self.energy)
                     self.dopamine_history.append(self.dopamine_sum)
                     self.sleep_history.append(self.sleep_sum)
+                    if not hasattr(self, "pos_history"):
+                        self.pos_history = []
+                    self.pos_history.append(self.pos.copy())
 
                     if len(self.step_history) > HISTORY_LEN:
                         self.step_history.pop(0)
@@ -611,6 +664,8 @@ class SolarBrainCPU:
                         self.energy_history.pop(0)
                         self.dopamine_history.pop(0)
                         self.sleep_history.pop(0)
+                        if len(self.pos_history) > HISTORY_LEN:
+                            self.pos_history.pop(0)
 
                 self.inner_step_counter += 1
 
@@ -686,6 +741,9 @@ class IntegratedBrainStudio:
         self.inout_3d_drag_moved: bool = False
         self.inout_3d_hover_target: dict | None = None
         self.inout_3d_pick_targets: list[dict] = []
+
+        # グラフ表示ページ管理 (1: 個体位置・フィールドマップ, 2: ドーパミン・睡眠波形)
+        self.graph_page: int = 1
 
         # 初期データ準備
         self._init_blank_gene(dim=2)
@@ -1291,6 +1349,8 @@ class IntegratedBrainStudio:
         else:
             if slot == 0: return "⚙️ 発電+ (Gen+)"
             elif slot == 1: return "⚙️ 発電- (Gen-)"
+            elif slot == 2: return "🚀 速度 (Speed)"
+            elif slot == 3: return "🔄 旋回 (Rotate)"
             else: return f"📤 モーター Out[{slot}]"
 
     def _get_io_port_color(self, port_type: str, slot: int) -> str:
@@ -2151,6 +2211,8 @@ class IntegratedBrainStudio:
             ("GEN_COST_RATE", "発電コスト係数", GEN_COST_RATE),
             ("SOLAR_GAIN_RATE", "太陽光ゲイン係数", SOLAR_GAIN_RATE),
             ("SUN_CYCLE_PERIOD", "昼夜半周期(tick)", SUN_CYCLE_PERIOD),
+            ("SPEED_GAIN", "速度ゲイン(前進/後退)", SPEED_GAIN),
+            ("ROTATE_GAIN", "旋回速度ゲイン", ROTATE_GAIN),
         ]
         cfg_grid = ttk.Frame(grp_cfg)
         cfg_grid.pack(fill=tk.X, pady=2)
@@ -2289,7 +2351,7 @@ class IntegratedBrainStudio:
         for child in self.sim_frame.winfo_children():
             child.destroy()
 
-        # 上部リアルタイムHUDバー（Tkinterネイティブ描画のため 0.05ms で毎フレーム高速更新）
+        # 1. 上部リアルタイムHUDバー
         self.lbl_sim_hud = tk.Label(
             self.sim_frame,
             text="",
@@ -2303,6 +2365,44 @@ class IntegratedBrainStudio:
             relief=tk.FLAT,
         )
         self.lbl_sim_hud.pack(side=tk.TOP, fill=tk.X)
+
+        # 2. グラフ操作・表示モード切替バー (HUD文字列の長さに潰されない独立行配置)
+        graph_ctrl_bar = tk.Frame(self.sim_frame, bg="#20222e", padx=8, pady=3)
+        graph_ctrl_bar.pack(side=tk.TOP, fill=tk.X)
+
+        tk.Label(
+            graph_ctrl_bar,
+            text="📊 右上グラフ表示切替 [ショートカット: P]:",
+            bg="#20222e",
+            fg="#b0bec5",
+            font=("", 8, "bold"),
+        ).pack(side=tk.LEFT, padx=(2, 8))
+
+        self.btn_page_pos = tk.Button(
+            graph_ctrl_bar,
+            text="📍 Page 1: 個体位置・フィールドマップ (Position)",
+            font=("", 8, "bold"),
+            command=lambda: self.action_set_graph_page(1),
+            relief=tk.RAISED,
+            bd=1,
+            padx=10,
+            pady=2,
+            cursor="hand2",
+        )
+        self.btn_page_pos.pack(side=tk.LEFT, padx=3)
+
+        self.btn_page_signals = tk.Button(
+            graph_ctrl_bar,
+            text="🧪 Page 2: ドーパミン・睡眠波形 (Neuromodulators)",
+            font=("", 8, "bold"),
+            command=lambda: self.action_set_graph_page(2),
+            relief=tk.RAISED,
+            bd=1,
+            padx=10,
+            pady=2,
+            cursor="hand2",
+        )
+        self.btn_page_signals.pack(side=tk.LEFT, padx=3)
 
         self.fig = Figure(figsize=(9.5, 7.2), dpi=100)
         gs_main = self.fig.add_gridspec(2, 2, width_ratios=[1.2, 1.15], height_ratios=[1, 1.2])
@@ -2341,7 +2441,49 @@ class IntegratedBrainStudio:
             verticalalignment="top", bbox=dict(boxstyle="round", facecolor="white", alpha=0.88),
         )
 
-        # 右上: ドーパミン・スリープ波形
+        # 右上 (Page 1): 個体位置 ＆ 目標オブジェクト フィールドマップ (2D空間)
+        self.ax_pos = self.fig.add_subplot(gs_main[0, 1])
+        self.ax_pos.set_title("Agent Field & Target (Pos & Heading) [P1]", fontsize=8.5)
+        self.ax_pos.set_xlim(-2.25, 2.25)
+        self.ax_pos.set_ylim(-2.25, 2.25)
+        self.ax_pos.set_aspect("equal")
+        self.ax_pos.grid(True, linestyle="--", alpha=0.35)
+
+        # フィールド移動制限枠 [-2.0, 2.0]
+        field_rect = Rectangle((-2.0, -2.0), 4.0, 4.0, fill=False, edgecolor="#78909c", linestyle="--", linewidth=1.2, alpha=0.7)
+        self.ax_pos.add_patch(field_rect)
+        self.ax_pos.axhline(0, color="#546e7a", linestyle=":", alpha=0.35, linewidth=0.8)
+        self.ax_pos.axvline(0, color="#546e7a", linestyle=":", alpha=0.35, linewidth=0.8)
+
+        # ターゲットオブジェクト (★) & 接近ボーナス目安円
+        target_init = getattr(self.brain, "obj_pos", np.array([0.0, 1.0], dtype=np.float32))
+        self.target_scatter = self.ax_pos.scatter(
+            [target_init[0]], [target_init[1]],
+            color="#ffd700", s=130, marker="*", edgecolor="#e65100", linewidth=1.5, zorder=6, label="Target (my_obj)"
+        )
+        self.target_bonus_circle = Circle(
+            (float(target_init[0]), float(target_init[1])), 1.0,
+            fill=True, facecolor="#ffd700", alpha=0.08, edgecolor="#ffb300", linestyle=":", linewidth=1.0, zorder=3
+        )
+        self.ax_pos.add_patch(self.target_bonus_circle)
+
+        # 移動軌跡 (直近の履歴)
+        self.line_traj, = self.ax_pos.plot([], [], color="#00e5ff", linewidth=1.8, alpha=0.75, label="Trajectory", zorder=4)
+
+        # 個体現在位置 (●) ＆ 向きベクトル線
+        self.agent_scatter = self.ax_pos.scatter(
+            [0.0], [0.0],
+            color="#ff1744", s=100, marker="o", edgecolor="white", linewidth=1.5, zorder=7, label="Agent (my_pos)"
+        )
+        self.line_agent_dir, = self.ax_pos.plot([], [], color="#ff5252", linewidth=2.8, zorder=8)
+
+        self.txt_pos_hud = self.ax_pos.text(
+            0.03, 0.04, "", transform=self.ax_pos.transAxes, fontsize=7.5,
+            verticalalignment="bottom", bbox=dict(boxstyle="round,pad=0.25", facecolor="#10121a", edgecolor="#555", alpha=0.85)
+        )
+        self.ax_pos.legend(loc="upper right", fontsize=7.2, framealpha=0.75)
+
+        # 右上 (Page 2): ドーパミン・スリープ波形
         self.ax_signals = self.fig.add_subplot(gs_main[0, 1])
         self.line_dopamine, = self.ax_signals.plot([], [], label="Dopamine Sum", color="darkorange", linewidth=2)
         self.line_sleep, = self.ax_signals.plot([], [], label="Sleep Sum", color="purple", linewidth=1.5)
@@ -2349,6 +2491,11 @@ class IntegratedBrainStudio:
         self.ax_signals.set_ylim(0, 1.5)
         self.ax_signals.legend(loc="upper right", fontsize=8)
         self.ax_signals.grid(True, alpha=0.3)
+
+        # ページ初期表示の反映
+        self.ax_pos.set_visible(self.graph_page == 1)
+        self.ax_signals.set_visible(self.graph_page == 2)
+        self._update_graph_page_button_styles()
 
         # 右下: 脳の全Zスライス表示 (内部 z=0 .. N-1, 外周込 P_z=1 .. N)
         N = self.N
@@ -2401,6 +2548,46 @@ class IntegratedBrainStudio:
         tk_w.bind("<Configure>", self._on_mpl_canvas_configure)
         self.mpl_canvas.mpl_connect("button_press_event", self._on_mpl_slice_click)
 
+    def _update_graph_page_button_styles(self):
+        """右上グラフ切替ボタンの見た目（アクティブ状態）を更新"""
+        if not hasattr(self, "btn_page_pos") or not hasattr(self, "btn_page_signals"):
+            return
+        if self.graph_page == 1:
+            self.btn_page_pos.config(
+                bg="#00b0ff", fg="#000000", activebackground="#40c4ff",
+                relief=tk.SUNKEN, font=("", 8, "bold")
+            )
+            self.btn_page_signals.config(
+                bg="#2e3240", fg="#90a4ae", activebackground="#3d4254",
+                relief=tk.RAISED, font=("", 8)
+            )
+        else:
+            self.btn_page_pos.config(
+                bg="#2e3240", fg="#90a4ae", activebackground="#3d4254",
+                relief=tk.RAISED, font=("", 8)
+            )
+            self.btn_page_signals.config(
+                bg="#d500f9", fg="#ffffff", activebackground="#e040fb",
+                relief=tk.SUNKEN, font=("", 8, "bold")
+            )
+
+    def action_set_graph_page(self, page: int):
+        """右上グラフの表示ページを指定 (1: 個体位置マップ / 2: ドパミン波形)"""
+        self.graph_page = int(page)
+        if hasattr(self, "ax_pos") and hasattr(self, "ax_signals"):
+            self.ax_pos.set_visible(self.graph_page == 1)
+            self.ax_signals.set_visible(self.graph_page == 2)
+            self._mpl_bg = None
+            self._update_graph_page_button_styles()
+            self._render_matplotlib_state(force_full=True)
+            if hasattr(self, "mpl_canvas"):
+                self.mpl_canvas.draw_idle()
+
+    def action_toggle_graph_page(self):
+        """P キーまたはボタンで右上グラフのページをトグル切り替え"""
+        new_page = 2 if getattr(self, "graph_page", 1) == 1 else 1
+        self.action_set_graph_page(new_page)
+
     def _on_mpl_canvas_configure(self, event):
         new_size = (event.width, event.height)
         if new_size != self._last_canvas_size and event.width > 50 and event.height > 50:
@@ -2416,9 +2603,20 @@ class IntegratedBrainStudio:
             self.line_gen,
             self.line_energy,
             self.info_text,
-            self.line_dopamine,
-            self.line_sleep,
         ]
+        if hasattr(self, "ax_pos") and self.ax_pos.get_visible():
+            dyn_artists.extend([
+                self.target_scatter,
+                self.line_traj,
+                self.agent_scatter,
+                self.line_agent_dir,
+                self.txt_pos_hud,
+            ])
+        if hasattr(self, "ax_signals") and self.ax_signals.get_visible():
+            dyn_artists.extend([
+                self.line_dopamine,
+                self.line_sleep,
+            ])
         for a in dyn_artists:
             a.set_visible(False)
         self.mpl_canvas.draw()
@@ -2454,6 +2652,11 @@ class IntegratedBrainStudio:
     def _render_matplotlib_state(self, force_full: bool = False):
         steps = self.brain.step_history
         if not steps:
+            # 起動直後やリセット直後（step_historyが空）でも、背景や初期オブジェクトを確実に描画
+            if force_full or (self._mpl_bg is None):
+                self._cache_mpl_backgrounds()
+            if hasattr(self, "mpl_canvas"):
+                self.mpl_canvas.draw_idle()
             return
 
         # X軸の範囲更新を毎ステップではなく50ステップ単位のスライドにして軸目盛り再計算コストを激減させる
@@ -2494,40 +2697,74 @@ class IntegratedBrainStudio:
         mean_out = float(np.mean(np.abs(internal_outputs)))
         mean_r = float(np.mean(self.brain.R))
 
+        dist_to_obj = float(np.linalg.norm(self.brain.pos - self.brain.obj_pos))
         hud_line1 = (
             f"File: {fname} ({self.N}³) | KO:{ko_count} SynCut:{syn_cut_count} | {state_str} | {flags_str}"
         )
         hud_line2 = (
             f"Step:{self.brain.inner_step_counter:5d} {day_night}(Sun:{self.brain.current_sunlight:.2f}) | "
-            f"Energy:{self.brain.energy:.4f}({self.brain.energy - INITIAL_ENERGY:+.4f}) Gen:{self.brain.generator_power:.3f} | "
+            f"Energy:{self.brain.energy:.4f}({self.brain.energy - INITIAL_ENERGY:+.4f}) Gen:{self.brain.generator_power:.3f} (GainCoeff:{self.brain.energy_coeff:.2f}x) | "
             f"Mean|Out|:{mean_out:.3f} R:{mean_r:.3f} Flick:{self.brain.flicker_rate:.1%}"
         )
+        hud_line3 = (
+            f"🚀Spd:{self.brain.speed * SPEED_GAIN:+.3f}(out:{self.brain.speed:+.2f}) 🔄Rot:{self.brain.rotate * ROTATE_GAIN:+.3f}(out:{self.brain.rotate:+.2f}) | "
+            f"Pos:({self.brain.pos[0]:+.2f}, {self.brain.pos[1]:+.2f}) Ang:{math.degrees(self.brain.angle) % 360:5.1f}° | "
+            f"Target:({self.brain.obj_pos[0]:+.2f}, {self.brain.obj_pos[1]:+.2f}) Dist:{dist_to_obj:.2f}"
+        )
         if hasattr(self, "lbl_sim_hud"):
-            self.lbl_sim_hud.config(text=f"{hud_line1}\n{hud_line2}")
+            self.lbl_sim_hud.config(text=f"{hud_line1}\n{hud_line2}\n{hud_line3}")
 
         if self.paused or self.is_recording_gif or force_full:
             self.info_text.set_text(
                 f"File: {fname} ({self.N}x{self.N}x{self.N}) | KO: {ko_count} | SynCut: {syn_cut_count}\n"
                 f"Status: {state_str} | {flags_str}\n"
                 f"Step: {self.brain.inner_step_counter:4d} | {day_night} (Sun: {self.brain.current_sunlight:.2f})\n"
-                f"Energy: {self.brain.energy:.4f} ({self.brain.energy - INITIAL_ENERGY:+.4f})\n"
-                f"Generator: {self.brain.generator_power:.3f} | Net: {self.brain.net_delta_energy:+.5f}\n"
+                f"Energy: {self.brain.energy:.4f} ({self.brain.energy - INITIAL_ENERGY:+.4f}) | Gen: {self.brain.generator_power:.3f} (Coeff: {self.brain.energy_coeff:.2f}x)\n"
+                f"Speed: {self.brain.speed * SPEED_GAIN:+.3f} (raw:{self.brain.speed:+.2f}) | Rotate: {self.brain.rotate * ROTATE_GAIN:+.3f} (raw:{self.brain.rotate:+.2f}) | Dist: {dist_to_obj:.2f}\n"
                 f"Mean |Output|: {mean_out:.4f} | Flicker: {self.brain.flicker_rate:.1%} | R: {mean_r:.3f}"
             )
 
-        if flags_str != self._cur_flags_str:
-            self._cur_flags_str = flags_str
-            self.ax_signals.set_title(f"Neuromodulators [{flags_str}]", fontsize=9.5)
-            need_bg_rebuild = True
+        # 右上グラフの更新 (Page 1: 個体位置マップ / Page 2: ドーパミン・スリープ波形)
+        if self.graph_page == 1 and hasattr(self, "ax_pos"):
+            obj_pos = self.brain.obj_pos
+            self.target_scatter.set_offsets([obj_pos])
+            if hasattr(self, "target_bonus_circle"):
+                self.target_bonus_circle.center = (float(obj_pos[0]), float(obj_pos[1]))
 
-        self.line_dopamine.set_data(steps, self.brain.dopamine_history)
-        self.line_sleep.set_data(steps, self.brain.sleep_history)
-        max_mod = max(max(self.brain.dopamine_history), max(self.brain.sleep_history), 0.5)
-        target_sig_ymax = float(np.ceil(max_mod * 1.15 * 4.0) / 4.0)
-        if abs(target_sig_ymax - self._cur_sig_ymax) > 0.05:
-            self._cur_sig_ymax = target_sig_ymax
-            self.ax_signals.set_ylim(0, target_sig_ymax)
-            need_bg_rebuild = True
+            # 軌跡更新
+            if hasattr(self.brain, "pos_history") and self.brain.pos_history:
+                traj_pts = np.asarray(self.brain.pos_history, dtype=np.float32)
+                self.line_traj.set_data(traj_pts[:, 0], traj_pts[:, 1])
+            else:
+                self.line_traj.set_data([self.brain.pos[0]], [self.brain.pos[1]])
+
+            # エージェント現在位置 & 向きベクトル (0.35長)
+            self.agent_scatter.set_offsets([self.brain.pos])
+            dir_len = 0.35
+            hx = float(self.brain.pos[0] + np.cos(self.brain.angle) * dir_len)
+            hy = float(self.brain.pos[1] + np.sin(self.brain.angle) * dir_len)
+            self.line_agent_dir.set_data([self.brain.pos[0], hx], [self.brain.pos[1], hy])
+
+            # グラフ内 HUD 表示
+            self.txt_pos_hud.set_text(
+                f"Agent: ({self.brain.pos[0]:+.2f}, {self.brain.pos[1]:+.2f}) Ang:{math.degrees(self.brain.angle) % 360:3.0f}°\n"
+                f"Target: ({obj_pos[0]:+.2f}, {obj_pos[1]:+.2f}) Dist:{dist_to_obj:.2f}\n"
+                f"GainCoeff: {self.brain.energy_coeff:.2f}x | Spd: {self.brain.speed * SPEED_GAIN:+.3f} (raw:{self.brain.speed:+.2f})"
+            )
+        elif self.graph_page == 2 and hasattr(self, "ax_signals"):
+            if flags_str != self._cur_flags_str:
+                self._cur_flags_str = flags_str
+                self.ax_signals.set_title(f"Neuromodulators [{flags_str}] [P2]", fontsize=9.5)
+                need_bg_rebuild = True
+
+            self.line_dopamine.set_data(steps, self.brain.dopamine_history)
+            self.line_sleep.set_data(steps, self.brain.sleep_history)
+            max_mod = max(max(self.brain.dopamine_history), max(self.brain.sleep_history), 0.5)
+            target_sig_ymax = float(np.ceil(max_mod * 1.15 * 4.0) / 4.0)
+            if abs(target_sig_ymax - self._cur_sig_ymax) > 0.05:
+                self._cur_sig_ymax = target_sig_ymax
+                self.ax_signals.set_ylim(0, target_sig_ymax)
+                need_bg_rebuild = True
 
         v_limit = max(float(np.max(np.abs(internal_outputs))), 0.05)
         is_sel_internal = (1 <= self.sel_z <= self.N) and (1 <= self.sel_y <= self.N) and (1 <= self.sel_x <= self.N)
@@ -2564,8 +2801,15 @@ class IntegratedBrainStudio:
                 self.ax_energy.draw_artist(self.line_energy)
                 if self.paused or self.is_recording_gif or force_full:
                     self.ax_energy.draw_artist(self.info_text)
-                self.ax_signals.draw_artist(self.line_dopamine)
-                self.ax_signals.draw_artist(self.line_sleep)
+                if self.graph_page == 1 and hasattr(self, "ax_pos"):
+                    self.ax_pos.draw_artist(self.target_scatter)
+                    self.ax_pos.draw_artist(self.line_traj)
+                    self.ax_pos.draw_artist(self.agent_scatter)
+                    self.ax_pos.draw_artist(self.line_agent_dir)
+                    self.ax_pos.draw_artist(self.txt_pos_hud)
+                elif self.graph_page == 2 and hasattr(self, "ax_signals"):
+                    self.ax_signals.draw_artist(self.line_dopamine)
+                    self.ax_signals.draw_artist(self.line_sleep)
                 for iz, ax_s in enumerate(self.slice_axes_list):
                     ax_s.draw_artist(self.slice_ims[iz])
                     if self.slice_sel_rects[iz].get_visible():
@@ -3221,7 +3465,9 @@ class IntegratedBrainStudio:
         elif key == "w":
             self.action_set_wire_src()
 
-        # --- 7. 3D配線マップ操作 (F: 視点リセット, [, ]: ポート切り替え) ---
+        # --- 7. 3D配線マップ ＆ グラフ表示切替 (P: グラフP1/P2切替, F: 視点リセット, [, ]: ポート切り替え) ---
+        elif key == "p":
+            self.action_toggle_graph_page()
         elif key == "f":
             self.action_reset_inout_3d_view()
         elif key == "bracketleft":
@@ -3274,6 +3520,7 @@ class IntegratedBrainStudio:
             ("シミュレーション", "R", "シミュレーション波形・エネルギーのリセット"),
             ("シミュレーション", "G", "GIF/MP4 録画の開始 / 停止・保存"),
             # 画面・タブ切り替え
+            ("画面・タブ切替", "P", "右上グラフ表示切替 (P1: 個体位置マップ ⇄ P2: ドパミン波形)"),
             ("画面・タブ切替", "1 または F1", "【大タブ1】 📊 波形グラフ ＆ 🧠 ボクセル脳マップ に切替"),
             ("画面・タブ切替", "2 または F2", "【大タブ2】 🛠️ 選択セル～統合SimConfig に切替"),
             ("画面・タブ切替", "Ctrl + 1", "大タブ2: 🔍 選択セル・配線 タブへジャンプ"),
@@ -4156,7 +4403,7 @@ class IntegratedBrainStudio:
                 self.sim_params["in_ports_fi"] = params["in_ports_fi"]
             if "out_ports_fi" in params:
                 self.sim_params["out_ports_fi"] = params["out_ports_fi"]
-            for k in ("light_in_fi", "battery_in_fi", "gen_neg_out_fi", "gen_pos_out_fi"):
+            for k in ("light_in_fi", "battery_in_fi", "gen_neg_out_fi", "gen_pos_out_fi", "speed_out_fi", "rotate_out_fi"):
                 if k in params:
                     self.sim_params[k] = params[k]
 
@@ -4217,6 +4464,8 @@ class IntegratedBrainStudio:
             battery_in_fi=np.asarray(self.sim_params.get("in_ports_fi", get_default_inout_fi(self.dim)["in_ports_fi"])[1] if NUM_IN_PORTS >= 2 else [0, 0, 0], dtype=np.int32),
             gen_pos_out_fi=np.asarray(self.sim_params.get("out_ports_fi", get_default_inout_fi(self.dim)["out_ports_fi"])[0] if NUM_OUT_PORTS >= 1 else [0, 0, 0], dtype=np.int32),
             gen_neg_out_fi=np.asarray(self.sim_params.get("out_ports_fi", get_default_inout_fi(self.dim)["out_ports_fi"])[1] if NUM_OUT_PORTS >= 2 else [0, 0, 0], dtype=np.int32),
+            speed_out_fi=np.asarray(self.sim_params.get("out_ports_fi", get_default_inout_fi(self.dim)["out_ports_fi"])[2] if NUM_OUT_PORTS >= 3 else [0, 0, 0], dtype=np.int32),
+            rotate_out_fi=np.asarray(self.sim_params.get("out_ports_fi", get_default_inout_fi(self.dim)["out_ports_fi"])[3] if NUM_OUT_PORTS >= 4 else [0, 0, 0], dtype=np.int32),
         )
         self.current_file_path = save_path
         self.last_opened_dir = os.path.dirname(os.path.abspath(save_path))
@@ -4253,7 +4502,7 @@ class IntegratedBrainStudio:
         """UI上の sim_config 設定を sim_config.py に書き出し、OneSim 内部の実行時定数にも即時反映する"""
         global ENABLE_LEARNING, ENABLE_DOPAMINE, ENABLE_SLEEP
         global NUM_IN_PORTS, NUM_OUT_PORTS
-        global INITIAL_ENERGY, METABOLIC_COST, GEN_COST_RATE, SOLAR_GAIN_RATE, SUN_CYCLE_PERIOD
+        global INITIAL_ENERGY, METABOLIC_COST, GEN_COST_RATE, SOLAR_GAIN_RATE, SUN_CYCLE_PERIOD, SPEED_GAIN, ROTATE_GAIN
 
         try:
             en_learn = float(np.clip(float(self.cfg_flag_str_vars["ENABLE_LEARNING"].get()), 0.0, 1.0))
@@ -4267,6 +4516,8 @@ class IntegratedBrainStudio:
             gen_c = float(self.cfg_num_vars["GEN_COST_RATE"].get())
             sol_g = float(self.cfg_num_vars["SOLAR_GAIN_RATE"].get())
             sun_p = max(1.0, float(self.cfg_num_vars["SUN_CYCLE_PERIOD"].get()))
+            spd_g = float(self.cfg_num_vars["SPEED_GAIN"].get())
+            rot_g = float(self.cfg_num_vars["ROTATE_GAIN"].get())
         except ValueError as e:
             messagebox.showerror("入力エラー", f"sim_config の数値形式が正しくありません:\n{e}")
             return
@@ -4281,6 +4532,8 @@ class IntegratedBrainStudio:
         GEN_COST_RATE = gen_c
         SOLAR_GAIN_RATE = sol_g
         SUN_CYCLE_PERIOD = sun_p
+        SPEED_GAIN = spd_g
+        ROTATE_GAIN = rot_g
 
         self._updating_ui_vars = True
         try:
@@ -4325,6 +4578,12 @@ class IntegratedBrainStudio:
             f"GEN_COST_RATE     = {gen_c}    # 発電稼働コスト係数\n"
             f"SOLAR_GAIN_RATE   = {sol_g}    # 太陽光発電ゲイン係数\n"
             f"SUN_CYCLE_PERIOD  = {sun_p}     # 昼夜サイクルの半周期 (tick数)\n"
+            f"\n"
+            f"# ==============================================================================\n"
+            f"# 個体運動パラメータ (身体性・移動ゲイン)\n"
+            f"# ==============================================================================\n"
+            f"SPEED_GAIN        = {spd_g}    # 前進/後退速度ゲイン (my_speed = speed_out * SPEED_GAIN)\n"
+            f"ROTATE_GAIN       = {rot_g}     # 旋回速度ゲイン (my_angle += rotate_out * ROTATE_GAIN)\n"
         )
         cfg_path = os.path.abspath("sim_config.py")
         with open(cfg_path, "w", encoding="utf-8") as f:
@@ -4728,6 +4987,8 @@ class IntegratedBrainStudio:
             battery_in_fi=np.asarray(self.sim_params.get("in_ports_fi", get_default_inout_fi(self.dim)["in_ports_fi"])[1] if NUM_IN_PORTS >= 2 else [0, 0, 0], dtype=np.int32),
             gen_pos_out_fi=np.asarray(self.sim_params.get("out_ports_fi", get_default_inout_fi(self.dim)["out_ports_fi"])[0] if NUM_OUT_PORTS >= 1 else [0, 0, 0], dtype=np.int32),
             gen_neg_out_fi=np.asarray(self.sim_params.get("out_ports_fi", get_default_inout_fi(self.dim)["out_ports_fi"])[1] if NUM_OUT_PORTS >= 2 else [0, 0, 0], dtype=np.int32),
+            speed_out_fi=np.asarray(self.sim_params.get("out_ports_fi", get_default_inout_fi(self.dim)["out_ports_fi"])[2] if NUM_OUT_PORTS >= 3 else [0, 0, 0], dtype=np.int32),
+            rotate_out_fi=np.asarray(self.sim_params.get("out_ports_fi", get_default_inout_fi(self.dim)["out_ports_fi"])[3] if NUM_OUT_PORTS >= 4 else [0, 0, 0], dtype=np.int32),
         )
 
         env = self._build_analyze_env()
