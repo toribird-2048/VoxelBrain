@@ -48,8 +48,16 @@ def load_elite_npz(npz_path: str):
     """
     data = np.load(npz_path)
 
-    # ニューロン総数から N と DIM を自動計算
-    total_n = int(data["dopamine"].size)
+    if "neuromod" in data:
+        neuromod_map = data["neuromod"].astype(np.float32).reshape(-1, 4)
+        total_n = neuromod_map.shape[0]
+        dopamine_map = neuromod_map[:, 0]
+        sleep_map = neuromod_map[:, 1]
+    else:
+        total_n = int(data["dopamine"].size) if "dopamine" in data else 64
+        dopamine_map = data["dopamine"].astype(np.float32).reshape(total_n) if "dopamine" in data else np.zeros(total_n, dtype=np.float32)
+        sleep_map = data["sleep"].astype(np.float32).reshape(total_n) if "sleep" in data else np.zeros(total_n, dtype=np.float32)
+
     n = int(round(total_n ** (1.0 / 3.0)))
     dim = int(np.log2(n))
     p = n + 2
@@ -58,8 +66,6 @@ def load_elite_npz(npz_path: str):
 
     sig_pre = data["sig_pre"].astype(np.float32).reshape((p, p, p, 4))
     sig_post = data["sig_post"].astype(np.float32).reshape((p, p, p, 4))
-    dopamine_map = data["dopamine"].astype(np.float32).reshape(total_n)
-    sleep_map = data["sleep"].astype(np.float32).reshape(total_n)
 
     # uint32ビットパッキングされた inhib を [-1.0, 1.0] に展開
     packed_inhib = data["inhib"].view(np.uint32)

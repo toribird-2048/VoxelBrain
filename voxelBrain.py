@@ -19,9 +19,6 @@ except Exception:
     pass
 
 from sim_config import (
-    ENABLE_LEARNING,
-    ENABLE_DOPAMINE,
-    ENABLE_SLEEP,
     NUM_IN_PORTS,
     NUM_OUT_PORTS,
     INITIAL_ENERGY,
@@ -159,12 +156,10 @@ class Config:
     class Seed:
         sigpre: int = 1
         sigpost: int = 2
-        dop: int = 3
-        sleep: int = 4
+        neuromod: int = 3
         inhib: int = 5
         link: int = 6
         res: int = 7
-        learn: int = 8
         inout: int = 9
 
 
@@ -173,13 +168,6 @@ class SigRange:
     biases = R4(float, -0.5, 0.5)
     freqs = R4(float, 0.0, 1.0)
     cutoffs = R4(float, 0.0, 0.95)
-
-
-class DopSleepRange:
-    seed = R(int, 0, 1<<20)
-    bias = R(float, -0.5, 0.5)
-    freq = R(float, 0.0, 1.0)
-    cutoff = R(float, 0.0, 0.95)
 
 
 class InhibRange:
@@ -200,13 +188,6 @@ class NeuronResourceRange:
     base_output = R(float, 0.001, 0.1, log=True)
     beta = R(float, 15.0, 30.0)
     k_refill = R(float, 0.02, 0.3)
-
-
-class LearningRange:
-    learning_rate = R(float, 0.0, 1.0)
-    forget_rate = R(float, 0.0, 1.0)
-    learning_threshold = R(float, 0.0, 1.0)
-    tag_decay = R(float, 0.7, 0.99)
 
 
 class InoutFiRange:
@@ -246,12 +227,10 @@ def generate(cls, seed: int) -> dict[str, np.ndarray]:
 class GenesisParams:
     signature_pre_params: dict[str, np.ndarray]
     signature_post_params: dict[str, np.ndarray]
-    dopamine_params: dict[str, np.ndarray]
-    sleep_params: dict[str, np.ndarray]
+    neuromod_params: dict[str, np.ndarray]
     inhib_params: dict[str, np.ndarray]
     resource_params: dict[str, np.ndarray]
     link28th_params: dict[str, np.ndarray]
-    learning_params: dict[str, np.ndarray]
     inout_params_fi: dict[str, np.ndarray]
 
     @classmethod
@@ -259,12 +238,10 @@ class GenesisParams:
         return cls(
             signature_pre_params=generate(SigRange, Config.Seed.sigpre),
             signature_post_params=generate(SigRange, Config.Seed.sigpost),
-            dopamine_params=generate(DopSleepRange, Config.Seed.dop),
-            sleep_params=generate(DopSleepRange, Config.Seed.sleep),
+            neuromod_params=generate(SigRange, Config.Seed.neuromod),
             inhib_params=generate(InhibRange, Config.Seed.inhib),
             resource_params=generate(NeuronResourceRange, Config.Seed.res),
             link28th_params=generate(Link28thRange, Config.Seed.link),
-            learning_params=generate(LearningRange, Config.Seed.learn),
             inout_params_fi=InoutFiRange.generate(Config.m, Config.Seed.inout),
         )
 
@@ -294,12 +271,6 @@ def build_kernel(device, filename: str):
             f"#define DIM {Config.dim}\n"
             f"#define NUM_IN_PORTS {NUM_IN_PORTS}\n"
             f"#define NUM_OUT_PORTS {NUM_OUT_PORTS}\n"
-            f"#define USE_LEARNING {1 if float(ENABLE_LEARNING) > 0.0 else 0}\n"
-            f"#define ENABLE_LEARNING {float(ENABLE_LEARNING)}h\n"
-            f"#define USE_DOPAMINE {1 if float(ENABLE_DOPAMINE) > 0.0 else 0}\n"
-            f"#define ENABLE_DOPAMINE {float(ENABLE_DOPAMINE)}h\n"
-            f"#define USE_SLEEP {1 if float(ENABLE_SLEEP) > 0.0 else 0}\n"
-            f"#define ENABLE_SLEEP {float(ENABLE_SLEEP)}h\n"
             f"#define INITIAL_ENERGY {INITIAL_ENERGY}f\n"
             f"#define METABOLIC_COST {METABOLIC_COST}f\n"
             f"#define GEN_COST_RATE {GEN_COST_RATE}f\n"
@@ -335,32 +306,39 @@ def create_buf(device: spy.Device, params: np.ndarray | dict[str, np.ndarray]):
 
 def create_mutation_params_buffers(num_groups: int, seed: int = None):
     rng = np.random.default_rng(seed)
-
-    # 旧 threshold (x) を 1 - x の変異確率 (rate) として設定
-    sig_pre_rate  = rng.uniform(0.05, 0.30, size=(num_groups, 4)).astype(np.float16)
-    sig_post_rate = rng.uniform(0.05, 0.30, size=(num_groups, 4)).astype(np.float16)
-    
-    other_rate = np.zeros((num_groups, 4), dtype=np.float16)
-    other_rate[:, 0] = rng.uniform(0.10, 0.40, size=num_groups)  # dopamine
-    other_rate[:, 1] = rng.uniform(0.10, 0.40, size=num_groups)  # sleep
-    other_rate[:, 2] = rng.uniform(0.02, 0.20, size=num_groups)  # inhib (反転確率)
-
-    steps = rng.integers(0, 6, size=(num_groups, 4), dtype=np.uint32)
-
     max_safe_diff = 1.0 / 27.0
-    sig_pre_diff  = rng.uniform(0.005, max_safe_diff, size=(num_groups, 4)).astype(np.float16)
-    sig_post_diff = rng.uniform(0.005, max_safe_diff, size=(num_groups, 4)).astype(np.float16)
-    
-    other_diff = np.zeros((num_groups, 4), dtype=np.float16)
-    other_diff[:, 0] = rng.uniform(0.005, max_safe_diff, size=num_groups)
-    other_diff[:, 1] = rng.uniform(0.005, max_safe_diff, size=num_groups)
 
-    sig_pre_max  = rng.uniform(0.01, 0.1, size=(num_groups, 4)).astype(np.float16)
-    sig_post_max = rng.uniform(0.01, 0.1, size=(num_groups, 4)).astype(np.float16)
-    
-    other_max = np.zeros((num_groups, 4), dtype=np.float16)
-    other_max[:, 0] = rng.uniform(0.01, 0.1, size=num_groups)
-    other_max[:, 1] = rng.uniform(0.01, 0.1, size=num_groups)
+    sig_mutation_params = {
+        "rate": rng.uniform(0.05, 0.30, size=(num_groups, 4)).astype(np.float16),
+        "steps": rng.integers(0, 6, size=num_groups, dtype=np.uint32),
+        "max": rng.uniform(0.01, 0.1, size=(num_groups, 4)).astype(np.float16),
+        "diff": rng.uniform(0.005, max_safe_diff, size=(num_groups, 4)).astype(np.float16),
+    }
+
+    neuromod_map_mutation_params = {
+        "rate": rng.uniform(0.05, 0.30, size=(num_groups, 4)).astype(np.float16),
+        "steps": rng.integers(0, 6, size=num_groups, dtype=np.uint32),
+        "max": rng.uniform(0.01, 0.1, size=(num_groups, 4)).astype(np.float16),
+        "diff": rng.uniform(0.005, max_safe_diff, size=(num_groups, 4)).astype(np.float16),
+    }
+
+    neuromod_params_rate = np.zeros((num_groups, 4), dtype=np.float16)
+    neuromod_params_rate[:, 0] = rng.uniform(0.02, 0.15, size=num_groups)  # rel_matrix
+    neuromod_params_rate[:, 1] = rng.uniform(0.02, 0.15, size=num_groups)  # weight_reaction
+    neuromod_params_rate[:, 2] = rng.uniform(0.02, 0.15, size=num_groups)  # diff
+    neuromod_params_rate[:, 3] = np.float16(0.0)  # unused
+    neuromod_params_mutation_params = {
+        "rate": neuromod_params_rate,
+    }
+
+    iicu_rate = np.zeros((num_groups, 4), dtype=np.float16)
+    iicu_rate[:, 0] = rng.uniform(0.02, 0.20, size=num_groups)  # inhib
+    iicu_rate[:, 1] = rng.uniform(0.02, 0.15, size=num_groups)  # inout
+    iicu_rate[:, 2] = rng.uniform(0.02, 0.15, size=num_groups)  # copy
+    iicu_rate[:, 3] = np.float16(0.0)  # unused
+    iicu_mutation_params = {
+        "iicu_rate": iicu_rate,
+    }
 
     resource_rate = np.zeros((num_groups, 4), dtype=np.float16)
     resource_rate[:, 0] = rng.uniform(0.02, 0.15, size=num_groups)
@@ -368,31 +346,43 @@ def create_mutation_params_buffers(num_groups: int, seed: int = None):
     resource_rate[:, 2] = rng.uniform(0.02, 0.15, size=num_groups)
 
     link28th_rate = rng.uniform(0.02, 0.15, size=(num_groups, 2)).astype(np.float16)
-
-    learning_rate = rng.uniform(0.02, 0.15, size=(num_groups, 4)).astype(np.float16)
-
     mutate_rate = rng.uniform(0.01, 0.10, size=(num_groups, 4)).astype(np.float16)
 
-    inout_copy_rate = np.zeros((num_groups, 2), dtype=np.float16)
-    inout_copy_rate[:, 0] = rng.uniform(0.02, 0.15, size=num_groups)
-    inout_copy_rate[:, 1] = rng.uniform(0.02, 0.15, size=num_groups)
-
-    return {
-        "sig_pre_rate":  sig_pre_rate,
-        "sig_post_rate": sig_post_rate,
-        "other_rate":    other_rate,
-        "steps":         steps,
-        "sig_pre_diff":  sig_pre_diff,
-        "sig_post_diff": sig_post_diff,
-        "other_diff":    other_diff,
-        "sig_pre_max":   sig_pre_max,
-        "sig_post_max":  sig_post_max,
-        "other_max":     other_max,
+    rlmu_mutation_params = {
         "resource_rate": resource_rate,
         "link28th_rate": link28th_rate,
-        "learning_rate": learning_rate,
-        "mutate_rate":   mutate_rate,
-        "inout_copy_rate":    inout_copy_rate,
+        "mutate_rate": mutate_rate,
+    }
+
+    return (
+        sig_mutation_params,
+        neuromod_map_mutation_params,
+        neuromod_params_mutation_params,
+        iicu_mutation_params,
+        rlmu_mutation_params,
+    )
+
+
+def create_neuromod_params_buffers(num_groups: int, seed: int = None):
+    rng = np.random.default_rng(seed)
+
+    # 4x4 相互作用行列 (初期は単位行列に近い形)
+    rel_matrix = np.zeros((num_groups, 4, 4), dtype=np.float16)
+    for g in range(num_groups):
+        rel_matrix[g] = np.eye(4, dtype=np.float16) * 0.95 + rng.uniform(-0.05, 0.05, size=(4, 4)).astype(np.float16)
+
+    # 4x4 反応行列 (シナプス重み反応)
+    weight_reaction = rng.uniform(-0.05, 0.05, size=(num_groups, 4, 4)).astype(np.float16)
+    for g in range(num_groups):
+        for i in range(4):
+            weight_reaction[g, i, 2] = 0.95  # 自身の重みを維持する項
+
+    diff = rng.uniform(0.005, 1.0 / 27.0, size=num_groups).astype(np.float16)
+
+    return {
+        "neuromod_rel_matrix": rel_matrix,
+        "neuromod_weight_reaction": weight_reaction,
+        "diff": diff,
     }
 
 
@@ -402,20 +392,21 @@ kernel_mutation = build_kernel(device, "mutation")
 
 sig_pre_map_np2 = np.zeros(Config.m * Config.P * Config.P * Config.P * 4, dtype=np.half)
 sig_post_map_np2 = np.zeros(Config.m * Config.P * Config.P * Config.P * 4, dtype=np.half)
-dopamine_map = np.zeros(Config.m * Config.N * Config.N * Config.N, dtype=np.half)
-sleep_map = np.zeros(Config.m * Config.N * Config.N * Config.N, dtype=np.half)
+neuromod_map = np.zeros((Config.m * Config.N * Config.N * Config.N, 4), dtype=np.half)
+neuromod_map_buf = device.create_buffer(
+    data=neuromod_map,
+    usage=spy.BufferUsage.unordered_access | spy.BufferUsage.shader_resource
+)
 inhib_sign_map = np.zeros(Config.m * Config.inhib_stride, dtype=np.uint32)
 
 generation_dict = {
     "sig_pre_map_np2_pout": sig_pre_map_np2,
     "sig_post_map_np2_pout": sig_post_map_np2,
-    "dopamine_map_pout": dopamine_map,
-    "sleep_map_pout": sleep_map,
+    "neuromod_map_pout": neuromod_map_buf,
     "inhib_sign_map_pout": inhib_sign_map,
     "sig_pre_genes": cast_and_buffer(genesis_params.signature_pre_params, device, float_dtype=np.float32),
     "sig_post_genes": cast_and_buffer(genesis_params.signature_post_params, device, float_dtype=np.float32),
-    "dopamine_genes": cast_and_buffer(genesis_params.dopamine_params, device, float_dtype=np.float32),
-    "sleep_genes": cast_and_buffer(genesis_params.sleep_params, device, float_dtype=np.float32),
+    "neuromod_genes": cast_and_buffer(genesis_params.neuromod_params, device, float_dtype=np.float32),
     "inhib_genes": cast_and_buffer(genesis_params.inhib_params, device, float_dtype=np.float32)
 }
 
@@ -439,18 +430,6 @@ membrane_buf = device.create_buffer(
     data=np.zeros((Config.m, Config.P, Config.P, Config.P), dtype=np.float16),
     usage=spy.BufferUsage.unordered_access
 )
-synapse_tag_buf = device.create_buffer(
-    data=np.zeros((Config.m, Config.N, Config.N, Config.N, 7), dtype=np.uint32),
-    usage=spy.BufferUsage.unordered_access
-)
-dopamine_sum_buf = device.create_buffer(
-    data=np.zeros(Config.m, dtype=np.float16),
-    usage=spy.BufferUsage.unordered_access
-)
-sleep_sum_buf = device.create_buffer(
-    data=np.zeros(Config.m, dtype=np.float16),
-    usage=spy.BufferUsage.unordered_access
-)
 mutation_rate_buf = device.create_buffer(
     data=np.zeros(Config.m, dtype=np.float32),
     usage=spy.BufferUsage.unordered_access,
@@ -458,9 +437,22 @@ mutation_rate_buf = device.create_buffer(
 
 shared_resource_params_buf = cast_and_buffer(genesis_params.resource_params, device)
 shared_link28th_params_buf = cast_and_buffer(genesis_params.link28th_params, device)
-shared_learning_params_buf = cast_and_buffer(genesis_params.learning_params, device)
 shared_inout_params_fi_buf = cast_and_buffer(genesis_params.inout_params_fi, device)
-shared_mutation_params_buf = cast_and_buffer(create_mutation_params_buffers(Config.m, 42), device)
+
+(
+    sig_mut_dict,
+    neuromod_map_mut_dict,
+    neuromod_params_mut_dict,
+    iicu_mut_dict,
+    rlmu_mut_dict,
+) = create_mutation_params_buffers(Config.m, 42)
+shared_sig_mut_buf = cast_and_buffer(sig_mut_dict, device)
+shared_neuromod_map_mut_buf = cast_and_buffer(neuromod_map_mut_dict, device)
+shared_neuromod_params_mut_buf = cast_and_buffer(neuromod_params_mut_dict, device)
+shared_iicu_mut_buf = cast_and_buffer(iicu_mut_dict, device)
+shared_rlmu_mut_buf = cast_and_buffer(rlmu_mut_dict, device)
+
+shared_neuromod_params_buf = cast_and_buffer(create_neuromod_params_buffers(Config.m, 42), device)
 
 
 def get_default_inout_fi(dim: int) -> dict[str, np.ndarray]:
@@ -509,15 +501,26 @@ def load_and_distribute_all_elites(folder_path: str):
     # --- 1. 空間マップ（脳の配線）の均等配分 ---
     sig_pre_all  = np.stack([e["sig_pre"] for e in elites])[assign].reshape(-1).astype(np.float16)
     sig_post_all = np.stack([e["sig_post"] for e in elites])[assign].reshape(-1).astype(np.float16)
-    dopamine_all = np.stack([e["dopamine"] for e in elites])[assign].reshape(-1).astype(np.float16)
-    sleep_all    = np.stack([e["sleep"] for e in elites])[assign].reshape(-1).astype(np.float16)
     inhib_all    = np.stack([e["inhib"] for e in elites])[assign].reshape(-1).astype(np.uint32)
 
     gen_buf_dict["sig_pre_map_np2_pout"].copy_from_numpy(sig_pre_all)
     gen_buf_dict["sig_post_map_np2_pout"].copy_from_numpy(sig_post_all)
-    gen_buf_dict["dopamine_map_pout"].copy_from_numpy(dopamine_all)
-    gen_buf_dict["sleep_map_pout"].copy_from_numpy(sleep_all)
     gen_buf_dict["inhib_sign_map_pout"].copy_from_numpy(inhib_all)
+
+    # neuromod_map の配分
+    neuromod_list = []
+    for e in elites:
+        if "neuromod" in e:
+            neuromod_list.append(np.asarray(e["neuromod"], dtype=np.float16).reshape(-1, 4))
+        else:
+            dop = np.asarray(e["dopamine"], dtype=np.float16).reshape(-1)
+            slp = np.asarray(e["sleep"], dtype=np.float16).reshape(-1)
+            nm = np.zeros((dop.size, 4), dtype=np.float16)
+            nm[:, 0] = dop
+            nm[:, 1] = slp
+            neuromod_list.append(nm)
+    neuromod_all = np.stack(neuromod_list)[assign].reshape(-1, 4).astype(np.float16)
+    neuromod_map_buf.copy_from_numpy(neuromod_all)
 
     # --- 2. 神経パラメータの均等配分 ---
     shared_resource_params_buf["base_output"].copy_from_numpy(
@@ -537,18 +540,16 @@ def load_and_distribute_all_elites(folder_path: str):
         np.array([e["link_bias"] for e in elites], dtype=np.int32)[assign]
     )
 
-    shared_learning_params_buf["learning_rate"].copy_from_numpy(
-        np.array([e["learn_rate"] for e in elites], dtype=np.float16)[assign]
-    )
-    shared_learning_params_buf["forget_rate"].copy_from_numpy(
-        np.array([e["learn_forget"] for e in elites], dtype=np.float16)[assign]
-    )
-    shared_learning_params_buf["learning_threshold"].copy_from_numpy(
-        np.array([e["learn_threshold"] for e in elites], dtype=np.float16)[assign]
-    )
-    shared_learning_params_buf["tag_decay"].copy_from_numpy(
-        np.array([e["learn_decay"] for e in elites], dtype=np.float16)[assign]
-    )
+    if "neuromod_rel_matrix" in elites[0]:
+        shared_neuromod_params_buf["neuromod_rel_matrix"].copy_from_numpy(
+            np.array([e["neuromod_rel_matrix"] for e in elites], dtype=np.float16)[assign]
+        )
+        shared_neuromod_params_buf["neuromod_weight_reaction"].copy_from_numpy(
+            np.array([e["neuromod_weight_reaction"] for e in elites], dtype=np.float16)[assign]
+        )
+        shared_neuromod_params_buf["diff"].copy_from_numpy(
+            np.array([e["neuromod_diff"] for e in elites], dtype=np.float16)[assign]
+        )
 
     defaults_fi = get_default_inout_fi(Config.dim)
     in_list = []
@@ -585,6 +586,56 @@ def load_and_distribute_all_elites(folder_path: str):
     shared_inout_params_fi_buf["in_ports_fi"].copy_from_numpy(np.ascontiguousarray(in_all))
     shared_inout_params_fi_buf["out_ports_fi"].copy_from_numpy(np.ascontiguousarray(out_all))
 
+    # --- 3. メタ変異パラメータ（mutation.slang）の復元 ---
+    if "mut_sig_rate" in elites[0]:
+        shared_sig_mut_buf["rate"].copy_from_numpy(
+            np.array([e["mut_sig_rate"] for e in elites], dtype=np.float16)[assign]
+        )
+        shared_sig_mut_buf["steps"].copy_from_numpy(
+            np.array([e["mut_sig_steps"] for e in elites], dtype=np.uint32)[assign]
+        )
+        shared_sig_mut_buf["max"].copy_from_numpy(
+            np.array([e["mut_sig_max"] for e in elites], dtype=np.float16)[assign]
+        )
+        shared_sig_mut_buf["diff"].copy_from_numpy(
+            np.array([e["mut_sig_diff"] for e in elites], dtype=np.float16)[assign]
+        )
+
+    if "mut_neuromod_map_rate" in elites[0]:
+        shared_neuromod_map_mut_buf["rate"].copy_from_numpy(
+            np.array([e["mut_neuromod_map_rate"] for e in elites], dtype=np.float16)[assign]
+        )
+        shared_neuromod_map_mut_buf["steps"].copy_from_numpy(
+            np.array([e["mut_neuromod_map_steps"] for e in elites], dtype=np.uint32)[assign]
+        )
+        shared_neuromod_map_mut_buf["max"].copy_from_numpy(
+            np.array([e["mut_neuromod_map_max"] for e in elites], dtype=np.float16)[assign]
+        )
+        shared_neuromod_map_mut_buf["diff"].copy_from_numpy(
+            np.array([e["mut_neuromod_map_diff"] for e in elites], dtype=np.float16)[assign]
+        )
+
+    if "mut_neuromod_params_rate" in elites[0]:
+        shared_neuromod_params_mut_buf["rate"].copy_from_numpy(
+            np.array([e["mut_neuromod_params_rate"] for e in elites], dtype=np.float16)[assign]
+        )
+
+    if "mut_iicu_rate" in elites[0]:
+        shared_iicu_mut_buf["iicu_rate"].copy_from_numpy(
+            np.array([e["mut_iicu_rate"] for e in elites], dtype=np.float16)[assign]
+        )
+
+    if "mut_resource_rate" in elites[0]:
+        shared_rlmu_mut_buf["resource_rate"].copy_from_numpy(
+            np.array([e["mut_resource_rate"] for e in elites], dtype=np.float16)[assign]
+        )
+        shared_rlmu_mut_buf["link28th_rate"].copy_from_numpy(
+            np.array([e["mut_link28th_rate"] for e in elites], dtype=np.float16)[assign]
+        )
+        shared_rlmu_mut_buf["mutate_rate"].copy_from_numpy(
+            np.array([e["mut_mutate_rate"] for e in elites], dtype=np.float16)[assign]
+        )
+
     print("[★] 全個体への多系統エリート配分が完了しました！\n")
 
 
@@ -595,36 +646,35 @@ if LOAD_CHECKPOINT_FOLDER and os.path.exists(LOAD_CHECKPOINT_FOLDER) and load is
     load_and_distribute_all_elites(LOAD_CHECKPOINT_FOLDER)
 
 reasoning_sim_dict = {
-    "dopamine_map_all": gen_buf_dict["dopamine_map_pout"],
-    "sleep_map_all": gen_buf_dict["sleep_map_pout"],
     "inhib_map_all": gen_buf_dict["inhib_sign_map_pout"],
     "global_poutputs_all": global_poutputs_buf,
     "membrane_all": membrane_buf,
-    "synapse_tag_all": synapse_tag_buf,
     "signature_pre_map_np2": gen_buf_dict["sig_pre_map_np2_pout"],
     "signature_post_map_np2": gen_buf_dict["sig_post_map_np2_pout"],
+    "neuromod_gen_map": neuromod_map_buf,
     "resource_params_all": shared_resource_params_buf,
     "link28th_params_all": shared_link28th_params_buf,
-    "learning_params_all": shared_learning_params_buf,
     "inout_params_fi_all": shared_inout_params_fi_buf,
-    "dopamine_sum": dopamine_sum_buf,
-    "sleep_sum": sleep_sum_buf,
+    "neuromod_params_all": shared_neuromod_params_buf,
     "mutation_rate_all": mutation_rate_buf,
     "dt": 0.01,
     "step": 0,
 }
 
 mutation_dict = {
-    "dopamine_map_all": gen_buf_dict["dopamine_map_pout"],
-    "sleep_map_all": gen_buf_dict["sleep_map_pout"],
+    "neuromod_map_all": neuromod_map_buf,
     "inhib_map_all": gen_buf_dict["inhib_sign_map_pout"],
     "signature_pre_map_np2": gen_buf_dict["sig_pre_map_np2_pout"],
     "signature_post_map_np2": gen_buf_dict["sig_post_map_np2_pout"],
+    "neuromod_params_all": shared_neuromod_params_buf,
     "resource_params_all": shared_resource_params_buf,
     "link28th_params_all": shared_link28th_params_buf,
-    "learning_params_all": shared_learning_params_buf,
     "inout_params_fi_all": shared_inout_params_fi_buf,
-    "mutation_params_all": shared_mutation_params_buf,
+    "sig_mutation_params_all": shared_sig_mut_buf,
+    "neuromod_map_mutation_params_all": shared_neuromod_map_mut_buf,
+    "neuromod_params_mutation_params_all": shared_neuromod_params_mut_buf,
+    "iicu_mutation_params_all": shared_iicu_mut_buf,
+    "rlmu_mutation_params_all": shared_rlmu_mut_buf,
     "mutation_rate_all": mutation_rate_buf,
     "total": Config.m,
     "step": 0
@@ -672,8 +722,7 @@ def save_top_k_elites(step_num: int, energies: np.ndarray, k: int = 20):
 
     sig_pre_all  = gen_buf_dict["sig_pre_map_np2_pout"].to_numpy().view(np.float16)
     sig_post_all = gen_buf_dict["sig_post_map_np2_pout"].to_numpy().view(np.float16)
-    dopamine_all = gen_buf_dict["dopamine_map_pout"].to_numpy().view(np.float16)
-    sleep_all    = gen_buf_dict["sleep_map_pout"].to_numpy().view(np.float16)
+    neuromod_all = neuromod_map_buf.to_numpy().view(np.float16).reshape(Config.m, N_cube, 4)
     inhib_all    = gen_buf_dict["inhib_sign_map_pout"].to_numpy().view(np.uint32)
 
     res_base   = shared_resource_params_buf["base_output"].to_numpy().view(np.float16)
@@ -681,13 +730,32 @@ def save_top_k_elites(step_num: int, energies: np.ndarray, k: int = 20):
     res_refill = shared_resource_params_buf["k_refill"].to_numpy().view(np.float16)
     link_mult  = shared_link28th_params_buf["multiplier"].to_numpy().view(np.int32)
     link_bias  = shared_link28th_params_buf["bias"].to_numpy().view(np.int32)
-    lr_rate    = shared_learning_params_buf["learning_rate"].to_numpy().view(np.float16)
-    lr_forget  = shared_learning_params_buf["forget_rate"].to_numpy().view(np.float16)
-    lr_thresh  = shared_learning_params_buf["learning_threshold"].to_numpy().view(np.float16)
-    lr_decay   = shared_learning_params_buf["tag_decay"].to_numpy().view(np.float16)
+
+    nm_rel   = shared_neuromod_params_buf["neuromod_rel_matrix"].to_numpy().view(np.float16).reshape(Config.m, 4, 4)
+    nm_react = shared_neuromod_params_buf["neuromod_weight_reaction"].to_numpy().view(np.float16).reshape(Config.m, 4, 4)
+    nm_diff  = shared_neuromod_params_buf["diff"].to_numpy().view(np.float16)
 
     in_ports_fi_all  = shared_inout_params_fi_buf["in_ports_fi"].to_numpy().view(np.int32).reshape(Config.m, NUM_IN_PORTS, 3)
     out_ports_fi_all = shared_inout_params_fi_buf["out_ports_fi"].to_numpy().view(np.int32).reshape(Config.m, NUM_OUT_PORTS, 3)
+
+    # メタ変異パラメータ（mutation.slang）の配列取得
+    mut_sig_rate_all  = shared_sig_mut_buf["rate"].to_numpy().view(np.float16).reshape(Config.m, 4)
+    mut_sig_steps_all = shared_sig_mut_buf["steps"].to_numpy().view(np.uint32)
+    mut_sig_max_all   = shared_sig_mut_buf["max"].to_numpy().view(np.float16).reshape(Config.m, 4)
+    mut_sig_diff_all  = shared_sig_mut_buf["diff"].to_numpy().view(np.float16).reshape(Config.m, 4)
+
+    mut_nm_map_rate_all  = shared_neuromod_map_mut_buf["rate"].to_numpy().view(np.float16).reshape(Config.m, 4)
+    mut_nm_map_steps_all = shared_neuromod_map_mut_buf["steps"].to_numpy().view(np.uint32)
+    mut_nm_map_max_all   = shared_neuromod_map_mut_buf["max"].to_numpy().view(np.float16).reshape(Config.m, 4)
+    mut_nm_map_diff_all  = shared_neuromod_map_mut_buf["diff"].to_numpy().view(np.float16).reshape(Config.m, 4)
+
+    mut_nm_params_rate_all = shared_neuromod_params_mut_buf["rate"].to_numpy().view(np.float16).reshape(Config.m, 4)
+
+    mut_iicu_rate_all = shared_iicu_mut_buf["iicu_rate"].to_numpy().view(np.float16).reshape(Config.m, 4)
+
+    mut_resource_rate_all = shared_rlmu_mut_buf["resource_rate"].to_numpy().view(np.float16).reshape(Config.m, 4)
+    mut_link28th_rate_all = shared_rlmu_mut_buf["link28th_rate"].to_numpy().view(np.float16).reshape(Config.m, 2)
+    mut_mutate_rate_all   = shared_rlmu_mut_buf["mutate_rate"].to_numpy().view(np.float16).reshape(Config.m, 4)
 
     for rank, idx in enumerate(top_indices, start=1):
         idx = int(idx)
@@ -698,29 +766,40 @@ def save_top_k_elites(step_num: int, energies: np.ndarray, k: int = 20):
             save_path,
             step=step_num,
             score=score,
-            enable_learning=np.float16(ENABLE_LEARNING),
-            enable_dopamine=np.float16(ENABLE_DOPAMINE),
-            enable_sleep=np.float16(ENABLE_SLEEP),
             sig_pre=sig_pre_all[idx * P_cube_4 : (idx + 1) * P_cube_4],
             sig_post=sig_post_all[idx * P_cube_4 : (idx + 1) * P_cube_4],
-            dopamine=dopamine_all[idx * N_cube : (idx + 1) * N_cube],
-            sleep=sleep_all[idx * N_cube : (idx + 1) * N_cube],
+            neuromod=neuromod_all[idx],
             inhib=inhib_all[idx * INHIB_SIZE : (idx + 1) * INHIB_SIZE],
             resource_base_output=res_base[idx],
             resource_beta=res_beta[idx],
             resource_k_refill=res_refill[idx],
             link_multiplier=link_mult[idx],
             link_bias=link_bias[idx],
-            learn_rate=lr_rate[idx],
-            learn_forget=lr_forget[idx],
-            learn_threshold=lr_thresh[idx],
-            learn_decay=lr_decay[idx],
+            neuromod_rel_matrix=nm_rel[idx],
+            neuromod_weight_reaction=nm_react[idx],
+            neuromod_diff=nm_diff[idx],
             in_ports_fi=in_ports_fi_all[idx],
             out_ports_fi=out_ports_fi_all[idx],
             light_in_fi=in_ports_fi_all[idx][0] if NUM_IN_PORTS >= 1 else np.array([0, 0, 0], dtype=np.int32),
             battery_in_fi=in_ports_fi_all[idx][1] if NUM_IN_PORTS >= 2 else np.array([0, 0, 0], dtype=np.int32),
             gen_pos_out_fi=out_ports_fi_all[idx][0] if NUM_OUT_PORTS >= 1 else np.array([0, 0, 0], dtype=np.int32),
             gen_neg_out_fi=out_ports_fi_all[idx][1] if NUM_OUT_PORTS >= 2 else np.array([0, 0, 0], dtype=np.int32),
+            speed_out_fi=out_ports_fi_all[idx][2] if NUM_OUT_PORTS >= 3 else np.array([0, 0, 0], dtype=np.int32),
+            rotate_out_fi=out_ports_fi_all[idx][3] if NUM_OUT_PORTS >= 4 else np.array([0, 0, 0], dtype=np.int32),
+            # メタ変異パラメータ（全遺伝情報の網羅）
+            mut_sig_rate=mut_sig_rate_all[idx],
+            mut_sig_steps=mut_sig_steps_all[idx],
+            mut_sig_max=mut_sig_max_all[idx],
+            mut_sig_diff=mut_sig_diff_all[idx],
+            mut_neuromod_map_rate=mut_nm_map_rate_all[idx],
+            mut_neuromod_map_steps=mut_nm_map_steps_all[idx],
+            mut_neuromod_map_max=mut_nm_map_max_all[idx],
+            mut_neuromod_map_diff=mut_nm_map_diff_all[idx],
+            mut_neuromod_params_rate=mut_nm_params_rate_all[idx],
+            mut_iicu_rate=mut_iicu_rate_all[idx],
+            mut_resource_rate=mut_resource_rate_all[idx],
+            mut_link28th_rate=mut_link28th_rate_all[idx],
+            mut_mutate_rate=mut_mutate_rate_all[idx],
         )
 
     print(f"[★] 上位 {k} 体の保存が完了しました！(1位スコア: {energies[top_indices[0]]:.3f} ~ {k}位スコア: {energies[top_indices[-1]]:.3f})")
@@ -802,37 +881,51 @@ for step in range(TOTAL_STEPS):
         
         sig_pre_elite  = gen_buf_dict["sig_pre_map_np2_pout"].to_numpy().view(np.float16)[best_idx * P_cube_4 : (best_idx + 1) * P_cube_4]
         sig_post_elite = gen_buf_dict["sig_post_map_np2_pout"].to_numpy().view(np.float16)[best_idx * P_cube_4 : (best_idx + 1) * P_cube_4]
-        dopamine_elite = gen_buf_dict["dopamine_map_pout"].to_numpy().view(np.float16)[best_idx * N_cube : (best_idx + 1) * N_cube]
-        sleep_elite    = gen_buf_dict["sleep_map_pout"].to_numpy().view(np.float16)[best_idx * N_cube : (best_idx + 1) * N_cube]
+        neuromod_elite = neuromod_map_buf.to_numpy().view(np.float16).reshape(Config.m, N_cube, 4)[best_idx]
         inhib_elite    = gen_buf_dict["inhib_sign_map_pout"].to_numpy().view(np.uint32)[best_idx * INHIB_SIZE : (best_idx + 1) * INHIB_SIZE]
+
+        nm_rel_elite   = shared_neuromod_params_buf["neuromod_rel_matrix"].to_numpy().view(np.float16).reshape(Config.m, 4, 4)[best_idx]
+        nm_react_elite = shared_neuromod_params_buf["neuromod_weight_reaction"].to_numpy().view(np.float16).reshape(Config.m, 4, 4)[best_idx]
+        nm_diff_elite  = shared_neuromod_params_buf["diff"].to_numpy().view(np.float16)[best_idx]
 
         np.savez_compressed(
             save_path,
             step=step,
             score=max_energy,
-            enable_learning=np.float16(ENABLE_LEARNING),
-            enable_dopamine=np.float16(ENABLE_DOPAMINE),
-            enable_sleep=np.float16(ENABLE_SLEEP),
             sig_pre=sig_pre_elite,
             sig_post=sig_post_elite,
-            dopamine=dopamine_elite,
-            sleep=sleep_elite,
+            neuromod=neuromod_elite,
             inhib=inhib_elite,
             resource_base_output=shared_resource_params_buf["base_output"].to_numpy().view(np.float16)[best_idx],
             resource_beta=shared_resource_params_buf["beta"].to_numpy().view(np.float16)[best_idx],
             resource_k_refill=shared_resource_params_buf["k_refill"].to_numpy().view(np.float16)[best_idx],
             link_multiplier=shared_link28th_params_buf["multiplier"].to_numpy().view(np.int32)[best_idx],
             link_bias=shared_link28th_params_buf["bias"].to_numpy().view(np.int32)[best_idx],
-            learn_rate=shared_learning_params_buf["learning_rate"].to_numpy().view(np.float16)[best_idx],
-            learn_forget=shared_learning_params_buf["forget_rate"].to_numpy().view(np.float16)[best_idx],
-            learn_threshold=shared_learning_params_buf["learning_threshold"].to_numpy().view(np.float16)[best_idx],
-            learn_decay=shared_learning_params_buf["tag_decay"].to_numpy().view(np.float16)[best_idx],
+            neuromod_rel_matrix=nm_rel_elite,
+            neuromod_weight_reaction=nm_react_elite,
+            neuromod_diff=nm_diff_elite,
             in_ports_fi=shared_inout_params_fi_buf["in_ports_fi"].to_numpy().view(np.int32).reshape(Config.m, NUM_IN_PORTS, 3)[best_idx],
             out_ports_fi=shared_inout_params_fi_buf["out_ports_fi"].to_numpy().view(np.int32).reshape(Config.m, NUM_OUT_PORTS, 3)[best_idx],
             light_in_fi=shared_inout_params_fi_buf["in_ports_fi"].to_numpy().view(np.int32).reshape(Config.m, NUM_IN_PORTS, 3)[best_idx][0] if NUM_IN_PORTS >= 1 else np.array([0, 0, 0], dtype=np.int32),
             battery_in_fi=shared_inout_params_fi_buf["in_ports_fi"].to_numpy().view(np.int32).reshape(Config.m, NUM_IN_PORTS, 3)[best_idx][1] if NUM_IN_PORTS >= 2 else np.array([0, 0, 0], dtype=np.int32),
             gen_pos_out_fi=shared_inout_params_fi_buf["out_ports_fi"].to_numpy().view(np.int32).reshape(Config.m, NUM_OUT_PORTS, 3)[best_idx][0] if NUM_OUT_PORTS >= 1 else np.array([0, 0, 0], dtype=np.int32),
             gen_neg_out_fi=shared_inout_params_fi_buf["out_ports_fi"].to_numpy().view(np.int32).reshape(Config.m, NUM_OUT_PORTS, 3)[best_idx][1] if NUM_OUT_PORTS >= 2 else np.array([0, 0, 0], dtype=np.int32),
+            speed_out_fi=shared_inout_params_fi_buf["out_ports_fi"].to_numpy().view(np.int32).reshape(Config.m, NUM_OUT_PORTS, 3)[best_idx][2] if NUM_OUT_PORTS >= 3 else np.array([0, 0, 0], dtype=np.int32),
+            rotate_out_fi=shared_inout_params_fi_buf["out_ports_fi"].to_numpy().view(np.int32).reshape(Config.m, NUM_OUT_PORTS, 3)[best_idx][3] if NUM_OUT_PORTS >= 4 else np.array([0, 0, 0], dtype=np.int32),
+            # メタ変異パラメータ（全遺伝情報の網羅）
+            mut_sig_rate=shared_sig_mut_buf["rate"].to_numpy().view(np.float16).reshape(Config.m, 4)[best_idx],
+            mut_sig_steps=shared_sig_mut_buf["steps"].to_numpy().view(np.uint32)[best_idx],
+            mut_sig_max=shared_sig_mut_buf["max"].to_numpy().view(np.float16).reshape(Config.m, 4)[best_idx],
+            mut_sig_diff=shared_sig_mut_buf["diff"].to_numpy().view(np.float16).reshape(Config.m, 4)[best_idx],
+            mut_neuromod_map_rate=shared_neuromod_map_mut_buf["rate"].to_numpy().view(np.float16).reshape(Config.m, 4)[best_idx],
+            mut_neuromod_map_steps=shared_neuromod_map_mut_buf["steps"].to_numpy().view(np.uint32)[best_idx],
+            mut_neuromod_map_max=shared_neuromod_map_mut_buf["max"].to_numpy().view(np.float16).reshape(Config.m, 4)[best_idx],
+            mut_neuromod_map_diff=shared_neuromod_map_mut_buf["diff"].to_numpy().view(np.float16).reshape(Config.m, 4)[best_idx],
+            mut_neuromod_params_rate=shared_neuromod_params_mut_buf["rate"].to_numpy().view(np.float16).reshape(Config.m, 4)[best_idx],
+            mut_iicu_rate=shared_iicu_mut_buf["iicu_rate"].to_numpy().view(np.float16).reshape(Config.m, 4)[best_idx],
+            mut_resource_rate=shared_rlmu_mut_buf["resource_rate"].to_numpy().view(np.float16).reshape(Config.m, 4)[best_idx],
+            mut_link28th_rate=shared_rlmu_mut_buf["link28th_rate"].to_numpy().view(np.float16).reshape(Config.m, 2)[best_idx],
+            mut_mutate_rate=shared_rlmu_mut_buf["mutate_rate"].to_numpy().view(np.float16).reshape(Config.m, 4)[best_idx],
         )
         print(f"  [★] 過去最高エリート（変異前・本物）を保存しました -> {save_path}")
 
