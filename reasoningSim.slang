@@ -49,6 +49,10 @@
 
 #define NEUROMOD_NUM (4)
 
+#ifndef ONE_SIM
+#define ONE_SIM (0)
+#endif
+
 // =============================================================================
 // 3. パラメータ構造体 ＆ シナプスデータ管理構造体
 // =============================================================================
@@ -168,7 +172,7 @@ struct NeuromodParams {
     }
 }
 
-// 各ニューロンが持つ28個のシナプス（近傍3x3x3=27個 ＋ 長距離27thリンク1個）
+// 各ニューロンが持つ28個のシナプス（近傍3x3x3=27個 ＋ 長距離28thリンク1個）
 struct SynapseData {
     half weights[28];
 
@@ -199,11 +203,11 @@ struct SynapseData {
 
     // --- 長距離シナプス (スロット27) ---
     [ForceInline]
-    half get_weight_27th() { return weights[27]; }
+    half get_weight_28th() { return weights[27]; }
 
     [mutating]
     [ForceInline]
-    void set_weights_27th(half val) { weights[27] = val; }
+    void set_weights_28th(half val) { weights[27] = val; }
 }
 
 struct Half8All {
@@ -417,10 +421,10 @@ void init_synapse_weights(
     }
 
     // 28番目（長距離リンク）シナプス重みの初期化
-    uint3 sig_27th_coord = indexToCoordN(groupIndex * link28th_params.multiplier + link28th_params.bias);
-    half4 sig_27th_pre = get_sig_pre(sig_27th_coord);
-    half weight_27th = saturate(0.25h * dot(my_post, sig_27th_pre));
-    synapse_data.set_weights_27th(weight_27th);
+    uint3 sig_28th_coord = indexToCoordN(groupIndex * link28th_params.multiplier + link28th_params.bias);
+    half4 sig_28th_pre = get_sig_pre(sig_28th_coord);
+    half weight_28th = saturate(0.25h * dot(my_post, sig_28th_pre));
+    synapse_data.set_weights_28th(weight_28th);
 }
 
 // 太陽光サイクル・発電コスト・エネルギー収支の更新と感覚入力膜への書き込み (Thread 0 が実行)
@@ -522,7 +526,7 @@ void computeMain(
     uint groupIndex: SV_GroupIndex,
     uint3 groupID: SV_GroupID,
     StructuredBuffer<uint> inhib_map_all,
-    RWStructuredBuffer<half2> global_poutputs_all,
+    RWStructuredBuffer<half2> global_outputs_all,
     RWStructuredBuffer<half2> membrane_all,
     StructuredBuffer<half4> signature_pre_map_np2,
     StructuredBuffer<half4> signature_post_map_np2,
@@ -534,32 +538,19 @@ void computeMain(
     RWStructuredBuffer<float> mutation_rate_all,
     uniform half dt,
     uniform uint step
-)
+#if ONE_SIM == 1
+    ,
+    uniform uint inner_step_val,
+    uniform uint is_init,
+    RWStructuredBuffer<float> body_state_all,
+    RWStructuredBuffer<half> r_all,
+    RWStructuredBuffer<half4> neuromod_state_all,
+    RWStructuredBuffer<half> synapse_weights_all,
+    StructuredBuffer<uint> ko_mask_all
+#endif
+) 
 {
     uint agent_id = groupID.x;
-
-    uint inner_step = 0u;
-
-    // --- Step 1: 共有メモリと個体パラメータの初期化 ---
-    if (groupIndex == 0) {
-        neuromod_params = NeuromodParams.load(agent_id, neuromod_params_all);
-
-        my_energy_s = INITIAL_ENERGY;
-        my_pos_s = float2(0.0, 0.0);
-        my_angle_s = 0.0;
-        float obj_rand = 2 * (float)rand_half(12277 * step + 67 * agent_id);
-        my_obj_s = float2(cospi(obj_rand), sinpi(obj_rand));
-        inout_params_s = InoutParamsFi.load(agent_id, inout_params_fi_all);
-    }
-
-    for (uint idx_np2 = groupIndex; idx_np2 < TOTAL_NP2; idx_np2 += TOTAL_N) {
-        sig_pre_map_s[idx_np2]  = signature_pre_map_np2[agent_id * TOTAL_NP2 + idx_np2];
-        sig_post_map_s[idx_np2] = signature_post_map_np2[agent_id * TOTAL_NP2 + idx_np2];
-    }
-    GroupMemoryBarrierWithGroupSync();
-
-    set_neuromod(groupThreadID, 0u, 0.0h);
-    set_neuromod(groupThreadID, 0u, 0.0h);
 
     uint packed_val = inhib_map_all[(agent_id * INHIB_STRIDE) + (groupIndex >> 5)];
     bool is_inhib   = bool((packed_val >> (groupIndex & 31)) & 1);
@@ -574,13 +565,95 @@ void computeMain(
     link28th_params.bias       = link28th_params_all.bias[agent_id];
     link28th_params.multiplier = link28th_params_all.multiplier[agent_id];
 
+    uint3 coord_28th = indexToCoordN(groupIndex * link28th_params.multiplier + link28th_params.bias);
+
+    if (groupIndex == 0) {
+        neuromod_params = NeuromodParams.load(agent_id, neuromod_params_all);
+        inout_params_s = InoutParamsFi.load(agent_id, inout_params_fi_all);
+    }
+    for (uint idx_np2 = groupIndex; idx_np2 < TOTAL_NP2; idx_np2 += TOTAL_N) {
+        sig_pre_map_s[idx_np2]  = signature_pre_map_np2[agent_id * TOTAL_NP2 + idx_np2];
+        sig_post_map_s[idx_np2] = signature_post_map_np2[agent_id * TOTAL_NP2 + idx_np2];
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+#if ONE_SIM == 1
+    SynapseData synapse_data;
+    half R;
+    half my_output = 0.0h;
+
+    if (is_init == 1u) {
+        // --- 初期化モード ---
+        if (groupIndex == 0) {
+            my_energy_s = body_state_all[0];
+            my_pos_s    = float2(body_state_all[1], body_state_all[2]);
+            my_angle_s  = body_state_all[3];
+            my_obj_s    = float2(body_state_all[4], body_state_all[5]);
+        }
+        init_synapse_weights(groupThreadID, groupIndex, link28th_params, synapse_data);
+        R = 1.0h;
+
+        for (uint idx_np2 = groupIndex; idx_np2 < TOTAL_NP2; idx_np2 += TOTAL_N) {
+            outputs_s[idx_np2] = 0.0h;
+        }
+        GroupMemoryBarrierWithGroupSync();
+
+        bool is_ko_init = bool((ko_mask_all[groupIndex >> 5] >> (groupIndex & 31)) & 1);
+        set_output_s(groupThreadID, is_ko_init ? 0.0h : 0.5h);
+        GroupMemoryBarrierWithGroupSync();
+
+        set_neuromod(groupThreadID, 0u, 0.0h);
+        set_neuromod(groupThreadID, 1u, 0.0h);
+        GroupMemoryBarrierWithGroupSync();
+
+        my_output = 0.0h;
+    } else {
+        // --- 状態復帰モード ---
+        if (groupIndex == 0) {
+            my_energy_s = body_state_all[0];
+            my_pos_s    = float2(body_state_all[1], body_state_all[2]);
+            my_angle_s  = body_state_all[3];
+            my_obj_s    = float2(body_state_all[4], body_state_all[5]);
+        }
+        [unroll]
+        for (uint w = 0; w < 28; w++) {
+            synapse_data.weights[w] = synapse_weights_all[(agent_id * TOTAL_N + groupIndex) * 28 + w];
+        }
+        R = r_all[agent_id * TOTAL_N + groupIndex];
+
+        for (uint idx_h2 = groupIndex; idx_h2 < TOTAL_NP2H2; idx_h2 += TOTAL_N) {
+            uint2 idx01 = idxNp2h2x_to_indexNp2_01(idx_h2);
+            half2 pair = membrane_all[agent_id * TOTAL_NP2H2 + idx_h2];
+            outputs_s[idx01.x] = pair.x;
+            outputs_s[idx01.y] = pair.y;
+        }
+        GroupMemoryBarrierWithGroupSync();
+
+        neuromod_map_s[groupIndex][inner_step_val & 1u] = neuromod_state_all[agent_id * TOTAL_N + groupIndex];
+        GroupMemoryBarrierWithGroupSync();
+
+        my_output = (inner_step_val == 0u) ? 0.0h : get_output_s(groupThreadID);
+    }
+#else
+    // --- Step 1: 共有メモリと個体パラメータの初期化 ---
+    if (groupIndex == 0) {
+        my_energy_s = INITIAL_ENERGY;
+        my_pos_s = float2(0.0, 0.0);
+        my_angle_s = 0.0;
+        float obj_rand = 2 * (float)rand_half(12277 * step + 67 * agent_id);
+        my_obj_s = float2(cospi(obj_rand), sinpi(obj_rand));
+    }
+
+    set_neuromod(groupThreadID, 0u, 0.0h);
+    set_neuromod(groupThreadID, 1u, 0.0h);
+
     // --- Step 2: シナプス重みとニューロン初期状態のセットアップ ---
     SynapseData synapse_data;
     init_synapse_weights(groupThreadID, groupIndex, link28th_params, synapse_data);
 
     half R = 1.0h;
 
-    // 外周膜は 0.0h、内部ニューロンは 0.5h で初期化（oneSim.py と完全一致）
+    // 外周膜は 0.0h、内部ニューロンは 0.5h で初期化
     [unroll]
     for (uint idx_np2 = groupIndex; idx_np2 < TOTAL_NP2; idx_np2 += TOTAL_N) {
         outputs_s[idx_np2] = 0.0h;
@@ -590,12 +663,16 @@ void computeMain(
     set_output_s(groupThreadID, 0.5h);
     GroupMemoryBarrierWithGroupSync();
 
-    uint3 coord_27th = indexToCoordN(groupIndex * link28th_params.multiplier + link28th_params.bias);
-
     half my_output = 0.0h;
-    // --- Step 3: 1000ステップの神経・環境ダイナミクスループ ---
-    for (uint inner_step = 0; inner_step < INNER_STEPS; inner_step++) {
+#endif
 
+// --- Step 3: 神経・環境ダイナミクスループ ---
+#if ONE_SIM == 1
+    if (is_init == 0u) {
+        uint inner_step = inner_step_val;
+#else
+    for (uint inner_step = 0; inner_step < INNER_STEPS; inner_step++) {
+#endif
         // 神経修飾物質の拡散、生成、反応
         diffuse_step_n(groupIndex, inner_step, neuromod_params.diff);
         GroupMemoryBarrierWithGroupSync();
@@ -632,15 +709,21 @@ void computeMain(
             }
         }
 
-        // 長距離（27th）シナプスからの入力集計（および生涯学習）
-        half my_weight_27th = synapse_data.get_weight_27th();
-        half delta_net_27th = get_output_s(coord_27th) * my_weight_27th;
-        net += delta_net_27th;
+        // 長距離（28th）シナプスからの入力集計（および生涯学習）
+        half my_weight_28th = synapse_data.get_weight_28th();
+        half delta_net_28th = get_output_s(coord_28th) * my_weight_28th;
+        net += delta_net_28th;
 
         // ニューロン発火率・出力の計算とシナプス資源 R の更新
         half scaled_net  = clamp(net * resource_params.beta, -20.0h, 20.0h);
         half output_rate = min(1.0h, resource_params.base_output * exp2(scaled_net));
         my_output   = half(my_inhib) * output_rate * R;
+#if ONE_SIM == 1
+        bool is_ko = bool((ko_mask_all[groupIndex >> 5] >> (groupIndex & 31)) & 1);
+        if (is_ko) {
+            my_output = 0.0h;
+        }
+#endif
 
         // Warp間の競合を防ぐため、全スレッドの読み取り完了を待ってから出力を書き込む
         GroupMemoryBarrierWithGroupSync();
@@ -657,14 +740,33 @@ void computeMain(
     }
 
     // --- Step 4: 最終状態のグローバルバッファへの書き戻し ---
+#if ONE_SIM == 1
+    if (groupIndex == 0) {
+        body_state_all[0] = my_energy_s;
+        body_state_all[1] = my_pos_s.x;
+        body_state_all[2] = my_pos_s.y;
+        body_state_all[3] = my_angle_s;
+        body_state_all[4] = my_obj_s.x;
+        body_state_all[5] = my_obj_s.y;
+        mutation_rate_all[agent_id] = saturate(my_energy_s);
+    }
+    [unroll]
+    for (uint w = 0; w < 28; w++) {
+        synapse_weights_all[(agent_id * TOTAL_N + groupIndex) * 28 + w] = synapse_data.weights[w];
+    }
+    r_all[agent_id * TOTAL_N + groupIndex] = R;
+    uint save_step = (is_init == 1u) ? 0u : ((inner_step_val + 1) & 1u);
+    neuromod_state_all[agent_id * TOTAL_N + groupIndex] = neuromod_map_s[groupIndex][save_step];
+#else
     if (groupIndex == 0) {
         mutation_rate_all[agent_id] = saturate(my_energy_s);
     }
+#endif
 
     for (uint idx_h2 = groupIndex; idx_h2 < TOTAL_NP2H2; idx_h2 += TOTAL_N) {
         uint2 idx01   = idxNp2h2x_to_indexNp2_01(idx_h2);
         half2 out_pair = half2(outputs_s[idx01.x], outputs_s[idx01.y]);
         membrane_all[agent_id * TOTAL_NP2H2 + idx_h2]        = out_pair;
-        global_poutputs_all[agent_id * TOTAL_NP2H2 + idx_h2] = out_pair;
+        global_outputs_all[agent_id * TOTAL_NP2H2 + idx_h2] = out_pair;
     }
 }

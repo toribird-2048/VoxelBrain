@@ -13,6 +13,8 @@ import csv
 from datetime import datetime
 import sys
 
+from elite_manager import EliteManager
+
 try:
     sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
 except Exception:
@@ -486,157 +488,37 @@ def get_default_inout_fi(dim: int) -> dict[str, np.ndarray]:
 
 
 def load_and_distribute_all_elites(folder_path: str):
-    file_list = sorted(glob.glob(os.path.join(folder_path, "*.npz")))
-    if not file_list:
-        print(f"[!] フォルダ内に .npz ファイルが見つかりません: {folder_path}")
-        return
-
-    num_elites = len(file_list)
-    print(f"\n[★] {num_elites} 個のエリート遺伝子を発見しました！")
-    print(f"    1系統あたり約 {Config.m // num_elites} 体ずつ、全 {Config.m} 体に均等配分します...")
-
-    elites = [np.load(f) for f in file_list]
-    assign = np.arange(Config.m) % num_elites
-
-    # --- 1. 空間マップ（脳の配線）の均等配分 ---
-    sig_pre_all  = np.stack([e["sig_pre"] for e in elites])[assign].reshape(-1).astype(np.float16)
-    sig_post_all = np.stack([e["sig_post"] for e in elites])[assign].reshape(-1).astype(np.float16)
-    inhib_all    = np.stack([e["inhib"] for e in elites])[assign].reshape(-1).astype(np.uint32)
-
-    gen_buf_dict["sig_pre_map_np2_pout"].copy_from_numpy(sig_pre_all)
-    gen_buf_dict["sig_post_map_np2_pout"].copy_from_numpy(sig_post_all)
-    gen_buf_dict["inhib_sign_map_pout"].copy_from_numpy(inhib_all)
-
-    # neuromod_map の配分
-    neuromod_list = []
-    for e in elites:
-        if "neuromod" in e:
-            neuromod_list.append(np.asarray(e["neuromod"], dtype=np.float16).reshape(-1, 4))
-        else:
-            dop = np.asarray(e["dopamine"], dtype=np.float16).reshape(-1)
-            slp = np.asarray(e["sleep"], dtype=np.float16).reshape(-1)
-            nm = np.zeros((dop.size, 4), dtype=np.float16)
-            nm[:, 0] = dop
-            nm[:, 1] = slp
-            neuromod_list.append(nm)
-    neuromod_all = np.stack(neuromod_list)[assign].reshape(-1, 4).astype(np.float16)
-    neuromod_map_buf.copy_from_numpy(neuromod_all)
-
-    # --- 2. 神経パラメータの均等配分 ---
-    shared_resource_params_buf["base_output"].copy_from_numpy(
-        np.array([e["resource_base_output"] for e in elites], dtype=np.float16)[assign]
-    )
-    shared_resource_params_buf["beta"].copy_from_numpy(
-        np.array([e["resource_beta"] for e in elites], dtype=np.float16)[assign]
-    )
-    shared_resource_params_buf["k_refill"].copy_from_numpy(
-        np.array([e["resource_k_refill"] for e in elites], dtype=np.float16)[assign]
-    )
-
-    shared_link28th_params_buf["multiplier"].copy_from_numpy(
-        np.array([e["link_multiplier"] for e in elites], dtype=np.int32)[assign]
-    )
-    shared_link28th_params_buf["bias"].copy_from_numpy(
-        np.array([e["link_bias"] for e in elites], dtype=np.int32)[assign]
-    )
-
-    if "neuromod_rel_matrix" in elites[0]:
-        shared_neuromod_params_buf["neuromod_rel_matrix"].copy_from_numpy(
-            np.array([e["neuromod_rel_matrix"] for e in elites], dtype=np.float16)[assign]
-        )
-        shared_neuromod_params_buf["neuromod_weight_reaction"].copy_from_numpy(
-            np.array([e["neuromod_weight_reaction"] for e in elites], dtype=np.float16)[assign]
-        )
-        shared_neuromod_params_buf["diff"].copy_from_numpy(
-            np.array([e["neuromod_diff"] for e in elites], dtype=np.float16)[assign]
-        )
-
     defaults_fi = get_default_inout_fi(Config.dim)
-    in_list = []
-    out_list = []
-    for e in elites:
-        in_arr = np.copy(defaults_fi["in_ports_fi"])
-        out_arr = np.copy(defaults_fi["out_ports_fi"])
-        if "in_ports_fi" in e:
-            loaded_in = np.asarray(e["in_ports_fi"], dtype=np.int32).reshape(-1, 3)
-            n_in = min(len(loaded_in), NUM_IN_PORTS)
-            in_arr[:n_in] = loaded_in[:n_in]
-        else:
-            if "light_in_fi" in e and NUM_IN_PORTS >= 1:
-                in_arr[0] = np.asarray(e["light_in_fi"], dtype=np.int32).reshape(3)
-            if "battery_in_fi" in e and NUM_IN_PORTS >= 2:
-                in_arr[1] = np.asarray(e["battery_in_fi"], dtype=np.int32).reshape(3)
-
-        if "out_ports_fi" in e:
-            loaded_out = np.asarray(e["out_ports_fi"], dtype=np.int32).reshape(-1, 3)
-            n_out = min(len(loaded_out), NUM_OUT_PORTS)
-            out_arr[:n_out] = loaded_out[:n_out]
-        else:
-            if "gen_pos_out_fi" in e and NUM_OUT_PORTS >= 1:
-                out_arr[0] = np.asarray(e["gen_pos_out_fi"], dtype=np.int32).reshape(3)
-            if "gen_neg_out_fi" in e and NUM_OUT_PORTS >= 2:
-                out_arr[1] = np.asarray(e["gen_neg_out_fi"], dtype=np.int32).reshape(3)
-
-        in_list.append(in_arr)
-        out_list.append(out_arr)
-
-    in_all = np.stack(in_list)[assign].reshape(Config.m * NUM_IN_PORTS, 3).astype(np.int32)
-    out_all = np.stack(out_list)[assign].reshape(Config.m * NUM_OUT_PORTS, 3).astype(np.int32)
-
-    shared_inout_params_fi_buf["in_ports_fi"].copy_from_numpy(np.ascontiguousarray(in_all))
-    shared_inout_params_fi_buf["out_ports_fi"].copy_from_numpy(np.ascontiguousarray(out_all))
-
-    # --- 3. メタ変異パラメータ（mutation.slang）の復元 ---
-    if "mut_sig_rate" in elites[0]:
-        shared_sig_mut_buf["rate"].copy_from_numpy(
-            np.array([e["mut_sig_rate"] for e in elites], dtype=np.float16)[assign]
-        )
-        shared_sig_mut_buf["steps"].copy_from_numpy(
-            np.array([e["mut_sig_steps"] for e in elites], dtype=np.uint32)[assign]
-        )
-        shared_sig_mut_buf["max"].copy_from_numpy(
-            np.array([e["mut_sig_max"] for e in elites], dtype=np.float16)[assign]
-        )
-        shared_sig_mut_buf["diff"].copy_from_numpy(
-            np.array([e["mut_sig_diff"] for e in elites], dtype=np.float16)[assign]
-        )
-
-    if "mut_neuromod_map_rate" in elites[0]:
-        shared_neuromod_map_mut_buf["rate"].copy_from_numpy(
-            np.array([e["mut_neuromod_map_rate"] for e in elites], dtype=np.float16)[assign]
-        )
-        shared_neuromod_map_mut_buf["steps"].copy_from_numpy(
-            np.array([e["mut_neuromod_map_steps"] for e in elites], dtype=np.uint32)[assign]
-        )
-        shared_neuromod_map_mut_buf["max"].copy_from_numpy(
-            np.array([e["mut_neuromod_map_max"] for e in elites], dtype=np.float16)[assign]
-        )
-        shared_neuromod_map_mut_buf["diff"].copy_from_numpy(
-            np.array([e["mut_neuromod_map_diff"] for e in elites], dtype=np.float16)[assign]
-        )
-
-    if "mut_neuromod_params_rate" in elites[0]:
-        shared_neuromod_params_mut_buf["rate"].copy_from_numpy(
-            np.array([e["mut_neuromod_params_rate"] for e in elites], dtype=np.float16)[assign]
-        )
-
-    if "mut_iicu_rate" in elites[0]:
-        shared_iicu_mut_buf["iicu_rate"].copy_from_numpy(
-            np.array([e["mut_iicu_rate"] for e in elites], dtype=np.float16)[assign]
-        )
-
-    if "mut_resource_rate" in elites[0]:
-        shared_rlmu_mut_buf["resource_rate"].copy_from_numpy(
-            np.array([e["mut_resource_rate"] for e in elites], dtype=np.float16)[assign]
-        )
-        shared_rlmu_mut_buf["link28th_rate"].copy_from_numpy(
-            np.array([e["mut_link28th_rate"] for e in elites], dtype=np.float16)[assign]
-        )
-        shared_rlmu_mut_buf["mutate_rate"].copy_from_numpy(
-            np.array([e["mut_mutate_rate"] for e in elites], dtype=np.float16)[assign]
-        )
-
-    print("[★] 全個体への多系統エリート配分が完了しました！\n")
+    def_defaults = {
+        "base_output": shared_resource_params_buf["base_output"].to_numpy().view(np.float16)[0],
+        "beta": shared_resource_params_buf["beta"].to_numpy().view(np.float16)[0],
+        "k_refill": shared_resource_params_buf["k_refill"].to_numpy().view(np.float16)[0],
+        "multiplier": shared_link28th_params_buf["multiplier"].to_numpy().view(np.int32)[0],
+        "bias": shared_link28th_params_buf["bias"].to_numpy().view(np.int32)[0],
+        "rel_matrix": shared_neuromod_params_buf["neuromod_rel_matrix"].to_numpy().view(np.float16).reshape(Config.m, 4, 4)[0],
+        "weight_reaction": shared_neuromod_params_buf["neuromod_weight_reaction"].to_numpy().view(np.float16).reshape(Config.m, 4, 4)[0],
+        "diff": shared_neuromod_params_buf["diff"].to_numpy().view(np.float16).reshape(Config.m)[0],
+        "in_ports_fi": defaults_fi["in_ports_fi"],
+        "out_ports_fi": defaults_fi["out_ports_fi"],
+        "mut_buffers": {
+            "shared_sig_mut_buf": shared_sig_mut_buf,
+            "shared_neuromod_map_mut_buf": shared_neuromod_map_mut_buf,
+            "shared_neuromod_params_mut_buf": shared_neuromod_params_mut_buf,
+            "shared_iicu_mut_buf": shared_iicu_mut_buf,
+            "shared_rlmu_mut_buf": shared_rlmu_mut_buf,
+        },
+    }
+    EliteManager.distribute_elites_to_population(
+        folder_path=folder_path,
+        config=Config,
+        gen_buf_dict=gen_buf_dict,
+        neuromod_map_buf=neuromod_map_buf,
+        shared_resource_params_buf=shared_resource_params_buf,
+        shared_link28th_params_buf=shared_link28th_params_buf,
+        shared_neuromod_params_buf=shared_neuromod_params_buf,
+        shared_inout_params_fi_buf=shared_inout_params_fi_buf,
+        def_defaults=def_defaults,
+    )
 
 
 LOAD_CHECKPOINT_FOLDER = os.environ.get("VB_LOAD_FOLDER", "backups/elites")
@@ -647,7 +529,7 @@ if LOAD_CHECKPOINT_FOLDER and os.path.exists(LOAD_CHECKPOINT_FOLDER) and load is
 
 reasoning_sim_dict = {
     "inhib_map_all": gen_buf_dict["inhib_sign_map_pout"],
-    "global_poutputs_all": global_poutputs_buf,
+    "global_outputs_all": global_poutputs_buf,
     "membrane_all": membrane_buf,
     "signature_pre_map_np2": gen_buf_dict["sig_pre_map_np2_pout"],
     "signature_post_map_np2": gen_buf_dict["sig_post_map_np2_pout"],
@@ -708,116 +590,55 @@ def get_current_energies() -> np.ndarray:
 
 
 def save_top_k_elites(step_num: int, energies: np.ndarray, k: int = 20):
-    """上位 k 体の遺伝子を一括でGPUから抜き出して保存する"""
+    """上位 k 体の遺伝子を一括でGPUから抜き出して保存する（EliteManagerに委譲）"""
     print(f"\n[+] 終了処理: Step {step_num} 時点の上位 {k} 体を '{top20_dir}/' に保存しています...")
     device.wait()
-
-    # 上位 k 個体のインデックスを取得（降順）
-    top_indices = np.argsort(energies)[::-1][:k]
-
-    # GPU→CPU転送を1回だけで済ませるため、最初に全配列を取得
-    P_cube_4   = Config.P * Config.P * Config.P * 4
-    N_cube     = Config.N * Config.N * Config.N
-    INHIB_SIZE = Config.inhib_stride
-
-    sig_pre_all  = gen_buf_dict["sig_pre_map_np2_pout"].to_numpy().view(np.float16)
-    sig_post_all = gen_buf_dict["sig_post_map_np2_pout"].to_numpy().view(np.float16)
-    neuromod_all = neuromod_map_buf.to_numpy().view(np.float16).reshape(Config.m, N_cube, 4)
-    inhib_all    = gen_buf_dict["inhib_sign_map_pout"].to_numpy().view(np.uint32)
-
-    res_base   = shared_resource_params_buf["base_output"].to_numpy().view(np.float16)
-    res_beta   = shared_resource_params_buf["beta"].to_numpy().view(np.float16)
-    res_refill = shared_resource_params_buf["k_refill"].to_numpy().view(np.float16)
-    link_mult  = shared_link28th_params_buf["multiplier"].to_numpy().view(np.int32)
-    link_bias  = shared_link28th_params_buf["bias"].to_numpy().view(np.int32)
-
-    nm_rel   = shared_neuromod_params_buf["neuromod_rel_matrix"].to_numpy().view(np.float16).reshape(Config.m, 4, 4)
-    nm_react = shared_neuromod_params_buf["neuromod_weight_reaction"].to_numpy().view(np.float16).reshape(Config.m, 4, 4)
-    nm_diff  = shared_neuromod_params_buf["diff"].to_numpy().view(np.float16)
-
-    in_ports_fi_all  = shared_inout_params_fi_buf["in_ports_fi"].to_numpy().view(np.int32).reshape(Config.m, NUM_IN_PORTS, 3)
-    out_ports_fi_all = shared_inout_params_fi_buf["out_ports_fi"].to_numpy().view(np.int32).reshape(Config.m, NUM_OUT_PORTS, 3)
-
-    # メタ変異パラメータ（mutation.slang）の配列取得
-    mut_sig_rate_all  = shared_sig_mut_buf["rate"].to_numpy().view(np.float16).reshape(Config.m, 4)
-    mut_sig_steps_all = shared_sig_mut_buf["steps"].to_numpy().view(np.uint32)
-    mut_sig_max_all   = shared_sig_mut_buf["max"].to_numpy().view(np.float16).reshape(Config.m, 4)
-    mut_sig_diff_all  = shared_sig_mut_buf["diff"].to_numpy().view(np.float16).reshape(Config.m, 4)
-
-    mut_nm_map_rate_all  = shared_neuromod_map_mut_buf["rate"].to_numpy().view(np.float16).reshape(Config.m, 4)
-    mut_nm_map_steps_all = shared_neuromod_map_mut_buf["steps"].to_numpy().view(np.uint32)
-    mut_nm_map_max_all   = shared_neuromod_map_mut_buf["max"].to_numpy().view(np.float16).reshape(Config.m, 4)
-    mut_nm_map_diff_all  = shared_neuromod_map_mut_buf["diff"].to_numpy().view(np.float16).reshape(Config.m, 4)
-
-    mut_nm_params_rate_all = shared_neuromod_params_mut_buf["rate"].to_numpy().view(np.float16).reshape(Config.m, 4)
-
-    mut_iicu_rate_all = shared_iicu_mut_buf["iicu_rate"].to_numpy().view(np.float16).reshape(Config.m, 4)
-
-    mut_resource_rate_all = shared_rlmu_mut_buf["resource_rate"].to_numpy().view(np.float16).reshape(Config.m, 4)
-    mut_link28th_rate_all = shared_rlmu_mut_buf["link28th_rate"].to_numpy().view(np.float16).reshape(Config.m, 2)
-    mut_mutate_rate_all   = shared_rlmu_mut_buf["mutate_rate"].to_numpy().view(np.float16).reshape(Config.m, 4)
-
-    for rank, idx in enumerate(top_indices, start=1):
-        idx = int(idx)
-        score = float(energies[idx])
-        save_path = os.path.join(top20_dir, f"rank{rank:02d}_step{step_num}_energy{score:.3f}_id{idx}.npz")
-
-        np.savez_compressed(
-            save_path,
-            step=step_num,
-            score=score,
-            sig_pre=sig_pre_all[idx * P_cube_4 : (idx + 1) * P_cube_4],
-            sig_post=sig_post_all[idx * P_cube_4 : (idx + 1) * P_cube_4],
-            neuromod=neuromod_all[idx],
-            inhib=inhib_all[idx * INHIB_SIZE : (idx + 1) * INHIB_SIZE],
-            resource_base_output=res_base[idx],
-            resource_beta=res_beta[idx],
-            resource_k_refill=res_refill[idx],
-            link_multiplier=link_mult[idx],
-            link_bias=link_bias[idx],
-            neuromod_rel_matrix=nm_rel[idx],
-            neuromod_weight_reaction=nm_react[idx],
-            neuromod_diff=nm_diff[idx],
-            in_ports_fi=in_ports_fi_all[idx],
-            out_ports_fi=out_ports_fi_all[idx],
-            light_in_fi=in_ports_fi_all[idx][0] if NUM_IN_PORTS >= 1 else np.array([0, 0, 0], dtype=np.int32),
-            battery_in_fi=in_ports_fi_all[idx][1] if NUM_IN_PORTS >= 2 else np.array([0, 0, 0], dtype=np.int32),
-            gen_pos_out_fi=out_ports_fi_all[idx][0] if NUM_OUT_PORTS >= 1 else np.array([0, 0, 0], dtype=np.int32),
-            gen_neg_out_fi=out_ports_fi_all[idx][1] if NUM_OUT_PORTS >= 2 else np.array([0, 0, 0], dtype=np.int32),
-            speed_out_fi=out_ports_fi_all[idx][2] if NUM_OUT_PORTS >= 3 else np.array([0, 0, 0], dtype=np.int32),
-            rotate_out_fi=out_ports_fi_all[idx][3] if NUM_OUT_PORTS >= 4 else np.array([0, 0, 0], dtype=np.int32),
-            # メタ変異パラメータ（全遺伝情報の網羅）
-            mut_sig_rate=mut_sig_rate_all[idx],
-            mut_sig_steps=mut_sig_steps_all[idx],
-            mut_sig_max=mut_sig_max_all[idx],
-            mut_sig_diff=mut_sig_diff_all[idx],
-            mut_neuromod_map_rate=mut_nm_map_rate_all[idx],
-            mut_neuromod_map_steps=mut_nm_map_steps_all[idx],
-            mut_neuromod_map_max=mut_nm_map_max_all[idx],
-            mut_neuromod_map_diff=mut_nm_map_diff_all[idx],
-            mut_neuromod_params_rate=mut_nm_params_rate_all[idx],
-            mut_iicu_rate=mut_iicu_rate_all[idx],
-            mut_resource_rate=mut_resource_rate_all[idx],
-            mut_link28th_rate=mut_link28th_rate_all[idx],
-            mut_mutate_rate=mut_mutate_rate_all[idx],
-        )
-
-    print(f"[★] 上位 {k} 体の保存が完了しました！(1位スコア: {energies[top_indices[0]]:.3f} ~ {k}位スコア: {energies[top_indices[-1]]:.3f})")
-    first_rank_path = os.path.join(top20_dir, f"rank01_step{step_num}_energy{float(energies[top_indices[0]]):.3f}_id{int(top_indices[0])}.npz")
-    print(f"  -> {first_rank_path}")
+    EliteManager.save_top_k(
+        target_dir=top20_dir,
+        energies=energies,
+        step=step_num,
+        config=Config,
+        gen_buf_dict=gen_buf_dict,
+        neuromod_map_buf=neuromod_map_buf,
+        shared_resource_params_buf=shared_resource_params_buf,
+        shared_link28th_params_buf=shared_link28th_params_buf,
+        shared_neuromod_params_buf=shared_neuromod_params_buf,
+        shared_inout_params_fi_buf=shared_inout_params_fi_buf,
+        k=k,
+        sync_latest_best=True,
+        backups_root="backups",
+        shared_sig_mut_buf=shared_sig_mut_buf,
+        shared_neuromod_map_mut_buf=shared_neuromod_map_mut_buf,
+        shared_neuromod_params_mut_buf=shared_neuromod_params_mut_buf,
+        shared_iicu_mut_buf=shared_iicu_mut_buf,
+        shared_rlmu_mut_buf=shared_rlmu_mut_buf,
+    )
+    print(f"[★] 上位 {k} 体の保存完了 & backups/latest_best.npz 同期完了！")
 
 
 TOTAL_STEPS = int(os.environ.get("VB_TOTAL_STEPS", "50000"))
+WAIT_INTERVAL = max(1, int(os.environ.get("VB_WAIT_INTERVAL", "1")))
 STOP_FILE = os.environ.get("VB_STOP_FILE", "")
 best_max_energy = BASE_ENERGY + 0.005
 last_completed_step = 0
 latest_energies = np.zeros(Config.m, dtype=np.float32)
 
+periodic_save_interval = EliteManager.calculate_save_interval(TOTAL_STEPS)
+
+interval_start_time = time.perf_counter()
+interval_steps = 0
+
+print(f"[+] 実行設定: 総ステップ数={TOTAL_STEPS}, GPU同期(wait)間隔={WAIT_INTERVAL}st, 定期保存間隔={periodic_save_interval}st")
+
 for step in range(TOTAL_STEPS):
     if stop_requested:
         break
 
-    start_time_output = time.perf_counter()
+    interval_steps += 1
+    has_stop_signal = bool(STOP_FILE and os.path.exists(STOP_FILE))
+    # 同期ステップ: 初回(step==0), 指定間隔(interval_steps >= WAIT_INTERVAL), 最終ステップ, または停止要求時
+    is_sync_step = (step == 0) or (interval_steps >= WAIT_INTERVAL) or (step == TOTAL_STEPS - 1) or has_stop_signal
+
     reasoning_sim_dict["step"] = step
     mutation_dict["step"] = step
     
@@ -828,109 +649,112 @@ for step in range(TOTAL_STEPS):
         thread_count=(Config.m * Config.N, Config.N, Config.N),
         **reasoning_sim_dict
     )
-    device.wait()
-
-    end_time_output = time.perf_counter()
-    elapsed_time_output = end_time_output - start_time_output
+    if is_sync_step:
+        device.wait()
 
     # -----------------------------------------------------------------
-    # 2. 上書きされる「前」の純粋な状態でエネルギーを取得・集計・保存する！
+    # 2. 同期ステップの場合のみ、エネルギーを取得・集計・ログ出力・保存
     # -----------------------------------------------------------------
-    energies = get_current_energies()
-    latest_energies = energies
-    last_completed_step = step
-    
-    max_energy  = float(np.max(energies))
-    mean_energy = float(np.mean(energies))
-    
-    gained_count = int(np.count_nonzero(energies > BASE_ENERGY + 0.002))
-    stay_count   = int(np.count_nonzero(np.abs(energies - BASE_ENERGY) <= 0.002))
-    elite_ge04   = int(np.count_nonzero(energies >= 0.40))
-    
-    top10 = [round(float(x), 3) for x in np.sort(energies)[::-1][:10]]
+    if is_sync_step:
+        now = time.perf_counter()
+        elapsed_interval = now - interval_start_time
+        elapsed_per_step = elapsed_interval / max(1, interval_steps)
 
-    print(
-        f"Step {step:05d} | {elapsed_time_output:.3f}s | "
-        f"黒字(>0.2): {gained_count:4d}体 | (静止=0.2: {stay_count:4d}, 0.4+: {elite_ge04:4d}) | "
-        f"Max: {max_energy:.3f} | Mean: {mean_energy:.3f} | Top5: {top10[:5]}"
-    )
-
-    with open(log_filename, mode="a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            step,
-            f"{elapsed_time_output:.4f}",
-            gained_count,
-            stay_count,
-            elite_ge04,
-            f"{mean_energy:.4f}",
-            f"{max_energy:.4f}",
-            f'"{top10}"'
-        ])
-        f.flush()
-
-    # ★ 変異前の「本物の最高個体」を保存！
-    if max_energy > best_max_energy:
-        best_max_energy = max_energy
-        best_idx = int(np.argmax(energies))
-        save_path = os.path.join(checkpoint_dir, f"best_step{step}_energy{max_energy:.3f}_id{best_idx}.npz")
+        energies = get_current_energies()
+        latest_energies = energies
+        last_completed_step = step
         
-        P_cube_4 = Config.P * Config.P * Config.P * 4
-        N_cube   = Config.N * Config.N * Config.N
-        INHIB_SIZE = Config.inhib_stride
+        max_energy  = float(np.max(energies))
+        mean_energy = float(np.mean(energies))
         
-        sig_pre_elite  = gen_buf_dict["sig_pre_map_np2_pout"].to_numpy().view(np.float16)[best_idx * P_cube_4 : (best_idx + 1) * P_cube_4]
-        sig_post_elite = gen_buf_dict["sig_post_map_np2_pout"].to_numpy().view(np.float16)[best_idx * P_cube_4 : (best_idx + 1) * P_cube_4]
-        neuromod_elite = neuromod_map_buf.to_numpy().view(np.float16).reshape(Config.m, N_cube, 4)[best_idx]
-        inhib_elite    = gen_buf_dict["inhib_sign_map_pout"].to_numpy().view(np.uint32)[best_idx * INHIB_SIZE : (best_idx + 1) * INHIB_SIZE]
+        gained_count = int(np.count_nonzero(energies > BASE_ENERGY + 0.002))
+        stay_count   = int(np.count_nonzero(np.abs(energies - BASE_ENERGY) <= 0.002))
+        elite_ge04   = int(np.count_nonzero(energies >= 0.40))
+        
+        top10 = [round(float(x), 3) for x in np.sort(energies)[::-1][:10]]
 
-        nm_rel_elite   = shared_neuromod_params_buf["neuromod_rel_matrix"].to_numpy().view(np.float16).reshape(Config.m, 4, 4)[best_idx]
-        nm_react_elite = shared_neuromod_params_buf["neuromod_weight_reaction"].to_numpy().view(np.float16).reshape(Config.m, 4, 4)[best_idx]
-        nm_diff_elite  = shared_neuromod_params_buf["diff"].to_numpy().view(np.float16)[best_idx]
+        if WAIT_INTERVAL == 1 or interval_steps == 1:
+            speed_str = f"{elapsed_per_step:.3f}s"
+        else:
+            speed_str = f"{elapsed_per_step:.3f}s/step ({elapsed_interval:.2f}s/{interval_steps}st)"
 
-        np.savez_compressed(
-            save_path,
-            step=step,
-            score=max_energy,
-            sig_pre=sig_pre_elite,
-            sig_post=sig_post_elite,
-            neuromod=neuromod_elite,
-            inhib=inhib_elite,
-            resource_base_output=shared_resource_params_buf["base_output"].to_numpy().view(np.float16)[best_idx],
-            resource_beta=shared_resource_params_buf["beta"].to_numpy().view(np.float16)[best_idx],
-            resource_k_refill=shared_resource_params_buf["k_refill"].to_numpy().view(np.float16)[best_idx],
-            link_multiplier=shared_link28th_params_buf["multiplier"].to_numpy().view(np.int32)[best_idx],
-            link_bias=shared_link28th_params_buf["bias"].to_numpy().view(np.int32)[best_idx],
-            neuromod_rel_matrix=nm_rel_elite,
-            neuromod_weight_reaction=nm_react_elite,
-            neuromod_diff=nm_diff_elite,
-            in_ports_fi=shared_inout_params_fi_buf["in_ports_fi"].to_numpy().view(np.int32).reshape(Config.m, NUM_IN_PORTS, 3)[best_idx],
-            out_ports_fi=shared_inout_params_fi_buf["out_ports_fi"].to_numpy().view(np.int32).reshape(Config.m, NUM_OUT_PORTS, 3)[best_idx],
-            light_in_fi=shared_inout_params_fi_buf["in_ports_fi"].to_numpy().view(np.int32).reshape(Config.m, NUM_IN_PORTS, 3)[best_idx][0] if NUM_IN_PORTS >= 1 else np.array([0, 0, 0], dtype=np.int32),
-            battery_in_fi=shared_inout_params_fi_buf["in_ports_fi"].to_numpy().view(np.int32).reshape(Config.m, NUM_IN_PORTS, 3)[best_idx][1] if NUM_IN_PORTS >= 2 else np.array([0, 0, 0], dtype=np.int32),
-            gen_pos_out_fi=shared_inout_params_fi_buf["out_ports_fi"].to_numpy().view(np.int32).reshape(Config.m, NUM_OUT_PORTS, 3)[best_idx][0] if NUM_OUT_PORTS >= 1 else np.array([0, 0, 0], dtype=np.int32),
-            gen_neg_out_fi=shared_inout_params_fi_buf["out_ports_fi"].to_numpy().view(np.int32).reshape(Config.m, NUM_OUT_PORTS, 3)[best_idx][1] if NUM_OUT_PORTS >= 2 else np.array([0, 0, 0], dtype=np.int32),
-            speed_out_fi=shared_inout_params_fi_buf["out_ports_fi"].to_numpy().view(np.int32).reshape(Config.m, NUM_OUT_PORTS, 3)[best_idx][2] if NUM_OUT_PORTS >= 3 else np.array([0, 0, 0], dtype=np.int32),
-            rotate_out_fi=shared_inout_params_fi_buf["out_ports_fi"].to_numpy().view(np.int32).reshape(Config.m, NUM_OUT_PORTS, 3)[best_idx][3] if NUM_OUT_PORTS >= 4 else np.array([0, 0, 0], dtype=np.int32),
-            # メタ変異パラメータ（全遺伝情報の網羅）
-            mut_sig_rate=shared_sig_mut_buf["rate"].to_numpy().view(np.float16).reshape(Config.m, 4)[best_idx],
-            mut_sig_steps=shared_sig_mut_buf["steps"].to_numpy().view(np.uint32)[best_idx],
-            mut_sig_max=shared_sig_mut_buf["max"].to_numpy().view(np.float16).reshape(Config.m, 4)[best_idx],
-            mut_sig_diff=shared_sig_mut_buf["diff"].to_numpy().view(np.float16).reshape(Config.m, 4)[best_idx],
-            mut_neuromod_map_rate=shared_neuromod_map_mut_buf["rate"].to_numpy().view(np.float16).reshape(Config.m, 4)[best_idx],
-            mut_neuromod_map_steps=shared_neuromod_map_mut_buf["steps"].to_numpy().view(np.uint32)[best_idx],
-            mut_neuromod_map_max=shared_neuromod_map_mut_buf["max"].to_numpy().view(np.float16).reshape(Config.m, 4)[best_idx],
-            mut_neuromod_map_diff=shared_neuromod_map_mut_buf["diff"].to_numpy().view(np.float16).reshape(Config.m, 4)[best_idx],
-            mut_neuromod_params_rate=shared_neuromod_params_mut_buf["rate"].to_numpy().view(np.float16).reshape(Config.m, 4)[best_idx],
-            mut_iicu_rate=shared_iicu_mut_buf["iicu_rate"].to_numpy().view(np.float16).reshape(Config.m, 4)[best_idx],
-            mut_resource_rate=shared_rlmu_mut_buf["resource_rate"].to_numpy().view(np.float16).reshape(Config.m, 4)[best_idx],
-            mut_link28th_rate=shared_rlmu_mut_buf["link28th_rate"].to_numpy().view(np.float16).reshape(Config.m, 2)[best_idx],
-            mut_mutate_rate=shared_rlmu_mut_buf["mutate_rate"].to_numpy().view(np.float16).reshape(Config.m, 4)[best_idx],
+        print(
+            f"Step {step:05d} | {speed_str} | "
+            f"黒字(>0.2): {gained_count:4d}体 | (静止=0.2: {stay_count:4d}, 0.4+: {elite_ge04:4d}) | "
+            f"Max: {max_energy:.3f} | Mean: {mean_energy:.3f} | Top5: {top10[:5]}"
         )
-        print(f"  [★] 過去最高エリート（変異前・本物）を保存しました -> {save_path}")
 
-    # ★ 最終ステップ、または Ctrl+C が押されていたら「変異（上書き）せず」にループを抜ける！
-    if STOP_FILE and os.path.exists(STOP_FILE):
+        with open(log_filename, mode="a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                step,
+                f"{elapsed_per_step:.4f}",
+                gained_count,
+                stay_count,
+                elite_ge04,
+                f"{mean_energy:.4f}",
+                f"{max_energy:.4f}",
+                f'"{top10}"'
+            ])
+            f.flush()
+
+        # ★ 変異前の「本物の最高個体」を保存！
+        if max_energy > best_max_energy:
+            best_max_energy = max_energy
+            best_idx = int(np.argmax(energies))
+            save_path = os.path.join(checkpoint_dir, f"best_step{step}_energy{max_energy:.3f}_id{best_idx}.npz")
+            
+            best_genome = EliteManager.extract_genome_dict(
+                idx=best_idx,
+                score=max_energy,
+                step=step,
+                config=Config,
+                gen_buf_dict=gen_buf_dict,
+                neuromod_map_buf=neuromod_map_buf,
+                shared_resource_params_buf=shared_resource_params_buf,
+                shared_link28th_params_buf=shared_link28th_params_buf,
+                shared_neuromod_params_buf=shared_neuromod_params_buf,
+                shared_inout_params_fi_buf=shared_inout_params_fi_buf,
+                shared_sig_mut_buf=shared_sig_mut_buf,
+                shared_neuromod_map_mut_buf=shared_neuromod_map_mut_buf,
+                shared_neuromod_params_mut_buf=shared_neuromod_params_mut_buf,
+                shared_iicu_mut_buf=shared_iicu_mut_buf,
+                shared_rlmu_mut_buf=shared_rlmu_mut_buf,
+            )
+            EliteManager.save_single_elite(save_path, best_genome, sync_latest_best=True, backups_root="backups")
+            print(f"  [★] 過去最高エリート（変異前・本物）を保存しました -> {save_path} (latest_best.npz 同期済)")
+
+        # ★ 定期チェックポイント保存（総ステップ数から自動計算された間隔で保存）
+        if step > 0 and step % periodic_save_interval == 0:
+            periodic_dir = os.path.join(checkpoint_dir, f"periodic_step{step:05d}")
+            EliteManager.save_top_k(
+                target_dir=periodic_dir,
+                energies=energies,
+                step=step,
+                config=Config,
+                gen_buf_dict=gen_buf_dict,
+                neuromod_map_buf=neuromod_map_buf,
+                shared_resource_params_buf=shared_resource_params_buf,
+                shared_link28th_params_buf=shared_link28th_params_buf,
+                shared_neuromod_params_buf=shared_neuromod_params_buf,
+                shared_inout_params_fi_buf=shared_inout_params_fi_buf,
+                k=5,
+                sync_latest_best=False,
+                backups_root="backups",
+                shared_sig_mut_buf=shared_sig_mut_buf,
+                shared_neuromod_map_mut_buf=shared_neuromod_map_mut_buf,
+                shared_neuromod_params_mut_buf=shared_neuromod_params_mut_buf,
+                shared_iicu_mut_buf=shared_iicu_mut_buf,
+                shared_rlmu_mut_buf=shared_rlmu_mut_buf,
+            )
+            print(f"  [💾] 定期チェックポイント保存完了 (Top 5) -> {periodic_dir}/")
+
+        # 次のインターバルに向けてタイマーリセット
+        interval_start_time = time.perf_counter()
+        interval_steps = 0
+
+    # ★ 最終ステップ、または Ctrl+C / 安全停止が押されていたら「変異（上書き）せず」にループを抜ける！
+    if has_stop_signal:
         print("\n[!] 停止リクエストを検知しました。現在のステップの上位20体を保存して安全に終了します...")
         stop_requested = True
     if stop_requested or step == TOTAL_STEPS - 1:
@@ -943,10 +767,15 @@ for step in range(TOTAL_STEPS):
         thread_count=(Config.m * Config.N, Config.N, Config.N),
         **mutation_dict
     )
-    device.wait()
+    if is_sync_step:
+        device.wait()
 
 # =====================================================================
 # ループ終了時（変異で上書きされる前の純粋な上位20体を一括保存！）
 # =====================================================================
+device.wait()
+if last_completed_step != step:
+    latest_energies = get_current_energies()
+    last_completed_step = step
 save_top_k_elites(last_completed_step, latest_energies, k=20)
 print("wow")
