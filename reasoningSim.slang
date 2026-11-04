@@ -6,27 +6,6 @@
 #define DIM 2
 #endif
 
-#ifndef ENABLE_LEARNING
-#define ENABLE_LEARNING 0.0h
-#endif
-#ifndef USE_LEARNING
-#define USE_LEARNING 0
-#endif
-
-#ifndef ENABLE_DOPAMINE
-#define ENABLE_DOPAMINE 0.0h
-#endif
-#ifndef USE_DOPAMINE
-#define USE_DOPAMINE 0
-#endif
-
-#ifndef ENABLE_SLEEP
-#define ENABLE_SLEEP 0.0h
-#endif
-#ifndef USE_SLEEP
-#define USE_SLEEP 0
-#endif
-
 #ifndef INITIAL_ENERGY
 #define INITIAL_ENERGY 0.20f
 #endif
@@ -66,7 +45,31 @@
 #define TOTAL_NP2H2 (TOTAL_NP2 >> 1)
 
 #define MAX_WAVE    (64)
-#define INNER_STEPS (1000)
+#ifndef INNER_STEPS
+#define INNER_STEPS (30)
+#endif
+
+#define NEUROMOD_NUM (4)
+
+#ifndef ONE_SIM
+#define ONE_SIM (0)
+#endif
+
+#ifndef VRAM_SYNC_MODE
+#if ONE_SIM == 1
+#define VRAM_SYNC_MODE (1)
+#else
+#define VRAM_SYNC_MODE (0)
+#endif
+#endif
+
+#ifndef KO_MASK_ENABLED
+#if ONE_SIM == 1
+#define KO_MASK_ENABLED (1)
+#else
+#define KO_MASK_ENABLED (0)
+#endif
+#endif
 
 // =============================================================================
 // 3. パラメータ構造体 ＆ シナプスデータ管理構造体
@@ -83,49 +86,43 @@ struct ResourceParamsAll {
     StructuredBuffer<half> k_refill;
 }
 
-struct Link27thParams {
+struct Link28thParams {
     uint multiplier;
     uint bias;
 }
 
-struct Link27thParamsAll {
+struct Link28thParamsAll {
     StructuredBuffer<uint> multiplier;
     StructuredBuffer<uint> bias;
 }
 
-struct LearningParams {
-    half learning_rate;
-    half forget_rate;
-    half learning_threshold;
-    half tag_decay;
-}
+#ifndef NUM_IN_PORTS
+#define NUM_IN_PORTS 2
+#endif
+#ifndef NUM_OUT_PORTS
+#define NUM_OUT_PORTS 2
+#endif
+#ifndef SPEED_GAIN
+#define SPEED_GAIN 0.05f
+#endif
+#ifndef ROTATE_GAIN
+#define ROTATE_GAIN 0.1f
+#endif
 
-struct LearningParamsAll {
-    StructuredBuffer<half> learning_rate;
-    StructuredBuffer<half> forget_rate;
-    StructuredBuffer<half> learning_threshold;
-    StructuredBuffer<half> tag_decay;
-}
+struct InoutParamsFiAll {
+    RWStructuredBuffer<int3[NUM_IN_PORTS]> in_ports_fi;
+    RWStructuredBuffer<int3[NUM_OUT_PORTS]> out_ports_fi;
 
-struct InoutParams {
-    int3 light_in;
-    int3 battery_in;
-    int3 gen_neg_out;
-    int3 gen_pos_out;
-
-    static InoutParams load(
-        int3 light_in,
-        int3 battery_in,
-        int3 gen_neg_out,
-        int3 gen_pos_out
-    ) {
-        InoutParams p;
-        p.light_in    = light_in;
-        p.battery_in  = battery_in;
-        p.gen_neg_out = gen_neg_out;
-        p.gen_pos_out = gen_pos_out;
-        return p;
+    [ForceInline]
+    void store(uint agent_id, InoutParamsFi ipf) {
+        in_ports_fi[agent_id] = ipf.in_coords_fi;
+        out_ports_fi[agent_id] = ipf.out_coords_fi;
     }
+};
+
+struct InoutParamsFi {
+    int3 in_coords_fi[NUM_IN_PORTS];
+    int3 out_coords_fi[NUM_OUT_PORTS];
 
     // 入力セル用: 外周膜の6面 (面座標 = -1 または N, 面内座標 = -1 .. N)
     static int3 faceIndex_to_coordIn(int3 face_index) {
@@ -157,32 +154,45 @@ struct InoutParams {
         return table[clamp(face_index.x, 0, 5)];
     }
 
-    static InoutParams load_face_index(
-        int3 light_in_fi,
-        int3 battery_in_fi,
-        int3 gen_neg_out_fi,
-        int3 gen_pos_out_fi
-    ) {
-        InoutParams p;
-        p.light_in    = faceIndex_to_coordIn(light_in_fi);
-        p.battery_in  = faceIndex_to_coordIn(battery_in_fi);
-        p.gen_neg_out = faceIndex_to_coordOut(gen_neg_out_fi);
-        p.gen_pos_out = faceIndex_to_coordOut(gen_pos_out_fi);
+    int3 get_in_coord(uint idx) {
+        return faceIndex_to_coordIn(in_coords_fi[idx]);
+    }
+
+    int3 get_out_coord(uint idx) {
+        return faceIndex_to_coordOut(out_coords_fi[idx]);
+    }
+
+    static InoutParamsFi load(uint agent_id, InoutParamsFiAll lpf_all) {
+        InoutParamsFi p;
+        p.in_coords_fi = lpf_all.in_ports_fi[agent_id];
+        p.out_coords_fi = lpf_all.out_ports_fi[agent_id];
         return p;
+    }
+};
+
+struct NeuromodParamsAll {
+    StructuredBuffer<half4x4> neuromod_rel_matrix;
+    StructuredBuffer<half4[NEUROMOD_NUM]> neuromod_weight_reaction;
+    StructuredBuffer<half> diff;
+}
+
+struct NeuromodParams {
+    half4x4 neuromod_rel_matrix;
+    half4[NEUROMOD_NUM] neuromod_weight_reaction;
+    half diff;
+
+    static NeuromodParams load(uint agent_id, NeuromodParamsAll np_map) {
+        NeuromodParams np;
+        np.neuromod_rel_matrix = np_map.neuromod_rel_matrix[agent_id];
+        np.neuromod_weight_reaction = np_map.neuromod_weight_reaction[agent_id];
+        np.diff = np_map.diff[agent_id];
+        return np;
     }
 }
 
-struct InoutParamsFiAll {
-    StructuredBuffer<int3> light_in_fi;
-    StructuredBuffer<int3> battery_in_fi;
-    StructuredBuffer<int3> gen_neg_out_fi;
-    StructuredBuffer<int3> gen_pos_out_fi;
-}
-
-// 各ニューロンが持つ28個のシナプス（近傍3x3x3=27個 ＋ 長距離27thリンク1個）
+// 各ニューロンが持つ28個のシナプス（近傍3x3x3=27個 ＋ 長距離28thリンク1個）
 struct SynapseData {
     half weights[28];
-    half tags[28];
 
     [ForceInline]
     static uint relCoordToSlot(int3 coord_rel) {
@@ -195,76 +205,83 @@ struct SynapseData {
         return weights[relCoordToSlot(coord_rel)];
     }
 
-    [ForceInline]
-    half get_tag(int3 coord_rel) {
-        return tags[relCoordToSlot(coord_rel)];
-    }
-
     [mutating]
     [ForceInline]
     void set_weights(int3 coord_rel, half val) {
         weights[relCoordToSlot(coord_rel)] = val;
     }
 
-    [mutating]
-    [ForceInline]
-    void set_tags(int3 coord_rel, half val) {
-        tags[relCoordToSlot(coord_rel)] = val;
-    }
-
     // --- インデックス直接指定 ---
     [ForceInline]
     half get_weight_idx(int idx) { return weights[idx]; }
-
-    [ForceInline]
-    half get_tag_idx(int idx) { return tags[idx]; }
 
     [mutating]
     [ForceInline]
     void set_weights_idx(int idx, half val) { weights[idx] = val; }
 
-    [mutating]
-    [ForceInline]
-    void set_tags_idx(int idx, half val) { tags[idx] = val; }
-
     // --- 長距離シナプス (スロット27) ---
     [ForceInline]
-    half get_weight_27th() { return weights[27]; }
-
-    [ForceInline]
-    half get_tag_27th() { return tags[27]; }
+    half get_weight_28th() { return weights[27]; }
 
     [mutating]
     [ForceInline]
-    void set_weights_27th(half val) { weights[27] = val; }
+    void set_weights_28th(half val) { weights[27] = val; }
+}
 
-    [mutating]
-    [ForceInline]
-    void set_tags_27th(half val) { tags[27] = val; }
+struct Half8All {
+    StructuredBuffer<half4> hi_vec;
+    StructuredBuffer<half4> lo_vec;
+}
 
-    // --- シナプスタグの8bit×4パック入出力 (28個 = uint32 × 7要素) ---
-    [ForceInline]
-    uint get_tag_idx_ui7(int idx_ui7) {
-        int base_idx = idx_ui7 * 4;
-        return pack_u8(uint4(
-            uint(round(tags[base_idx + 0] * 255.0h)),
-            uint(round(tags[base_idx + 1] * 255.0h)),
-            uint(round(tags[base_idx + 2] * 255.0h)),
-            uint(round(tags[base_idx + 3] * 255.0h))
-        ));
-    }
+struct Half8 {
+    half4 hi_vec;
+    half4 lo_vec;
 
-    [mutating]
-    [ForceInline]
-    void set_tags_idx_ui7(int idx_ui7, uint val) {
-        half4 unpacked_val = half4(unpack_u8u32(val)) * (1.0h / 255.0h);
-        int base_idx = idx_ui7 * 4;
-        tags[base_idx + 0] = unpacked_val.x;
-        tags[base_idx + 1] = unpacked_val.y;
-        tags[base_idx + 2] = unpacked_val.z;
-        tags[base_idx + 3] = unpacked_val.w;
+    static Half8 load(uint agent_id, Half8All h8_all) {
+        Half8 h8;
+        h8.hi_vec = h8_all.hi_vec[agent_id];
+        h8.lo_vec = h8_all.lo_vec[agent_id];
+        return h8;
     }
 }
+
+Half8 saturate(Half8 h8) {
+    Half8 r;
+    r.hi_vec = saturate(h8.hi_vec);
+    r.lo_vec = saturate(h8.lo_vec);
+    return r;
+}
+
+struct Half88 {
+    half4 ri_row[8]; // right
+    half4 le_row[8]; // left
+}
+
+Half88 saturate(Half88 h88) {
+    Half88 r;
+    for (uint i = 0; i < 8; i++) {
+        r.le_row[i] = saturate(h88.le_row[i]);
+        r.ri_row[i] = saturate(h88.ri_row[i]);
+    }
+    return r;
+}
+
+Half8 mul88x8(Half88 h88, Half8 h8) {
+    half r[8];
+
+    [unroll]
+    for (uint i = 0; i < 8; i++) {
+        r[i] = dot(h88.ri_row[i], h8.hi_vec) + dot(h88.le_row[i], h8.lo_vec);
+    }
+
+    Half8 result;
+    result.hi_vec = half4(r[0], r[1], r[2], r[3]);
+    result.lo_vec = half4(r[4], r[5], r[6], r[7]);
+
+    return result;
+}
+
+
 
 // =============================================================================
 // 4. グループ共有メモリ (1グループ = 1個体)
@@ -273,13 +290,15 @@ groupshared half  outputs_s[TOTAL_NP2];         // ニューロン出力＆外�
 groupshared half4 sig_pre_map_s[TOTAL_NP2];     // シナプス前シグネチャ
 groupshared half4 sig_post_map_s[TOTAL_NP2];    // シナプス後シグネチャ
 
-groupshared half  dopamine_wave_sums[MAX_WAVE]; // Wave単位のドーパミン部分和
-groupshared half  my_dopamine_sum;              // 個体全体のドーパミン総量
-groupshared half  sleep_wave_sums[MAX_WAVE];    // Wave単位の睡眠シグナル部分和
-groupshared half  my_sleep_sum;                 // 個体全体の睡眠シグナル総量
+groupshared half4 neuromod_map_s[TOTAL_N][2]; // 神経修飾物質
+groupshared NeuromodParams neuromod_params;
 
 groupshared float my_energy_s; // 個体の現在エネルギー残量
-groupshared InoutParams inout_params_s;
+groupshared InoutParamsFi inout_params_s;
+
+groupshared float2 my_pos_s;
+groupshared float my_angle_s;
+groupshared float2 my_obj_s;
 
 
 // =============================================================================
@@ -376,6 +395,11 @@ uint pcg_hash(uint input) {
     return (word >> 22u) ^ word;
 }
 
+half rand_half(uint input) {
+    uint h1 = pcg_hash(input);
+    return half(float(h1) / 4294967295.0);
+}
+
 half2 rand_half2(uint input) {
     uint h1 = pcg_hash(input);
     uint h2 = pcg_hash(h1 + 1u);
@@ -394,14 +418,9 @@ half2 rand_half2(uint input) {
 void init_synapse_weights(
     uint3 groupThreadID,
     uint groupIndex,
-    Link27thParams link27th_params,
+    Link28thParams link28th_params,
     inout SynapseData synapse_data
 ) {
-    [unroll]
-    for (uint idx_ui7 = 0; idx_ui7 < 7; idx_ui7++) {
-        synapse_data.set_tags_idx_ui7(idx_ui7, 0u);
-    }
-
     half4 my_post = get_sig_post(groupThreadID);
 
     // 近傍 3x3x3 シナプス重みの初期化
@@ -420,68 +439,98 @@ void init_synapse_weights(
     }
 
     // 28番目（長距離リンク）シナプス重みの初期化
-    uint3 sig_27th_coord = indexToCoordN(groupIndex * link27th_params.multiplier + link27th_params.bias);
-    half4 sig_27th_pre = get_sig_pre(sig_27th_coord);
-    half weight_27th = saturate(0.25h * dot(my_post, sig_27th_pre));
-    synapse_data.set_weights_27th(weight_27th);
-}
-
-// ドーパミン・睡眠シグナルのWave横断リダクション集計
-[ForceInline]
-void reduce_neuromodulators(
-    uint groupIndex,
-    half my_output,
-    half my_dopamine_map,
-    half my_sleep_map
-) {
-#if USE_DOPAMINE || USE_SLEEP
-    half my_dopamine = abs(my_output) * my_dopamine_map;
-    half my_sleep    = abs(my_output) * my_sleep_map;
-
-    half dopamine_wave_sum = WaveActiveSum(my_dopamine);
-    half sleep_wave_sum    = WaveActiveSum(my_sleep);
-
-    uint waveIndex = groupIndex / WaveGetLaneCount();
-    if (WaveIsFirstLane()) {
-        dopamine_wave_sums[waveIndex] = dopamine_wave_sum;
-        sleep_wave_sums[waveIndex]    = sleep_wave_sum;
-    }
-
-    GroupMemoryBarrierWithGroupSync();
-
-    uint num_waves = (TOTAL_N + WaveGetLaneCount() - 1) / WaveGetLaneCount();
-    half local_dopamine_sum = (groupIndex < num_waves) ? dopamine_wave_sums[groupIndex] : 0.0h;
-    half local_sleep_sum    = (groupIndex < num_waves) ? sleep_wave_sums[groupIndex]    : 0.0h;
-
-    half final_dopamine_sum = WaveActiveSum(local_dopamine_sum);
-    half final_sleep_sum    = saturate(WaveActiveSum(local_sleep_sum));
-
-    if (groupIndex == 0) {
-        my_dopamine_sum = final_dopamine_sum * half(ENABLE_DOPAMINE);
-        my_sleep_sum    = saturate(final_sleep_sum * half(ENABLE_SLEEP));
-    }
-    GroupMemoryBarrierWithGroupSync();
-#endif
+    uint3 sig_28th_coord = indexToCoordN(groupIndex * link28th_params.multiplier + link28th_params.bias);
+    half4 sig_28th_pre = get_sig_pre(sig_28th_coord);
+    half weight_28th = saturate(0.25h * dot(my_post, sig_28th_pre));
+    synapse_data.set_weights_28th(weight_28th);
 }
 
 // 太陽光サイクル・発電コスト・エネルギー収支の更新と感覚入力膜への書き込み (Thread 0 が実行)
 [ForceInline]
 void update_solar_energy_and_sensors(uint inner_step) {
     float current_sunlight = saturate(sinpi(inner_step * (1.0 / SUN_CYCLE_PERIOD)));
-    half generator_power = saturate(get_output_s(inout_params_s.gen_pos_out) - get_output_s(inout_params_s.gen_neg_out));
+    
+    // 出力スロット 0: gen_pos, 1: gen_neg, 2: speed_out, 3: rotate_out
+    half generator_power = 0.0h;
+    if (NUM_OUT_PORTS >= 2) {
+        generator_power = saturate(get_output_s(inout_params_s.get_out_coord(0)) - get_output_s(inout_params_s.get_out_coord(1)));
+    } else if (NUM_OUT_PORTS == 1) {
+        generator_power = saturate(get_output_s(inout_params_s.get_out_coord(0)));
+    }
 
     if (my_energy_s > 0.0f) {
+        my_angle_s += (float)get_output_s(inout_params_s.get_out_coord(3)) * ROTATE_GAIN;
+        float my_speed = (float)get_output_s(inout_params_s.get_out_coord(2)) * SPEED_GAIN;
+        my_pos_s += float2(cos(my_angle_s), sin(my_angle_s)) * my_speed;
+        my_pos_s = clamp(my_pos_s, -2.0, 2.0);
+
+        float2 diff = my_pos_s - my_obj_s;
+        float dist_dot = dot(diff, diff);
+
+        // float energy_coefficient = 2.0 / (1.0 + 0.5 * dist_dot);
+        float energy_coefficient = 1.0h;
+
         my_energy_s -= METABOLIC_COST;
         my_energy_s -= float(abs(generator_power)) * GEN_COST_RATE;
-        my_energy_s += SOLAR_GAIN_RATE * abs(generator_power) * current_sunlight;
+        my_energy_s += SOLAR_GAIN_RATE * abs(generator_power) * current_sunlight * energy_coefficient;
         my_energy_s = saturate(my_energy_s);
     } else {
         my_energy_s = 0.0f;
     }
 
-    // 外周膜の感覚セルへ現在のエネルギーと日照量を書き込む
-    set_output_s(inout_params_s.battery_in, half(my_energy_s));
-    set_output_s(inout_params_s.light_in, half(current_sunlight));
+    // 外周膜の感覚セルへ書き込む (スロット 0: sunlight, 1: battery)
+    if (NUM_IN_PORTS >= 1) {
+        set_output_s(inout_params_s.get_in_coord(0), half(current_sunlight));
+    }
+    if (NUM_IN_PORTS >= 2) {
+        set_output_s(inout_params_s.get_in_coord(1), half(my_energy_s));
+    }
+}
+
+half4 get_neuromod(uint3 center_coord, int3 coord_rel, uint step) {
+    int3 target_coord = center_coord + coord_rel;
+    bool is_inside = all(0 <= target_coord) && all(target_coord <= N - 1);
+    return is_inside
+        ? neuromod_map_s[coordToIndexN(uint3(target_coord))][step & 1u]
+        : neuromod_map_s[coordToIndexN(center_coord)][step & 1u];
+}
+
+half4 get_idx_neuromod(uint idx, uint step) {
+    return neuromod_map_s[idx][step & 1u];
+}
+
+void set_idx_neuromod(uint idx, uint step, half4 val) {
+    neuromod_map_s[idx][step & 1u] = val;
+}
+
+void set_neuromod(uint3 center_coord, uint step, half4 val) {
+    neuromod_map_s[coordToIndexN(center_coord)][step & 1u] = val;
+}
+
+// 3x3x3 近傍のラプラシアンを計算 (N グリッド)
+half4 compute_laplacian_n(uint3 center_coord, uint step) {
+    half4 neighbor_sum = 0.0h;
+    [unroll]
+    for (int dz = -1; dz <= 1; dz++) {
+        [unroll]
+        for (int dy = -1; dy <= 1; dy++) {
+            [unroll]
+            for (int dx = -1; dx <= 1; dx++) {
+                neighbor_sum += get_neuromod(center_coord, int3(dx, dy, dz), step);
+            }
+        }
+    }
+    half4 current_val = get_neuromod(center_coord, int3(0, 0, 0), step);
+    return neighbor_sum - 27.0h * current_val;
+}
+
+// 1ステップ分のラプラシアン拡散 (N グリッド)
+void diffuse_step_n(uint groupIndex, uint step, half diff) {
+    const half dt = 1.0h / 54.0h;
+    uint3 coord = indexToCoordN(groupIndex);
+    half4 current_val = get_neuromod(coord, int3(0, 0, 0), step);
+    half4 laplacian = compute_laplacian_n(coord, step);
+    set_neuromod(coord, step + 1, current_val + (diff * laplacian) * dt);
 }
 
 // =============================================================================
@@ -494,92 +543,151 @@ void computeMain(
     uint3 groupThreadID: SV_GroupThreadID,
     uint groupIndex: SV_GroupIndex,
     uint3 groupID: SV_GroupID,
-    StructuredBuffer<half> dopamine_map_all,
-    StructuredBuffer<half> sleep_map_all,
     StructuredBuffer<uint> inhib_map_all,
-    RWStructuredBuffer<half2> global_poutputs_all,
+    RWStructuredBuffer<half2> global_outputs_all,
     RWStructuredBuffer<half2> membrane_all,
-    RWStructuredBuffer<uint> synapse_tag_all,
     StructuredBuffer<half4> signature_pre_map_np2,
     StructuredBuffer<half4> signature_post_map_np2,
+    StructuredBuffer<half4> neuromod_gen_map,
     uniform ResourceParamsAll resource_params_all,
-    uniform Link27thParamsAll link27th_params_all,
-    uniform LearningParamsAll learning_params_all,
+    uniform Link28thParamsAll link28th_params_all,
     uniform InoutParamsFiAll inout_params_fi_all,
-    RWStructuredBuffer<half> dopamine_sum,
-    RWStructuredBuffer<half> sleep_sum,
+    uniform NeuromodParamsAll neuromod_params_all,
     RWStructuredBuffer<float> mutation_rate_all,
     uniform half dt,
     uniform uint step
-)
+#if VRAM_SYNC_MODE == 1
+    ,
+    uniform uint inner_step_start,
+    uniform uint inner_step_count,
+    uniform uint is_init,
+    RWStructuredBuffer<float> body_state_all,
+    RWStructuredBuffer<half> r_all,
+    RWStructuredBuffer<half4> neuromod_state_all,
+    RWStructuredBuffer<half> synapse_weights_all
+#if KO_MASK_ENABLED == 1
+    ,
+    StructuredBuffer<uint> ko_mask_all
+#endif
+#endif
+) 
 {
     uint agent_id = groupID.x;
-
-    // --- Step 1: 共有メモリと個体パラメータの初期化 ---
-    if (groupIndex == 0) {
-        my_energy_s = INITIAL_ENERGY;
-        inout_params_s = InoutParams::load_face_index(
-            inout_params_fi_all.light_in_fi[agent_id],
-            inout_params_fi_all.battery_in_fi[agent_id],
-            inout_params_fi_all.gen_neg_out_fi[agent_id],
-            inout_params_fi_all.gen_pos_out_fi[agent_id]
-        );
-    }
-
-    for (uint idx_np2 = groupIndex; idx_np2 < TOTAL_NP2; idx_np2 += TOTAL_N) {
-        sig_pre_map_s[idx_np2]  = signature_pre_map_np2[agent_id * TOTAL_NP2 + idx_np2];
-        sig_post_map_s[idx_np2] = signature_post_map_np2[agent_id * TOTAL_NP2 + idx_np2];
-    }
-    GroupMemoryBarrierWithGroupSync();
-
-#if USE_DOPAMINE
-    half my_dopamine_map = dopamine_map_all[TOTAL_N * agent_id + groupIndex];
-#else
-    half my_dopamine_map = 0.0h;
-#endif
-
-#if USE_SLEEP
-    half my_sleep_map = sleep_map_all[TOTAL_N * agent_id + groupIndex];
-#else
-    half my_sleep_map = 0.0h;
-#endif
 
     uint packed_val = inhib_map_all[(agent_id * INHIB_STRIDE) + (groupIndex >> 5)];
     bool is_inhib   = bool((packed_val >> (groupIndex & 31)) & 1);
     int  my_inhib   = is_inhib ? -1 : 1;
-
-    my_dopamine_sum = 0.0h;
-    my_sleep_sum    = 0.0h;
 
     ResourceParams resource_params;
     resource_params.base_output = resource_params_all.base_output[agent_id];
     resource_params.beta        = resource_params_all.beta[agent_id];
     resource_params.k_refill    = resource_params_all.k_refill[agent_id];
 
-    Link27thParams link27th_params;
-    link27th_params.bias       = link27th_params_all.bias[agent_id];
-    link27th_params.multiplier = link27th_params_all.multiplier[agent_id];
+    Link28thParams link28th_params;
+    link28th_params.bias       = link28th_params_all.bias[agent_id];
+    link28th_params.multiplier = link28th_params_all.multiplier[agent_id];
 
-    LearningParams learning_params;
-#if USE_LEARNING
-    learning_params.forget_rate        = learning_params_all.forget_rate[agent_id];
-    learning_params.learning_rate      = learning_params_all.learning_rate[agent_id];
-    learning_params.learning_threshold = learning_params_all.learning_threshold[agent_id];
-    learning_params.tag_decay          = learning_params_all.tag_decay[agent_id];
+    uint3 coord_28th = indexToCoordN(groupIndex * link28th_params.multiplier + link28th_params.bias);
+
+    if (groupIndex == 0) {
+        neuromod_params = NeuromodParams.load(agent_id, neuromod_params_all);
+        inout_params_s = InoutParamsFi.load(agent_id, inout_params_fi_all);
+    }
+    for (uint idx_np2 = groupIndex; idx_np2 < TOTAL_NP2; idx_np2 += TOTAL_N) {
+        sig_pre_map_s[idx_np2]  = signature_pre_map_np2[agent_id * TOTAL_NP2 + idx_np2];
+        sig_post_map_s[idx_np2] = signature_post_map_np2[agent_id * TOTAL_NP2 + idx_np2];
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+#if VRAM_SYNC_MODE == 1
+    SynapseData synapse_data;
+    half R;
+    half my_output = 0.0h;
+
+    if (is_init == 1u) {
+        // --- 初期化モード ---
+        if (groupIndex == 0) {
+#if ONE_SIM == 1
+            my_energy_s = body_state_all[agent_id * 6 + 0];
+            my_pos_s    = float2(body_state_all[agent_id * 6 + 1], body_state_all[agent_id * 6 + 2]);
+            my_angle_s  = body_state_all[agent_id * 6 + 3];
+            my_obj_s    = float2(body_state_all[agent_id * 6 + 4], body_state_all[agent_id * 6 + 5]);
 #else
-    learning_params.forget_rate        = 0.0h;
-    learning_params.learning_rate      = 0.0h;
-    learning_params.learning_threshold = 0.0h;
-    learning_params.tag_decay          = 0.0h;
+            my_energy_s = INITIAL_ENERGY;
+            my_pos_s    = float2(0.0, 0.0);
+            my_angle_s  = 0.0;
+            float obj_rand = 2.0f * (float)rand_half(12277u * step + 67u * agent_id);
+            my_obj_s    = float2(cospi(obj_rand), sinpi(obj_rand));
 #endif
+        }
+        init_synapse_weights(groupThreadID, groupIndex, link28th_params, synapse_data);
+        R = 1.0h;
+
+        for (uint idx_np2 = groupIndex; idx_np2 < TOTAL_NP2; idx_np2 += TOTAL_N) {
+            outputs_s[idx_np2] = 0.0h;
+        }
+        GroupMemoryBarrierWithGroupSync();
+
+#if KO_MASK_ENABLED == 1
+        bool is_ko_init = bool((ko_mask_all[groupIndex >> 5] >> (groupIndex & 31)) & 1);
+        set_output_s(groupThreadID, is_ko_init ? 0.0h : 0.5h);
+#else
+        set_output_s(groupThreadID, 0.5h);
+#endif
+        GroupMemoryBarrierWithGroupSync();
+
+        set_neuromod(groupThreadID, 0u, 0.0h);
+        set_neuromod(groupThreadID, 1u, 0.0h);
+        GroupMemoryBarrierWithGroupSync();
+
+        my_output = 0.0h;
+    } else {
+        // --- 状態復帰モード ---
+        if (groupIndex == 0) {
+            my_energy_s = body_state_all[agent_id * 6 + 0];
+            my_pos_s    = float2(body_state_all[agent_id * 6 + 1], body_state_all[agent_id * 6 + 2]);
+            my_angle_s  = body_state_all[agent_id * 6 + 3];
+            my_obj_s    = float2(body_state_all[agent_id * 6 + 4], body_state_all[agent_id * 6 + 5]);
+        }
+        [unroll]
+        for (uint w = 0; w < 28; w++) {
+            synapse_data.weights[w] = synapse_weights_all[(agent_id * TOTAL_N + groupIndex) * 28 + w];
+        }
+        R = r_all[agent_id * TOTAL_N + groupIndex];
+
+        for (uint idx_h2 = groupIndex; idx_h2 < TOTAL_NP2H2; idx_h2 += TOTAL_N) {
+            uint2 idx01 = idxNp2h2x_to_indexNp2_01(idx_h2);
+            half2 pair = membrane_all[agent_id * TOTAL_NP2H2 + idx_h2];
+            outputs_s[idx01.x] = pair.x;
+            outputs_s[idx01.y] = pair.y;
+        }
+        GroupMemoryBarrierWithGroupSync();
+
+        neuromod_map_s[groupIndex][inner_step_start & 1u] = neuromod_state_all[agent_id * TOTAL_N + groupIndex];
+        GroupMemoryBarrierWithGroupSync();
+
+        my_output = (inner_step_start == 0u) ? 0.0h : get_output_s(groupThreadID);
+    }
+#else
+    // --- Step 1: 共有メモリと個体パラメータの初期化 ---
+    if (groupIndex == 0) {
+        my_energy_s = INITIAL_ENERGY;
+        my_pos_s = float2(0.0, 0.0);
+        my_angle_s = 0.0;
+        float obj_rand = 2 * (float)rand_half(12277 * step + 67 * agent_id);
+        my_obj_s = float2(cospi(obj_rand), sinpi(obj_rand));
+    }
+
+    set_neuromod(groupThreadID, 0u, 0.0h);
+    set_neuromod(groupThreadID, 1u, 0.0h);
 
     // --- Step 2: シナプス重みとニューロン初期状態のセットアップ ---
     SynapseData synapse_data;
-    init_synapse_weights(groupThreadID, groupIndex, link27th_params, synapse_data);
+    init_synapse_weights(groupThreadID, groupIndex, link28th_params, synapse_data);
 
     half R = 1.0h;
 
-    // 外周膜は 0.0h、内部ニューロンは 0.5h で初期化（oneSim.py と完全一致）
+    // 外周膜は 0.0h、内部ニューロンは 0.5h で初期化
     [unroll]
     for (uint idx_np2 = groupIndex; idx_np2 < TOTAL_NP2; idx_np2 += TOTAL_N) {
         outputs_s[idx_np2] = 0.0h;
@@ -589,13 +697,29 @@ void computeMain(
     set_output_s(groupThreadID, 0.5h);
     GroupMemoryBarrierWithGroupSync();
 
-    uint3 coord_27th = indexToCoordN(groupIndex * link27th_params.multiplier + link27th_params.bias);
+    half my_output = 0.0h;
+#endif
 
-    // --- Step 3: 1000ステップの神経・環境ダイナミクスループ ---
+// --- Step 3: 神経・環境ダイナミクスループ ---
+#if VRAM_SYNC_MODE == 1
+    if (is_init == 0u) {
+        for (uint inner_step = inner_step_start; inner_step < inner_step_start + inner_step_count; inner_step++) {
+#else
     for (uint inner_step = 0; inner_step < INNER_STEPS; inner_step++) {
-        half net = 0.0h;
+#endif
+        // 神経修飾物質の拡散、生成、反応
+        diffuse_step_n(groupIndex, inner_step, neuromod_params.diff);
+        GroupMemoryBarrierWithGroupSync();
 
-        // 3.1 近傍 3x3x3 シナプスからの入力集計（および生涯学習）
+        half4 cur_nm = get_idx_neuromod(groupIndex, inner_step + 1);
+        cur_nm += my_output * neuromod_gen_map[agent_id * TOTAL_N + groupIndex];
+        cur_nm = max(0.0h, mul(neuromod_params.neuromod_rel_matrix, cur_nm));
+        set_idx_neuromod(groupIndex, inner_step + 1, cur_nm);
+
+        GroupMemoryBarrierWithGroupSync();
+
+        half net = 0.0h;
+        // 近傍 3x3x3 シナプスからの入力集計（および生涯学習）
         [unroll]
         for (int dz = -1; dz <= 1; dz++) {
             [unroll]
@@ -606,37 +730,34 @@ void computeMain(
                     half my_weight = synapse_data.get_weight(offset);
                     half delta_net = get_output_s(groupThreadID + offset) * my_weight;
                     net += delta_net;
-
-#if USE_LEARNING
-                    half tag = half(synapse_data.get_tag(offset));
-                    tag = saturate((tag + saturate(abs(delta_net))) * (1.0h - learning_params.tag_decay));
-                    half bistable = my_weight * (1.0h - my_weight) * (my_weight - learning_params.learning_threshold);
-                    half delta_weight = half(ENABLE_LEARNING) * learning_params.forget_rate * (my_dopamine_sum * tag + learning_params.learning_rate * bistable);
-                    synapse_data.set_tags(offset, tag);
-                    synapse_data.set_weights(offset, clamp(my_weight + delta_weight, 0.0h, 1.0h));
-#endif
+                    half4 neighbor_neuromod = get_neuromod(groupThreadID, offset, inner_step + 1);
+                    half new_weight = 0;
+                    for (uint i = 0; i < NEUROMOD_NUM; i++) {
+                        new_weight += dot(
+                            half4(cur_nm[i], neighbor_neuromod[i], my_weight, 1.0h),
+                            neuromod_params.neuromod_weight_reaction[i]
+                        );
+                    }
+                    synapse_data.set_weights(offset, saturate(new_weight));
                 }
             }
         }
 
-        // 3.2 長距離（27th）シナプスからの入力集計（および生涯学習）
-        half my_weight_27th = synapse_data.get_weight_27th();
-        half delta_net_27th = get_output_s(coord_27th) * my_weight_27th;
-        net += delta_net_27th;
+        // 長距離（28th）シナプスからの入力集計（および生涯学習）
+        half my_weight_28th = synapse_data.get_weight_28th();
+        half delta_net_28th = get_output_s(coord_28th) * my_weight_28th;
+        net += delta_net_28th;
 
-#if USE_LEARNING
-        half tag_27th = half(synapse_data.get_tag_27th());
-        tag_27th = saturate((tag_27th + saturate(abs(delta_net_27th))) * (1.0h - learning_params.tag_decay));
-        half bistable_27th = my_weight_27th * (1.0h - my_weight_27th) * (my_weight_27th - learning_params.learning_threshold);
-        half delta_weight_27th = half(ENABLE_LEARNING) * learning_params.learning_rate * (my_dopamine_sum * tag_27th + learning_params.learning_rate * bistable_27th);
-        synapse_data.set_tags_27th(tag_27th);
-        synapse_data.set_weights_27th(clamp(my_weight_27th + delta_weight_27th, 0.0h, 1.0h));
-#endif
-
-        // 3.3 ニューロン発火率・出力の計算とシナプス資源 R の更新
+        // ニューロン発火率・出力の計算とシナプス資源 R の更新
         half scaled_net  = clamp(net * resource_params.beta, -20.0h, 20.0h);
         half output_rate = min(1.0h, resource_params.base_output * exp2(scaled_net));
-        half my_output   = (1.0h - my_sleep_sum) * half(my_inhib) * output_rate * R;
+        my_output   = half(my_inhib) * output_rate * R;
+#if KO_MASK_ENABLED == 1
+        bool is_ko = bool((ko_mask_all[groupIndex >> 5] >> (groupIndex & 31)) & 1);
+        if (is_ko) {
+            my_output = 0.0h;
+        }
+#endif
 
         // Warp間の競合を防ぐため、全スレッドの読み取り完了を待ってから出力を書き込む
         GroupMemoryBarrierWithGroupSync();
@@ -645,31 +766,44 @@ void computeMain(
 
         R = saturate(R - output_rate * R + resource_params.k_refill);
 
-        // 3.4 神経修飾物質（ドーパミン・睡眠）の全体集計
-        reduce_neuromodulators(groupIndex, my_output, my_dopamine_map, my_sleep_map);
-
         // 3.5 太陽光発電・代謝コスト計算と感覚入力の更新
         if (groupIndex == 0) {
             update_solar_energy_and_sensors(inner_step);
         }
         GroupMemoryBarrierWithGroupSync();
     }
+#if VRAM_SYNC_MODE == 1
+    }
+#endif
 
     // --- Step 4: 最終状態のグローバルバッファへの書き戻し ---
+#if VRAM_SYNC_MODE == 1
     if (groupIndex == 0) {
-        dopamine_sum[agent_id]      = my_dopamine_sum;
-        sleep_sum[agent_id]         = my_sleep_sum;
+        body_state_all[agent_id * 6 + 0] = my_energy_s;
+        body_state_all[agent_id * 6 + 1] = my_pos_s.x;
+        body_state_all[agent_id * 6 + 2] = my_pos_s.y;
+        body_state_all[agent_id * 6 + 3] = my_angle_s;
+        body_state_all[agent_id * 6 + 4] = my_obj_s.x;
+        body_state_all[agent_id * 6 + 5] = my_obj_s.y;
         mutation_rate_all[agent_id] = saturate(my_energy_s);
     }
+    [unroll]
+    for (uint w = 0; w < 28; w++) {
+        synapse_weights_all[(agent_id * TOTAL_N + groupIndex) * 28 + w] = synapse_data.weights[w];
+    }
+    r_all[agent_id * TOTAL_N + groupIndex] = R;
+    uint save_step = (is_init == 1u) ? 0u : ((inner_step_start + inner_step_count) & 1u);
+    neuromod_state_all[agent_id * TOTAL_N + groupIndex] = neuromod_map_s[groupIndex][save_step];
+#else
+    if (groupIndex == 0) {
+        mutation_rate_all[agent_id] = saturate(my_energy_s);
+    }
+#endif
 
     for (uint idx_h2 = groupIndex; idx_h2 < TOTAL_NP2H2; idx_h2 += TOTAL_N) {
         uint2 idx01   = idxNp2h2x_to_indexNp2_01(idx_h2);
         half2 out_pair = half2(outputs_s[idx01.x], outputs_s[idx01.y]);
         membrane_all[agent_id * TOTAL_NP2H2 + idx_h2]        = out_pair;
-        global_poutputs_all[agent_id * TOTAL_NP2H2 + idx_h2] = out_pair;
-    }
-
-    for (uint idx_ui7 = 0; idx_ui7 < 7; idx_ui7++) {
-        synapse_tag_all[agent_id * (TOTAL_N * 7) + groupIndex * 7 + idx_ui7] = synapse_data.get_tag_idx_ui7(idx_ui7);
+        global_outputs_all[agent_id * TOTAL_NP2H2 + idx_h2] = out_pair;
     }
 }

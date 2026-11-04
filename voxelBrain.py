@@ -12,6 +12,9 @@ import glob
 import csv
 from datetime import datetime
 import sys
+import argparse
+
+from elite_manager import EliteManager
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
@@ -19,15 +22,39 @@ except Exception:
     pass
 
 from sim_config import (
-    ENABLE_LEARNING,
-    ENABLE_DOPAMINE,
-    ENABLE_SLEEP,
+    NUM_IN_PORTS,
+    NUM_OUT_PORTS,
     INITIAL_ENERGY,
     METABOLIC_COST,
     GEN_COST_RATE,
     SOLAR_GAIN_RATE,
     SUN_CYCLE_PERIOD,
+    SPEED_GAIN,
+    ROTATE_GAIN,
 )
+
+# ---------------------------------------------------------
+# コマンドライン引数の解析 (未指定時は環境変数またはデフォルト値)
+# ---------------------------------------------------------
+parser = argparse.ArgumentParser(description="VoxelBrain Evolution Simulation")
+parser.add_argument("--steps", "-n", type=int, default=None, help="総世代数 / ステップ数 (デフォルト: 50000 または VB_TOTAL_STEPS)")
+parser.add_argument("--inner-steps", type=int, default=None, help="1世代あたりの推論ステップ数 (デフォルト: 30 または VB_INNER_STEPS)")
+parser.add_argument("--sub-inner-steps", type=int, default=None, help="VRAM書き戻し間隔 (デフォルト: inner_steps または VB_SUB_INNER_STEPS)")
+parser.add_argument("--dim", type=int, default=None, help="ボクセル解像度次元 1, 2, or 3 (デフォルト: 2 または VB_DIM)")
+parser.add_argument("--m", type=int, default=None, help="個体群サイズ (デフォルト: 32768 または VB_M)")
+parser.add_argument("--wait-interval", type=int, default=None, help="GPU同期・ログ出力間隔 (デフォルト: 1 または VB_WAIT_INTERVAL)")
+parser.add_argument("--stop-file", type=str, default=None, help="安全停止用トリガーファイルパス")
+
+args, unknown_args = parser.parse_known_args()
+
+if args.dim is not None:
+    os.environ["VB_DIM"] = str(args.dim)
+if args.m is not None:
+    os.environ["VB_M"] = str(args.m)
+if args.inner_steps is not None:
+    os.environ["VB_INNER_STEPS"] = str(args.inner_steps)
+if args.sub_inner_steps is not None:
+    os.environ["VB_SUB_INNER_STEPS"] = str(args.sub_inner_steps)
 
 
 stop_requested = False
@@ -152,15 +179,20 @@ class Config:
     m: int = int(os.environ.get("VB_M", str(1 << 15)))
     world_size: float = 100.0
     
+    # 1世代あたりの総推論ステップ数 (デフォルト: 30)
+    inner_steps: int = int(os.environ.get("VB_INNER_STEPS", "30"))
+    # VRAM書き戻し間隔 (何inner_stepごとにVRAMへ書き戻すか。デフォルト: inner_steps = 一括実行)
+    sub_inner_steps: int = int(os.environ.get("VB_SUB_INNER_STEPS", str(inner_steps)))
+    # VRAM書き戻しモードの判定
+    is_vram_sync_mode: bool = sub_inner_steps < inner_steps
+    
     class Seed:
         sigpre: int = 1
         sigpost: int = 2
-        dop: int = 3
-        sleep: int = 4
+        neuromod: int = 3
         inhib: int = 5
         link: int = 6
         res: int = 7
-        learn: int = 8
         inout: int = 9
 
 
@@ -169,13 +201,6 @@ class SigRange:
     biases = R4(float, -0.5, 0.5)
     freqs = R4(float, 0.0, 1.0)
     cutoffs = R4(float, 0.0, 0.95)
-
-
-class DopSleepRange:
-    seed = R(int, 0, 1<<20)
-    bias = R(float, -0.5, 0.5)
-    freq = R(float, 0.0, 1.0)
-    cutoff = R(float, 0.0, 0.95)
 
 
 class InhibRange:
@@ -187,7 +212,7 @@ class InhibRange:
     threshold = R(float, 0.0, 1.0)
 
 
-class Link27thRange:
+class Link28thRange:
     multiplier = R(int, 0, Config.total_cells - 1, odd=True)
     bias = R(int, 0, Config.total_cells - 1)
 
@@ -198,18 +223,26 @@ class NeuronResourceRange:
     k_refill = R(float, 0.02, 0.3)
 
 
-class LearningRange:
-    learning_rate = R(float, 0.0, 1.0)
-    forget_rate = R(float, 0.0, 1.0)
-    learning_threshold = R(float, 0.0, 1.0)
-    tag_decay = R(float, 0.7, 0.99)
-
-
 class InoutFiRange:
-    light_in_fi = RInoutFi(is_output=False)
-    battery_in_fi = RInoutFi(is_output=False)
-    gen_neg_out_fi = RInoutFi(is_output=True)
-    gen_pos_out_fi = RInoutFi(is_output=True)
+    @staticmethod
+    def generate(count_agents: int, seed: int) -> dict[str, np.ndarray]:
+        rng = np.random.default_rng(seed=seed)
+        total_in = count_agents * NUM_IN_PORTS
+        in_face = rng.integers(0, 5, size=total_in, endpoint=True, dtype=np.int32)
+        in_u = rng.integers(-1, Config.N, size=total_in, endpoint=True, dtype=np.int32)
+        in_v = rng.integers(-1, Config.N, size=total_in, endpoint=True, dtype=np.int32)
+        in_ports_fi = np.stack([in_face, in_u, in_v], axis=-1).astype(np.int32)
+
+        total_out = count_agents * NUM_OUT_PORTS
+        out_face = rng.integers(0, 5, size=total_out, endpoint=True, dtype=np.int32)
+        out_u = rng.integers(0, Config.N - 1, size=total_out, endpoint=True, dtype=np.int32)
+        out_v = rng.integers(0, Config.N - 1, size=total_out, endpoint=True, dtype=np.int32)
+        out_ports_fi = np.stack([out_face, out_u, out_v], axis=-1).astype(np.int32)
+
+        return {
+            "in_ports_fi": in_ports_fi,
+            "out_ports_fi": out_ports_fi,
+        }
 
 
 def generate(cls, seed: int) -> dict[str, np.ndarray]:
@@ -227,12 +260,10 @@ def generate(cls, seed: int) -> dict[str, np.ndarray]:
 class GenesisParams:
     signature_pre_params: dict[str, np.ndarray]
     signature_post_params: dict[str, np.ndarray]
-    dopamine_params: dict[str, np.ndarray]
-    sleep_params: dict[str, np.ndarray]
+    neuromod_params: dict[str, np.ndarray]
     inhib_params: dict[str, np.ndarray]
     resource_params: dict[str, np.ndarray]
-    link27th_params: dict[str, np.ndarray]
-    learning_params: dict[str, np.ndarray]
+    link28th_params: dict[str, np.ndarray]
     inout_params_fi: dict[str, np.ndarray]
 
     @classmethod
@@ -240,17 +271,14 @@ class GenesisParams:
         return cls(
             signature_pre_params=generate(SigRange, Config.Seed.sigpre),
             signature_post_params=generate(SigRange, Config.Seed.sigpost),
-            dopamine_params=generate(DopSleepRange, Config.Seed.dop),
-            sleep_params=generate(DopSleepRange, Config.Seed.sleep),
+            neuromod_params=generate(SigRange, Config.Seed.neuromod),
             inhib_params=generate(InhibRange, Config.Seed.inhib),
             resource_params=generate(NeuronResourceRange, Config.Seed.res),
-            link27th_params=generate(Link27thRange, Config.Seed.link),
-            learning_params=generate(LearningRange, Config.Seed.learn),
-            inout_params_fi=generate(InoutFiRange, Config.Seed.inout),
+            link28th_params=generate(Link28thRange, Config.Seed.link),
+            inout_params_fi=InoutFiRange.generate(Config.m, Config.Seed.inout),
         )
 
 
-genesis_params = GenesisParams.new()
 device = spy.create_device(type=spy.DeviceType.cuda)
 
 
@@ -269,25 +297,26 @@ def cast_and_buffer(ndarray_dict: dict[str, np.ndarray], device: spy.Device, flo
     return buf_dict
 
 
-def build_kernel(device, filename: str):
+def build_kernel(device, filename: str, extra_defines: str = ""):
     with open(filename + ".slang", "r", encoding="utf-8") as f:
         defines = (
             f"#define DIM {Config.dim}\n"
-            f"#define USE_LEARNING {1 if float(ENABLE_LEARNING) > 0.0 else 0}\n"
-            f"#define ENABLE_LEARNING {float(ENABLE_LEARNING)}h\n"
-            f"#define USE_DOPAMINE {1 if float(ENABLE_DOPAMINE) > 0.0 else 0}\n"
-            f"#define ENABLE_DOPAMINE {float(ENABLE_DOPAMINE)}h\n"
-            f"#define USE_SLEEP {1 if float(ENABLE_SLEEP) > 0.0 else 0}\n"
-            f"#define ENABLE_SLEEP {float(ENABLE_SLEEP)}h\n"
+            f"#define INNER_STEPS {Config.inner_steps}\n"
+            f"#define NUM_IN_PORTS {NUM_IN_PORTS}\n"
+            f"#define NUM_OUT_PORTS {NUM_OUT_PORTS}\n"
             f"#define INITIAL_ENERGY {INITIAL_ENERGY}f\n"
             f"#define METABOLIC_COST {METABOLIC_COST}f\n"
             f"#define GEN_COST_RATE {GEN_COST_RATE}f\n"
             f"#define SOLAR_GAIN_RATE {SOLAR_GAIN_RATE}f\n"
             f"#define SUN_CYCLE_PERIOD {SUN_CYCLE_PERIOD}f\n"
+            f"#define SPEED_GAIN {SPEED_GAIN}f\n"
+            f"#define ROTATE_GAIN {ROTATE_GAIN}f\n"
+            f"{extra_defines}"
         )
         source_code = defines + f.read()
     
-    module = device.load_module_from_source("kernel" + filename, source_code)
+    module_name = f"kernel_{filename}_{'sync' if 'VRAM_SYNC_MODE' in extra_defines else 'mono'}"
+    module = device.load_module_from_source(module_name, source_code)
     entry = module.entry_point("computeMain")
     program = device.link_program([module], [entry])
     kernel = device.create_compute_kernel(program)
@@ -312,87 +341,110 @@ def create_buf(device: spy.Device, params: np.ndarray | dict[str, np.ndarray]):
 
 def create_mutation_params_buffers(num_groups: int, seed: int = None):
     rng = np.random.default_rng(seed)
-
-    # 旧 threshold (x) を 1 - x の変異確率 (rate) として設定
-    sig_pre_rate  = rng.uniform(0.05, 0.30, size=(num_groups, 4)).astype(np.float16)
-    sig_post_rate = rng.uniform(0.05, 0.30, size=(num_groups, 4)).astype(np.float16)
-    
-    other_rate = np.zeros((num_groups, 4), dtype=np.float16)
-    other_rate[:, 0] = rng.uniform(0.10, 0.40, size=num_groups)  # dopamine
-    other_rate[:, 1] = rng.uniform(0.10, 0.40, size=num_groups)  # sleep
-    other_rate[:, 2] = rng.uniform(0.02, 0.20, size=num_groups)  # inhib (反転確率)
-
-    steps = rng.integers(0, 6, size=(num_groups, 4), dtype=np.uint32)
-
     max_safe_diff = 1.0 / 27.0
-    sig_pre_diff  = rng.uniform(0.005, max_safe_diff, size=(num_groups, 4)).astype(np.float16)
-    sig_post_diff = rng.uniform(0.005, max_safe_diff, size=(num_groups, 4)).astype(np.float16)
-    
-    other_diff = np.zeros((num_groups, 4), dtype=np.float16)
-    other_diff[:, 0] = rng.uniform(0.005, max_safe_diff, size=num_groups)
-    other_diff[:, 1] = rng.uniform(0.005, max_safe_diff, size=num_groups)
 
-    sig_pre_max  = rng.uniform(0.01, 0.1, size=(num_groups, 4)).astype(np.float16)
-    sig_post_max = rng.uniform(0.01, 0.1, size=(num_groups, 4)).astype(np.float16)
-    
-    other_max = np.zeros((num_groups, 4), dtype=np.float16)
-    other_max[:, 0] = rng.uniform(0.01, 0.1, size=num_groups)
-    other_max[:, 1] = rng.uniform(0.01, 0.1, size=num_groups)
+    sig_mutation_params = {
+        "rate": rng.uniform(0.05, 0.30, size=(num_groups, 4)).astype(np.float16),
+        "steps": rng.integers(0, 6, size=num_groups, dtype=np.uint32),
+        "max": rng.uniform(0.01, 0.1, size=(num_groups, 4)).astype(np.float16),
+        "diff": rng.uniform(0.005, max_safe_diff, size=(num_groups, 4)).astype(np.float16),
+    }
+
+    neuromod_map_mutation_params = {
+        "rate": rng.uniform(0.05, 0.30, size=(num_groups, 4)).astype(np.float16),
+        "steps": rng.integers(0, 6, size=num_groups, dtype=np.uint32),
+        "max": rng.uniform(0.01, 0.1, size=(num_groups, 4)).astype(np.float16),
+        "diff": rng.uniform(0.005, max_safe_diff, size=(num_groups, 4)).astype(np.float16),
+    }
+
+    neuromod_params_rate = np.zeros((num_groups, 4), dtype=np.float16)
+    neuromod_params_rate[:, 0] = rng.uniform(0.02, 0.15, size=num_groups)  # rel_matrix
+    neuromod_params_rate[:, 1] = rng.uniform(0.02, 0.15, size=num_groups)  # weight_reaction
+    neuromod_params_rate[:, 2] = rng.uniform(0.02, 0.15, size=num_groups)  # diff
+    neuromod_params_rate[:, 3] = np.float16(0.0)  # unused
+    neuromod_params_mutation_params = {
+        "rate": neuromod_params_rate,
+    }
+
+    iicu_rate = np.zeros((num_groups, 4), dtype=np.float16)
+    iicu_rate[:, 0] = rng.uniform(0.02, 0.20, size=num_groups)  # inhib
+    iicu_rate[:, 1] = rng.uniform(0.02, 0.15, size=num_groups)  # inout
+    iicu_rate[:, 2] = rng.uniform(0.02, 0.15, size=num_groups)  # copy
+    iicu_rate[:, 3] = np.float16(0.0)  # unused
+    iicu_mutation_params = {
+        "iicu_rate": iicu_rate,
+    }
 
     resource_rate = np.zeros((num_groups, 4), dtype=np.float16)
     resource_rate[:, 0] = rng.uniform(0.02, 0.15, size=num_groups)
     resource_rate[:, 1] = rng.uniform(0.02, 0.15, size=num_groups)
     resource_rate[:, 2] = rng.uniform(0.02, 0.15, size=num_groups)
 
-    link27th_rate = rng.uniform(0.02, 0.15, size=(num_groups, 2)).astype(np.float16)
-
-    learning_rate = rng.uniform(0.02, 0.15, size=(num_groups, 4)).astype(np.float16)
-
+    link28th_rate = rng.uniform(0.02, 0.15, size=(num_groups, 2)).astype(np.float16)
     mutate_rate = rng.uniform(0.01, 0.10, size=(num_groups, 4)).astype(np.float16)
 
-    inout_copy_rate = np.zeros((num_groups, 2), dtype=np.float16)
-    inout_copy_rate[:, 0] = rng.uniform(0.02, 0.15, size=num_groups)
-    inout_copy_rate[:, 1] = rng.uniform(0.02, 0.15, size=num_groups)
+    rlmu_mutation_params = {
+        "resource_rate": resource_rate,
+        "link28th_rate": link28th_rate,
+        "mutate_rate": mutate_rate,
+    }
+
+    return (
+        sig_mutation_params,
+        neuromod_map_mutation_params,
+        neuromod_params_mutation_params,
+        iicu_mutation_params,
+        rlmu_mutation_params,
+    )
+
+
+def create_neuromod_params_buffers(num_groups: int, seed: int = None):
+    rng = np.random.default_rng(seed)
+
+    # 4x4 相互作用行列 (初期は単位行列に近い形)
+    rel_matrix = np.zeros((num_groups, 4, 4), dtype=np.float16)
+    for g in range(num_groups):
+        rel_matrix[g] = np.eye(4, dtype=np.float16) * 0.95 + rng.uniform(-0.05, 0.05, size=(4, 4)).astype(np.float16)
+
+    # 4x4 反応行列 (シナプス重み反応)
+    weight_reaction = rng.uniform(-0.05, 0.05, size=(num_groups, 4, 4)).astype(np.float16)
+    for g in range(num_groups):
+        for i in range(4):
+            weight_reaction[g, i, 2] = 0.95  # 自身の重みを維持する項
+
+    diff = rng.uniform(0.005, 1.0 / 27.0, size=num_groups).astype(np.float16)
 
     return {
-        "sig_pre_rate":  sig_pre_rate,
-        "sig_post_rate": sig_post_rate,
-        "other_rate":    other_rate,
-        "steps":         steps,
-        "sig_pre_diff":  sig_pre_diff,
-        "sig_post_diff": sig_post_diff,
-        "other_diff":    other_diff,
-        "sig_pre_max":   sig_pre_max,
-        "sig_post_max":  sig_post_max,
-        "other_max":     other_max,
-        "resource_rate": resource_rate,
-        "link27th_rate": link27th_rate,
-        "learning_rate": learning_rate,
-        "mutate_rate":   mutate_rate,
-        "inout_copy_rate":    inout_copy_rate,
+        "neuromod_rel_matrix": rel_matrix,
+        "neuromod_weight_reaction": weight_reaction,
+        "diff": diff,
     }
 
 
 kernel_generation = build_kernel(device, "generation")
-kernel_reasoning = build_kernel(device, "reasoningSim")
+if Config.is_vram_sync_mode:
+    kernel_reasoning_step = build_kernel(device, "reasoningSim", extra_defines="#define VRAM_SYNC_MODE 1\n")
+else:
+    kernel_reasoning = build_kernel(device, "reasoningSim")
 kernel_mutation = build_kernel(device, "mutation")
 
 sig_pre_map_np2 = np.zeros(Config.m * Config.P * Config.P * Config.P * 4, dtype=np.half)
 sig_post_map_np2 = np.zeros(Config.m * Config.P * Config.P * Config.P * 4, dtype=np.half)
-dopamine_map = np.zeros(Config.m * Config.N * Config.N * Config.N, dtype=np.half)
-sleep_map = np.zeros(Config.m * Config.N * Config.N * Config.N, dtype=np.half)
+neuromod_map = np.zeros((Config.m * Config.N * Config.N * Config.N, 4), dtype=np.half)
+neuromod_map_buf = device.create_buffer(
+    data=neuromod_map,
+    usage=spy.BufferUsage.unordered_access | spy.BufferUsage.shader_resource
+)
 inhib_sign_map = np.zeros(Config.m * Config.inhib_stride, dtype=np.uint32)
 
 generation_dict = {
     "sig_pre_map_np2_pout": sig_pre_map_np2,
     "sig_post_map_np2_pout": sig_post_map_np2,
-    "dopamine_map_pout": dopamine_map,
-    "sleep_map_pout": sleep_map,
+    "neuromod_map_pout": neuromod_map_buf,
     "inhib_sign_map_pout": inhib_sign_map,
     "sig_pre_genes": cast_and_buffer(genesis_params.signature_pre_params, device, float_dtype=np.float32),
     "sig_post_genes": cast_and_buffer(genesis_params.signature_post_params, device, float_dtype=np.float32),
-    "dopamine_genes": cast_and_buffer(genesis_params.dopamine_params, device, float_dtype=np.float32),
-    "sleep_genes": cast_and_buffer(genesis_params.sleep_params, device, float_dtype=np.float32),
+    "neuromod_genes": cast_and_buffer(genesis_params.neuromod_params, device, float_dtype=np.float32),
     "inhib_genes": cast_and_buffer(genesis_params.inhib_params, device, float_dtype=np.float32)
 }
 
@@ -416,120 +468,93 @@ membrane_buf = device.create_buffer(
     data=np.zeros((Config.m, Config.P, Config.P, Config.P), dtype=np.float16),
     usage=spy.BufferUsage.unordered_access
 )
-synapse_tag_buf = device.create_buffer(
-    data=np.zeros((Config.m, Config.N, Config.N, Config.N, 7), dtype=np.uint32),
-    usage=spy.BufferUsage.unordered_access
-)
-dopamine_sum_buf = device.create_buffer(
-    data=np.zeros(Config.m, dtype=np.float16),
-    usage=spy.BufferUsage.unordered_access
-)
-sleep_sum_buf = device.create_buffer(
-    data=np.zeros(Config.m, dtype=np.float16),
-    usage=spy.BufferUsage.unordered_access
-)
 mutation_rate_buf = device.create_buffer(
     data=np.zeros(Config.m, dtype=np.float32),
     usage=spy.BufferUsage.unordered_access,
 )
 
 shared_resource_params_buf = cast_and_buffer(genesis_params.resource_params, device)
-shared_link27th_params_buf = cast_and_buffer(genesis_params.link27th_params, device)
-shared_learning_params_buf = cast_and_buffer(genesis_params.learning_params, device)
+shared_link28th_params_buf = cast_and_buffer(genesis_params.link28th_params, device)
 shared_inout_params_fi_buf = cast_and_buffer(genesis_params.inout_params_fi, device)
-shared_mutation_params_buf = cast_and_buffer(create_mutation_params_buffers(Config.m, 42), device)
+
+(
+    sig_mut_dict,
+    neuromod_map_mut_dict,
+    neuromod_params_mut_dict,
+    iicu_mut_dict,
+    rlmu_mut_dict,
+) = create_mutation_params_buffers(Config.m, 42)
+shared_sig_mut_buf = cast_and_buffer(sig_mut_dict, device)
+shared_neuromod_map_mut_buf = cast_and_buffer(neuromod_map_mut_dict, device)
+shared_neuromod_params_mut_buf = cast_and_buffer(neuromod_params_mut_dict, device)
+shared_iicu_mut_buf = cast_and_buffer(iicu_mut_dict, device)
+shared_rlmu_mut_buf = cast_and_buffer(rlmu_mut_dict, device)
+
+shared_neuromod_params_buf = cast_and_buffer(create_neuromod_params_buffers(Config.m, 42), device)
 
 
 def get_default_inout_fi(dim: int) -> dict[str, np.ndarray]:
+    """デフォルトの入出力face_index [face, u, v] を返す。
+    in_ports_fi: shape (NUM_IN_PORTS, 3)
+    out_ports_fi: shape (NUM_OUT_PORTS, 3)
+    """
+    in_defaults = np.zeros((NUM_IN_PORTS, 3), dtype=np.int32)
+    out_defaults = np.zeros((NUM_OUT_PORTS, 3), dtype=np.int32)
+
     if dim == 1:
-        return {
-            "light_in_fi": np.array([2, 1, 0], dtype=np.int32),
-            "battery_in_fi": np.array([2, 0, 0], dtype=np.int32),
-            "gen_neg_out_fi": np.array([5, 0, 0], dtype=np.int32),
-            "gen_pos_out_fi": np.array([5, 1, 0], dtype=np.int32),
-        }
+        if NUM_IN_PORTS >= 1: in_defaults[0] = [2, 1, 0]
+        if NUM_IN_PORTS >= 2: in_defaults[1] = [2, 0, 0]
+        if NUM_OUT_PORTS >= 1: out_defaults[0] = [5, 1, 0]
+        if NUM_OUT_PORTS >= 2: out_defaults[1] = [5, 0, 0]
     elif dim == 2:
-        return {
-            "light_in_fi": np.array([2, 3, 2], dtype=np.int32),
-            "battery_in_fi": np.array([2, 1, 2], dtype=np.int32),
-            "gen_neg_out_fi": np.array([0, 2, 1], dtype=np.int32),
-            "gen_pos_out_fi": np.array([1, 2, 1], dtype=np.int32),
-        }
+        if NUM_IN_PORTS >= 1: in_defaults[0] = [2, 3, 2]
+        if NUM_IN_PORTS >= 2: in_defaults[1] = [2, 1, 2]
+        if NUM_OUT_PORTS >= 1: out_defaults[0] = [1, 2, 1]
+        if NUM_OUT_PORTS >= 2: out_defaults[1] = [0, 2, 1]
     else:
-        return {
-            "light_in_fi": np.array([2, 5, 4], dtype=np.int32),
-            "battery_in_fi": np.array([2, 3, 4], dtype=np.int32),
-            "gen_neg_out_fi": np.array([0, 2, 1], dtype=np.int32),
-            "gen_pos_out_fi": np.array([1, 2, 1], dtype=np.int32),
-        }
+        if NUM_IN_PORTS >= 1: in_defaults[0] = [2, 5, 4]
+        if NUM_IN_PORTS >= 2: in_defaults[1] = [2, 3, 4]
+        if NUM_OUT_PORTS >= 1: out_defaults[0] = [1, 2, 1]
+        if NUM_OUT_PORTS >= 2: out_defaults[1] = [0, 2, 1]
+
+    return {
+        "in_ports_fi": in_defaults,
+        "out_ports_fi": out_defaults,
+    }
 
 
 def load_and_distribute_all_elites(folder_path: str):
-    file_list = sorted(glob.glob(os.path.join(folder_path, "*.npz")))
-    if not file_list:
-        print(f"[!] フォルダ内に .npz ファイルが見つかりません: {folder_path}")
-        return
-
-    num_elites = len(file_list)
-    print(f"\n[★] {num_elites} 個のエリート遺伝子を発見しました！")
-    print(f"    1系統あたり約 {Config.m // num_elites} 体ずつ、全 {Config.m} 体に均等配分します...")
-
-    elites = [np.load(f) for f in file_list]
-    assign = np.arange(Config.m) % num_elites
-
-    # --- 1. 空間マップ（脳の配線）の均等配分 ---
-    sig_pre_all  = np.stack([e["sig_pre"] for e in elites])[assign].reshape(-1).astype(np.float16)
-    sig_post_all = np.stack([e["sig_post"] for e in elites])[assign].reshape(-1).astype(np.float16)
-    dopamine_all = np.stack([e["dopamine"] for e in elites])[assign].reshape(-1).astype(np.float16)
-    sleep_all    = np.stack([e["sleep"] for e in elites])[assign].reshape(-1).astype(np.float16)
-    inhib_all    = np.stack([e["inhib"] for e in elites])[assign].reshape(-1).astype(np.uint32)
-
-    gen_buf_dict["sig_pre_map_np2_pout"].copy_from_numpy(sig_pre_all)
-    gen_buf_dict["sig_post_map_np2_pout"].copy_from_numpy(sig_post_all)
-    gen_buf_dict["dopamine_map_pout"].copy_from_numpy(dopamine_all)
-    gen_buf_dict["sleep_map_pout"].copy_from_numpy(sleep_all)
-    gen_buf_dict["inhib_sign_map_pout"].copy_from_numpy(inhib_all)
-
-    # --- 2. 神経パラメータの均等配分 ---
-    shared_resource_params_buf["base_output"].copy_from_numpy(
-        np.array([e["resource_base_output"] for e in elites], dtype=np.float16)[assign]
-    )
-    shared_resource_params_buf["beta"].copy_from_numpy(
-        np.array([e["resource_beta"] for e in elites], dtype=np.float16)[assign]
-    )
-    shared_resource_params_buf["k_refill"].copy_from_numpy(
-        np.array([e["resource_k_refill"] for e in elites], dtype=np.float16)[assign]
-    )
-
-    shared_link27th_params_buf["multiplier"].copy_from_numpy(
-        np.array([e["link_multiplier"] for e in elites], dtype=np.int32)[assign]
-    )
-    shared_link27th_params_buf["bias"].copy_from_numpy(
-        np.array([e["link_bias"] for e in elites], dtype=np.int32)[assign]
-    )
-
-    shared_learning_params_buf["learning_rate"].copy_from_numpy(
-        np.array([e["learn_rate"] for e in elites], dtype=np.float16)[assign]
-    )
-    shared_learning_params_buf["forget_rate"].copy_from_numpy(
-        np.array([e["learn_forget"] for e in elites], dtype=np.float16)[assign]
-    )
-    shared_learning_params_buf["learning_threshold"].copy_from_numpy(
-        np.array([e["learn_threshold"] for e in elites], dtype=np.float16)[assign]
-    )
-    shared_learning_params_buf["tag_decay"].copy_from_numpy(
-        np.array([e["learn_decay"] for e in elites], dtype=np.float16)[assign]
-    )
-
     defaults_fi = get_default_inout_fi(Config.dim)
-    for fi_key in ("light_in_fi", "battery_in_fi", "gen_neg_out_fi", "gen_pos_out_fi"):
-        fi_arr = np.stack([
-            np.asarray(e[fi_key], dtype=np.int32).reshape(3) if fi_key in e else defaults_fi[fi_key]
-            for e in elites
-        ])[assign].astype(np.int32)
-        shared_inout_params_fi_buf[fi_key].copy_from_numpy(np.ascontiguousarray(fi_arr))
-
-    print("[★] 全個体への多系統エリート配分が完了しました！\n")
+    def_defaults = {
+        "base_output": shared_resource_params_buf["base_output"].to_numpy().view(np.float16)[0],
+        "beta": shared_resource_params_buf["beta"].to_numpy().view(np.float16)[0],
+        "k_refill": shared_resource_params_buf["k_refill"].to_numpy().view(np.float16)[0],
+        "multiplier": shared_link28th_params_buf["multiplier"].to_numpy().view(np.int32)[0],
+        "bias": shared_link28th_params_buf["bias"].to_numpy().view(np.int32)[0],
+        "rel_matrix": shared_neuromod_params_buf["neuromod_rel_matrix"].to_numpy().view(np.float16).reshape(Config.m, 4, 4)[0],
+        "weight_reaction": shared_neuromod_params_buf["neuromod_weight_reaction"].to_numpy().view(np.float16).reshape(Config.m, 4, 4)[0],
+        "diff": shared_neuromod_params_buf["diff"].to_numpy().view(np.float16).reshape(Config.m)[0],
+        "in_ports_fi": defaults_fi["in_ports_fi"],
+        "out_ports_fi": defaults_fi["out_ports_fi"],
+        "mut_buffers": {
+            "shared_sig_mut_buf": shared_sig_mut_buf,
+            "shared_neuromod_map_mut_buf": shared_neuromod_map_mut_buf,
+            "shared_neuromod_params_mut_buf": shared_neuromod_params_mut_buf,
+            "shared_iicu_mut_buf": shared_iicu_mut_buf,
+            "shared_rlmu_mut_buf": shared_rlmu_mut_buf,
+        },
+    }
+    EliteManager.distribute_elites_to_population(
+        folder_path=folder_path,
+        config=Config,
+        gen_buf_dict=gen_buf_dict,
+        neuromod_map_buf=neuromod_map_buf,
+        shared_resource_params_buf=shared_resource_params_buf,
+        shared_link28th_params_buf=shared_link28th_params_buf,
+        shared_neuromod_params_buf=shared_neuromod_params_buf,
+        shared_inout_params_fi_buf=shared_inout_params_fi_buf,
+        def_defaults=def_defaults,
+    )
 
 
 LOAD_CHECKPOINT_FOLDER = os.environ.get("VB_LOAD_FOLDER", "backups/elites")
@@ -539,36 +564,86 @@ if LOAD_CHECKPOINT_FOLDER and os.path.exists(LOAD_CHECKPOINT_FOLDER) and load is
     load_and_distribute_all_elites(LOAD_CHECKPOINT_FOLDER)
 
 reasoning_sim_dict = {
-    "dopamine_map_all": gen_buf_dict["dopamine_map_pout"],
-    "sleep_map_all": gen_buf_dict["sleep_map_pout"],
     "inhib_map_all": gen_buf_dict["inhib_sign_map_pout"],
-    "global_poutputs_all": global_poutputs_buf,
+    "global_outputs_all": global_poutputs_buf,
     "membrane_all": membrane_buf,
-    "synapse_tag_all": synapse_tag_buf,
     "signature_pre_map_np2": gen_buf_dict["sig_pre_map_np2_pout"],
     "signature_post_map_np2": gen_buf_dict["sig_post_map_np2_pout"],
+    "neuromod_gen_map": neuromod_map_buf,
     "resource_params_all": shared_resource_params_buf,
-    "link27th_params_all": shared_link27th_params_buf,
-    "learning_params_all": shared_learning_params_buf,
+    "link28th_params_all": shared_link28th_params_buf,
     "inout_params_fi_all": shared_inout_params_fi_buf,
-    "dopamine_sum": dopamine_sum_buf,
-    "sleep_sum": sleep_sum_buf,
+    "neuromod_params_all": shared_neuromod_params_buf,
     "mutation_rate_all": mutation_rate_buf,
     "dt": 0.01,
     "step": 0,
 }
 
+if Config.is_vram_sync_mode:
+    body_state_buf = device.create_buffer(
+        data=np.zeros((Config.m, 6), dtype=np.float32),
+        usage=spy.BufferUsage.unordered_access | spy.BufferUsage.shader_resource
+    )
+    r_buf = device.create_buffer(
+        data=np.zeros((Config.m, Config.total_cells), dtype=np.float16),
+        usage=spy.BufferUsage.unordered_access | spy.BufferUsage.shader_resource
+    )
+    neuromod_state_buf = device.create_buffer(
+        data=np.zeros((Config.m, Config.total_cells, 4), dtype=np.float16),
+        usage=spy.BufferUsage.unordered_access | spy.BufferUsage.shader_resource
+    )
+    synapse_weights_buf = device.create_buffer(
+        data=np.zeros((Config.m, Config.total_cells * 28), dtype=np.float16),
+        usage=spy.BufferUsage.unordered_access | spy.BufferUsage.shader_resource
+    )
+
+    reasoning_step_dict = {
+        **reasoning_sim_dict,
+        "inner_step_start": np.uint32(0),
+        "inner_step_count": np.uint32(0),
+        "is_init": np.uint32(1),
+        "body_state_all": body_state_buf,
+        "r_all": r_buf,
+        "neuromod_state_all": neuromod_state_buf,
+        "synapse_weights_all": synapse_weights_buf,
+    }
+
+
+def physics_interaction_hook(
+    step: int,
+    inner_step_start: int,
+    inner_step_count: int,
+    body_state_buf: spy.Buffer,
+    global_outputs_buf: spy.Buffer,
+):
+    """
+    ユーザー拡張用: マルチエージェント物理シミュレーション挿入フック。
+    VRAM書き戻しモード時に各サブステップ終了直後に呼び出されます。
+    ユーザー独自の物理シミュレーション（GPUカーネルディスパッチ等）をここに実装してください。
+
+    Args:
+        step: 現在の世代 (global step)
+        inner_step_start: 直前のサブステップ開始番号
+        inner_step_count: 直前のサブステップ実行数
+        body_state_buf: 全個体の身体状態バッファ [Config.m, 6] (float32: energy, pos.x, pos.y, angle, obj.x, obj.y)
+        global_outputs_buf: 全個体のニューロン出力・膜電位バッファ
+    """
+    pass
+
 mutation_dict = {
-    "dopamine_map_all": gen_buf_dict["dopamine_map_pout"],
-    "sleep_map_all": gen_buf_dict["sleep_map_pout"],
+    "neuromod_map_all": neuromod_map_buf,
     "inhib_map_all": gen_buf_dict["inhib_sign_map_pout"],
     "signature_pre_map_np2": gen_buf_dict["sig_pre_map_np2_pout"],
     "signature_post_map_np2": gen_buf_dict["sig_post_map_np2_pout"],
+    "neuromod_params_all": shared_neuromod_params_buf,
     "resource_params_all": shared_resource_params_buf,
-    "link27th_params_all": shared_link27th_params_buf,
-    "learning_params_all": shared_learning_params_buf,
+    "link28th_params_all": shared_link28th_params_buf,
     "inout_params_fi_all": shared_inout_params_fi_buf,
-    "mutation_params_all": shared_mutation_params_buf,
+    "sig_mutation_params_all": shared_sig_mut_buf,
+    "neuromod_map_mutation_params_all": shared_neuromod_map_mut_buf,
+    "neuromod_params_mutation_params_all": shared_neuromod_params_mut_buf,
+    "iicu_mutation_params_all": shared_iicu_mut_buf,
+    "rlmu_mutation_params_all": shared_rlmu_mut_buf,
     "mutation_rate_all": mutation_rate_buf,
     "total": Config.m,
     "step": 0
@@ -602,184 +677,200 @@ def get_current_energies() -> np.ndarray:
 
 
 def save_top_k_elites(step_num: int, energies: np.ndarray, k: int = 20):
-    """上位 k 体の遺伝子を一括でGPUから抜き出して保存する"""
+    """上位 k 体の遺伝子を一括でGPUから抜き出して保存する（EliteManagerに委譲）"""
     print(f"\n[+] 終了処理: Step {step_num} 時点の上位 {k} 体を '{top20_dir}/' に保存しています...")
     device.wait()
-
-    # 上位 k 個体のインデックスを取得（降順）
-    top_indices = np.argsort(energies)[::-1][:k]
-
-    # GPU→CPU転送を1回だけで済ませるため、最初に全配列を取得
-    P_cube_4   = Config.P * Config.P * Config.P * 4
-    N_cube     = Config.N * Config.N * Config.N
-    INHIB_SIZE = Config.inhib_stride
-
-    sig_pre_all  = gen_buf_dict["sig_pre_map_np2_pout"].to_numpy().view(np.float16)
-    sig_post_all = gen_buf_dict["sig_post_map_np2_pout"].to_numpy().view(np.float16)
-    dopamine_all = gen_buf_dict["dopamine_map_pout"].to_numpy().view(np.float16)
-    sleep_all    = gen_buf_dict["sleep_map_pout"].to_numpy().view(np.float16)
-    inhib_all    = gen_buf_dict["inhib_sign_map_pout"].to_numpy().view(np.uint32)
-
-    res_base   = shared_resource_params_buf["base_output"].to_numpy().view(np.float16)
-    res_beta   = shared_resource_params_buf["beta"].to_numpy().view(np.float16)
-    res_refill = shared_resource_params_buf["k_refill"].to_numpy().view(np.float16)
-    link_mult  = shared_link27th_params_buf["multiplier"].to_numpy().view(np.int32)
-    link_bias  = shared_link27th_params_buf["bias"].to_numpy().view(np.int32)
-    lr_rate    = shared_learning_params_buf["learning_rate"].to_numpy().view(np.float16)
-    lr_forget  = shared_learning_params_buf["forget_rate"].to_numpy().view(np.float16)
-    lr_thresh  = shared_learning_params_buf["learning_threshold"].to_numpy().view(np.float16)
-    lr_decay   = shared_learning_params_buf["tag_decay"].to_numpy().view(np.float16)
-
-    light_in_fi_all    = shared_inout_params_fi_buf["light_in_fi"].to_numpy().view(np.int32).reshape(Config.m, 3)
-    battery_in_fi_all  = shared_inout_params_fi_buf["battery_in_fi"].to_numpy().view(np.int32).reshape(Config.m, 3)
-    gen_neg_out_fi_all = shared_inout_params_fi_buf["gen_neg_out_fi"].to_numpy().view(np.int32).reshape(Config.m, 3)
-    gen_pos_out_fi_all = shared_inout_params_fi_buf["gen_pos_out_fi"].to_numpy().view(np.int32).reshape(Config.m, 3)
-
-    for rank, idx in enumerate(top_indices, start=1):
-        idx = int(idx)
-        score = float(energies[idx])
-        save_path = os.path.join(top20_dir, f"rank{rank:02d}_step{step_num}_energy{score:.3f}_id{idx}.npz")
-
-        np.savez_compressed(
-            save_path,
-            step=step_num,
-            score=score,
-            enable_learning=np.float16(ENABLE_LEARNING),
-            enable_dopamine=np.float16(ENABLE_DOPAMINE),
-            enable_sleep=np.float16(ENABLE_SLEEP),
-            sig_pre=sig_pre_all[idx * P_cube_4 : (idx + 1) * P_cube_4],
-            sig_post=sig_post_all[idx * P_cube_4 : (idx + 1) * P_cube_4],
-            dopamine=dopamine_all[idx * N_cube : (idx + 1) * N_cube],
-            sleep=sleep_all[idx * N_cube : (idx + 1) * N_cube],
-            inhib=inhib_all[idx * INHIB_SIZE : (idx + 1) * INHIB_SIZE],
-            resource_base_output=res_base[idx],
-            resource_beta=res_beta[idx],
-            resource_k_refill=res_refill[idx],
-            link_multiplier=link_mult[idx],
-            link_bias=link_bias[idx],
-            learn_rate=lr_rate[idx],
-            learn_forget=lr_forget[idx],
-            learn_threshold=lr_thresh[idx],
-            learn_decay=lr_decay[idx],
-            light_in_fi=light_in_fi_all[idx],
-            battery_in_fi=battery_in_fi_all[idx],
-            gen_neg_out_fi=gen_neg_out_fi_all[idx],
-            gen_pos_out_fi=gen_pos_out_fi_all[idx],
-        )
-
-    print(f"[★] 上位 {k} 体の保存が完了しました！(1位スコア: {energies[top_indices[0]]:.3f} ~ {k}位スコア: {energies[top_indices[-1]]:.3f})")
-    first_rank_path = os.path.join(top20_dir, f"rank01_step{step_num}_energy{float(energies[top_indices[0]]):.3f}_id{int(top_indices[0])}.npz")
-    print(f"  -> {first_rank_path}")
+    EliteManager.save_top_k(
+        target_dir=top20_dir,
+        energies=energies,
+        step=step_num,
+        config=Config,
+        gen_buf_dict=gen_buf_dict,
+        neuromod_map_buf=neuromod_map_buf,
+        shared_resource_params_buf=shared_resource_params_buf,
+        shared_link28th_params_buf=shared_link28th_params_buf,
+        shared_neuromod_params_buf=shared_neuromod_params_buf,
+        shared_inout_params_fi_buf=shared_inout_params_fi_buf,
+        k=k,
+        sync_latest_best=True,
+        backups_root="backups",
+        shared_sig_mut_buf=shared_sig_mut_buf,
+        shared_neuromod_map_mut_buf=shared_neuromod_map_mut_buf,
+        shared_neuromod_params_mut_buf=shared_neuromod_params_mut_buf,
+        shared_iicu_mut_buf=shared_iicu_mut_buf,
+        shared_rlmu_mut_buf=shared_rlmu_mut_buf,
+    )
+    print(f"[★] 上位 {k} 体の保存完了 & backups/latest_best.npz 同期完了！")
 
 
-TOTAL_STEPS = int(os.environ.get("VB_TOTAL_STEPS", "50000"))
-STOP_FILE = os.environ.get("VB_STOP_FILE", "")
+TOTAL_STEPS = args.steps if args.steps is not None else int(os.environ.get("VB_TOTAL_STEPS", "50000"))
+WAIT_INTERVAL = max(1, args.wait_interval if args.wait_interval is not None else int(os.environ.get("VB_WAIT_INTERVAL", "1")))
+STOP_FILE = args.stop_file if args.stop_file is not None else os.environ.get("VB_STOP_FILE", "")
 best_max_energy = BASE_ENERGY + 0.005
 last_completed_step = 0
 latest_energies = np.zeros(Config.m, dtype=np.float32)
+
+periodic_save_interval = EliteManager.calculate_save_interval(TOTAL_STEPS)
+
+interval_start_time = time.perf_counter()
+interval_steps = 0
+
+mode_str = (
+    f"VRAM書き戻し分割モード ({Config.sub_inner_steps}st/chunk, 全{Config.inner_steps}st)"
+    if Config.is_vram_sync_mode
+    else f"一括モード ({Config.inner_steps}st)"
+)
+print(f"[+] 実行設定: 総ステップ数={TOTAL_STEPS}, 推論={mode_str}, GPU同期(wait)間隔={WAIT_INTERVAL}st, 定期保存間隔={periodic_save_interval}st")
 
 for step in range(TOTAL_STEPS):
     if stop_requested:
         break
 
-    start_time_output = time.perf_counter()
-    reasoning_sim_dict["step"] = step
+    interval_steps += 1
+    has_stop_signal = bool(STOP_FILE and os.path.exists(STOP_FILE))
+    # 同期ステップ: 初回(step==0), 指定間隔(interval_steps >= WAIT_INTERVAL), 最終ステップ, または停止要求時
+    is_sync_step = (step == 0) or (interval_steps >= WAIT_INTERVAL) or (step == TOTAL_STEPS - 1) or has_stop_signal
+
     mutation_dict["step"] = step
     
     # -----------------------------------------------------------------
     # 1. まず推論・評価だけを実行する（まだ変異で上書きしない！）
     # -----------------------------------------------------------------
-    kernel_reasoning.dispatch(
-        thread_count=(Config.m * Config.N, Config.N, Config.N),
-        **reasoning_sim_dict
-    )
-    device.wait()
-
-    end_time_output = time.perf_counter()
-    elapsed_time_output = end_time_output - start_time_output
-
-    # -----------------------------------------------------------------
-    # 2. 上書きされる「前」の純粋な状態でエネルギーを取得・集計・保存する！
-    # -----------------------------------------------------------------
-    energies = get_current_energies()
-    latest_energies = energies
-    last_completed_step = step
-    
-    max_energy  = float(np.max(energies))
-    mean_energy = float(np.mean(energies))
-    
-    gained_count = int(np.count_nonzero(energies > BASE_ENERGY + 0.002))
-    stay_count   = int(np.count_nonzero(np.abs(energies - BASE_ENERGY) <= 0.002))
-    elite_ge04   = int(np.count_nonzero(energies >= 0.40))
-    
-    top10 = [round(float(x), 3) for x in np.sort(energies)[::-1][:10]]
-
-    print(
-        f"Step {step:05d} | {elapsed_time_output:.3f}s | "
-        f"黒字(>0.2): {gained_count:4d}体 | (静止=0.2: {stay_count:4d}, 0.4+: {elite_ge04:4d}) | "
-        f"Max: {max_energy:.3f} | Mean: {mean_energy:.3f} | Top5: {top10[:5]}"
-    )
-
-    with open(log_filename, mode="a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            step,
-            f"{elapsed_time_output:.4f}",
-            gained_count,
-            stay_count,
-            elite_ge04,
-            f"{mean_energy:.4f}",
-            f"{max_energy:.4f}",
-            f'"{top10}"'
-        ])
-        f.flush()
-
-    # ★ 変異前の「本物の最高個体」を保存！
-    if max_energy > best_max_energy:
-        best_max_energy = max_energy
-        best_idx = int(np.argmax(energies))
-        save_path = os.path.join(checkpoint_dir, f"best_step{step}_energy{max_energy:.3f}_id{best_idx}.npz")
-        
-        P_cube_4 = Config.P * Config.P * Config.P * 4
-        N_cube   = Config.N * Config.N * Config.N
-        INHIB_SIZE = Config.inhib_stride
-        
-        sig_pre_elite  = gen_buf_dict["sig_pre_map_np2_pout"].to_numpy().view(np.float16)[best_idx * P_cube_4 : (best_idx + 1) * P_cube_4]
-        sig_post_elite = gen_buf_dict["sig_post_map_np2_pout"].to_numpy().view(np.float16)[best_idx * P_cube_4 : (best_idx + 1) * P_cube_4]
-        dopamine_elite = gen_buf_dict["dopamine_map_pout"].to_numpy().view(np.float16)[best_idx * N_cube : (best_idx + 1) * N_cube]
-        sleep_elite    = gen_buf_dict["sleep_map_pout"].to_numpy().view(np.float16)[best_idx * N_cube : (best_idx + 1) * N_cube]
-        inhib_elite    = gen_buf_dict["inhib_sign_map_pout"].to_numpy().view(np.uint32)[best_idx * INHIB_SIZE : (best_idx + 1) * INHIB_SIZE]
-
-        np.savez_compressed(
-            save_path,
-            step=step,
-            score=max_energy,
-            enable_learning=np.float16(ENABLE_LEARNING),
-            enable_dopamine=np.float16(ENABLE_DOPAMINE),
-            enable_sleep=np.float16(ENABLE_SLEEP),
-            sig_pre=sig_pre_elite,
-            sig_post=sig_post_elite,
-            dopamine=dopamine_elite,
-            sleep=sleep_elite,
-            inhib=inhib_elite,
-            resource_base_output=shared_resource_params_buf["base_output"].to_numpy().view(np.float16)[best_idx],
-            resource_beta=shared_resource_params_buf["beta"].to_numpy().view(np.float16)[best_idx],
-            resource_k_refill=shared_resource_params_buf["k_refill"].to_numpy().view(np.float16)[best_idx],
-            link_multiplier=shared_link27th_params_buf["multiplier"].to_numpy().view(np.int32)[best_idx],
-            link_bias=shared_link27th_params_buf["bias"].to_numpy().view(np.int32)[best_idx],
-            learn_rate=shared_learning_params_buf["learning_rate"].to_numpy().view(np.float16)[best_idx],
-            learn_forget=shared_learning_params_buf["forget_rate"].to_numpy().view(np.float16)[best_idx],
-            learn_threshold=shared_learning_params_buf["learning_threshold"].to_numpy().view(np.float16)[best_idx],
-            learn_decay=shared_learning_params_buf["tag_decay"].to_numpy().view(np.float16)[best_idx],
-            light_in_fi=shared_inout_params_fi_buf["light_in_fi"].to_numpy().view(np.int32).reshape(Config.m, 3)[best_idx],
-            battery_in_fi=shared_inout_params_fi_buf["battery_in_fi"].to_numpy().view(np.int32).reshape(Config.m, 3)[best_idx],
-            gen_neg_out_fi=shared_inout_params_fi_buf["gen_neg_out_fi"].to_numpy().view(np.int32).reshape(Config.m, 3)[best_idx],
-            gen_pos_out_fi=shared_inout_params_fi_buf["gen_pos_out_fi"].to_numpy().view(np.int32).reshape(Config.m, 3)[best_idx],
+    if not Config.is_vram_sync_mode:
+        reasoning_sim_dict["step"] = step
+        kernel_reasoning.dispatch(
+            thread_count=(Config.m * Config.N, Config.N, Config.N),
+            **reasoning_sim_dict
         )
-        print(f"  [★] 過去最高エリート（変異前・本物）を保存しました -> {save_path}")
+    else:
+        reasoning_step_dict["step"] = step
+        # 1-1. 各個体の初期化ディスパッチ (is_init = 1)
+        reasoning_step_dict["is_init"] = 1
+        reasoning_step_dict["inner_step_start"] = 0
+        reasoning_step_dict["inner_step_count"] = 0
+        kernel_reasoning_step.dispatch(
+            thread_count=(Config.m * Config.N, Config.N, Config.N),
+            **reasoning_step_dict
+        )
 
-    # ★ 最終ステップ、または Ctrl+C が押されていたら「変異（上書き）せず」にループを抜ける！
-    if STOP_FILE and os.path.exists(STOP_FILE):
+        # 1-2. sub_inner_steps ごとに分割実行し、VRAMに状態を書き戻す
+        reasoning_step_dict["is_init"] = 0
+        for start_s in range(0, Config.inner_steps, Config.sub_inner_steps):
+            count_s = min(Config.sub_inner_steps, Config.inner_steps - start_s)
+            reasoning_step_dict["inner_step_start"] = start_s
+            reasoning_step_dict["inner_step_count"] = count_s
+            kernel_reasoning_step.dispatch(
+                thread_count=(Config.m * Config.N, Config.N, Config.N),
+                **reasoning_step_dict
+            )
+            # ★ 物理シミュレーション挿入フック
+            physics_interaction_hook(step, start_s, count_s, body_state_buf, global_poutputs_buf)
+    if is_sync_step:
+        device.wait()
+
+    # -----------------------------------------------------------------
+    # 2. 同期ステップの場合のみ、エネルギーを取得・集計・ログ出力・保存
+    # -----------------------------------------------------------------
+    if is_sync_step:
+        now = time.perf_counter()
+        elapsed_interval = now - interval_start_time
+        elapsed_per_step = elapsed_interval / max(1, interval_steps)
+
+        energies = get_current_energies()
+        latest_energies = energies
+        last_completed_step = step
+        
+        max_energy  = float(np.max(energies))
+        mean_energy = float(np.mean(energies))
+        
+        gained_count = int(np.count_nonzero(energies > BASE_ENERGY + 0.002))
+        stay_count   = int(np.count_nonzero(np.abs(energies - BASE_ENERGY) <= 0.002))
+        elite_ge04   = int(np.count_nonzero(energies >= 0.40))
+        
+        top10 = [round(float(x), 3) for x in np.sort(energies)[::-1][:10]]
+
+        if WAIT_INTERVAL == 1 or interval_steps == 1:
+            speed_str = f"{elapsed_per_step:.3f}s"
+        else:
+            speed_str = f"{elapsed_per_step:.3f}s/step ({elapsed_interval:.2f}s/{interval_steps}st)"
+
+        print(
+            f"Step {step:05d} | {speed_str} | "
+            f"黒字(>0.2): {gained_count:4d}体 | (静止=0.2: {stay_count:4d}, 0.4+: {elite_ge04:4d}) | "
+            f"Max: {max_energy:.3f} | Mean: {mean_energy:.3f} | Top5: {top10[:5]}"
+        )
+
+        with open(log_filename, mode="a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                step,
+                f"{elapsed_per_step:.4f}",
+                gained_count,
+                stay_count,
+                elite_ge04,
+                f"{mean_energy:.4f}",
+                f"{max_energy:.4f}",
+                f'"{top10}"'
+            ])
+            f.flush()
+
+        # ★ 変異前の「本物の最高個体」を保存！
+        if max_energy > best_max_energy:
+            best_max_energy = max_energy
+            best_idx = int(np.argmax(energies))
+            save_path = os.path.join(checkpoint_dir, f"best_step{step}_energy{max_energy:.3f}_id{best_idx}.npz")
+            
+            best_genome = EliteManager.extract_genome_dict(
+                idx=best_idx,
+                score=max_energy,
+                step=step,
+                config=Config,
+                gen_buf_dict=gen_buf_dict,
+                neuromod_map_buf=neuromod_map_buf,
+                shared_resource_params_buf=shared_resource_params_buf,
+                shared_link28th_params_buf=shared_link28th_params_buf,
+                shared_neuromod_params_buf=shared_neuromod_params_buf,
+                shared_inout_params_fi_buf=shared_inout_params_fi_buf,
+                shared_sig_mut_buf=shared_sig_mut_buf,
+                shared_neuromod_map_mut_buf=shared_neuromod_map_mut_buf,
+                shared_neuromod_params_mut_buf=shared_neuromod_params_mut_buf,
+                shared_iicu_mut_buf=shared_iicu_mut_buf,
+                shared_rlmu_mut_buf=shared_rlmu_mut_buf,
+            )
+            EliteManager.save_single_elite(save_path, best_genome, sync_latest_best=True, backups_root="backups")
+            print(f"  [★] 過去最高エリート（変異前・本物）を保存しました -> {save_path} (latest_best.npz 同期済)")
+
+        # ★ 定期チェックポイント保存（総ステップ数から自動計算された間隔で保存）
+        if step > 0 and step % periodic_save_interval == 0:
+            periodic_dir = os.path.join(checkpoint_dir, f"periodic_step{step:05d}")
+            EliteManager.save_top_k(
+                target_dir=periodic_dir,
+                energies=energies,
+                step=step,
+                config=Config,
+                gen_buf_dict=gen_buf_dict,
+                neuromod_map_buf=neuromod_map_buf,
+                shared_resource_params_buf=shared_resource_params_buf,
+                shared_link28th_params_buf=shared_link28th_params_buf,
+                shared_neuromod_params_buf=shared_neuromod_params_buf,
+                shared_inout_params_fi_buf=shared_inout_params_fi_buf,
+                k=5,
+                sync_latest_best=False,
+                backups_root="backups",
+                shared_sig_mut_buf=shared_sig_mut_buf,
+                shared_neuromod_map_mut_buf=shared_neuromod_map_mut_buf,
+                shared_neuromod_params_mut_buf=shared_neuromod_params_mut_buf,
+                shared_iicu_mut_buf=shared_iicu_mut_buf,
+                shared_rlmu_mut_buf=shared_rlmu_mut_buf,
+            )
+            print(f"  [💾] 定期チェックポイント保存完了 (Top 5) -> {periodic_dir}/")
+
+        # 次のインターバルに向けてタイマーリセット
+        interval_start_time = time.perf_counter()
+        interval_steps = 0
+
+    # ★ 最終ステップ、または Ctrl+C / 安全停止が押されていたら「変異（上書き）せず」にループを抜ける！
+    if has_stop_signal:
         print("\n[!] 停止リクエストを検知しました。現在のステップの上位20体を保存して安全に終了します...")
         stop_requested = True
     if stop_requested or step == TOTAL_STEPS - 1:
@@ -792,10 +883,15 @@ for step in range(TOTAL_STEPS):
         thread_count=(Config.m * Config.N, Config.N, Config.N),
         **mutation_dict
     )
-    device.wait()
+    if is_sync_step:
+        device.wait()
 
 # =====================================================================
 # ループ終了時（変異で上書きされる前の純粋な上位20体を一括保存！）
 # =====================================================================
+device.wait()
+if last_completed_step != step:
+    latest_energies = get_current_energies()
+    last_completed_step = step
 save_top_k_elites(last_completed_step, latest_energies, k=20)
 print("wow")

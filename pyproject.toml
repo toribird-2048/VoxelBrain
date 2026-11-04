@@ -1,15 +1,22 @@
 [project]
 name = "voxelbrain"
 version = "0.1.0"
-description = "Add your description here"
+description = "3D Coupled Map Lattice, Spatial Diffusion Neuromodulation, and GPU Massively Parallel Evolution System"
 readme = "README.md"
+license = "Apache-2.0"
 requires-python = ">=3.13"
 dependencies = [
+    "dearpygui>=2.3.1",
+    "fastapi>=0.162.0",
+    "httpx>=0.28.1",
     "jaxtyping>=0.3.11",
     "matplotlib>=3.11.2",
     "numpy>=2.5.4",
     "pandas>=3.1.0",
+    "python-multipart>=0.0.33",
     "setuptools<81",
     "slangpy>=0.43.1",
+    "uvicorn>=0.54.0",
     "vnoise>=0.1.0",
+    "websockets>=17.4",
 ]

@@ -23,13 +23,6 @@ struct SigPerlinGenes {
     StructuredBuffer<float4> cutoffs;
 };
 
-struct PerlinGenes {
-    StructuredBuffer<uint> seed;
-    StructuredBuffer<float> bias;
-    StructuredBuffer<float> freq;
-    StructuredBuffer<float> cutoff;
-};
-
 struct InhibGenes {
     StructuredBuffer<uint> seed;
     StructuredBuffer<float> speed;
@@ -59,53 +52,63 @@ float3 get_GRADIENT(uint3 grid_coord, uint seed) {
     uint ry = pcg_hash(rx);
     uint rz = pcg_hash(ry);
 
-    float3 v = float3(
-        float(rx) * (1.0 / 4294967295.0),
-        float(ry) * (1.0 / 4294967295.0),
-        float(rz) * (1.0 / 4294967295.0),
-    ) * 2.0 - 1.0;
-
-    return normalize(v + float3(1e-5, 0.0, 0.0));
+    return normalize(float3(
+        float(rx & 0xFFFF) / 32767.5f - 1.0f,
+        float(ry & 0xFFFF) / 32767.5f - 1.0f,
+        float(rz & 0xFFFF) / 32767.5f - 1.0f
+    ));
 }
 
-float3 fade(float3 t) {
-    return t * t * t *(t * (t * 6.0 - 15.0) + 10.0);
+float fade(float t) {
+    return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
 }
 
-uint3 indexToCoordNp2(uint index) {
-    uint P = N + 2;
-    return uint3(
-        index % P,
-        (index / P) % P,
-        (index / (P * P)) % P
-    );
-}
+float perlin_gen(float3 p, float freq, uint seed) {
+    float3 scaled_p = p * freq;
+    int3 p0 = floor(scaled_p);
+    float3 f = frac(scaled_p);
 
-uint coordToIndexNp2(uint3 coord) {
-    uint P = N + 2;
-    return (P * P) * coord.z + P * coord.y + coord.x;
-}
+    float3 u = float3(fade(f.x), fade(f.y), fade(f.z));
 
-float perlin_gen(float3 coord, float freq, uint seed) {
-    float3 my_pos = (coord + 0.5f) * freq;
-
-    float sum = 0.0f;
-    float3 my_mod = frac(my_pos);
-    float3 f = fade(my_mod);
-
-    for (uint dz = 0; dz <= 1; dz++) {
-        for (uint dy = 0; dy <= 1; dy++) {
-            for (uint dx = 0; dx <= 1; dx++) {
-                float3 grad = get_GRADIENT(int3(floor(my_pos)) + int3(dx, dy, dz), seed);
-                float dot_grad = dot(grad, my_mod - float3(dx, dy, dz));
-                sum += dot_grad 
-                    * (dx == 0 ? (1.0f - f.x) : f.x) 
-                    * (dy == 0 ? (1.0f - f.y) : f.y) 
-                    * (dz == 0 ? (1.0f - f.z) : f.z);
+    float c[2][2][2];
+    [unroll]
+    for (int dz = 0; dz <= 1; dz++) {
+        [unroll]
+        for (int dy = 0; dy <= 1; dy++) {
+            [unroll]
+            for (int dx = 0; dx <= 1; dx++) {
+                int3 g_coord = p0 + int3(dx, dy, dz);
+                float3 g = get_GRADIENT(uint3(g_coord), seed);
+                float3 d = f - float3(dx, dy, dz);
+                c[dx][dy][dz] = dot(g, d);
             }
         }
     }
-    return sum;
+
+    return lerp(
+        lerp(
+            lerp(c[0][0][0], c[1][0][0], u.x),
+            lerp(c[0][1][0], c[1][1][0], u.x),
+            u.y
+        ),
+        lerp(
+            lerp(c[0][0][1], c[1][0][1], u.x),
+            lerp(c[0][1][1], c[1][1][1], u.x),
+            u.y
+        ),
+        u.z
+    );
+}
+
+int3 indexToCoordNp2(int index) {
+    int x = index % (N + 2);
+    int y = (index / (N + 2)) % (N + 2);
+    int z = index / ((N + 2) * (N + 2));
+    return int3(x, y, z);
+}
+
+int coordToIndexNp2(int3 coord) {
+    return coord.x + (N + 2) * (coord.y + (N + 2) * coord.z);
 }
 
 void sig_gen(RWStructuredBuffer<half4> sig_map_np2, SigPerlinGenes genes, uint group_id_x, uint group_index) {
@@ -115,7 +118,7 @@ void sig_gen(RWStructuredBuffer<half4> sig_map_np2, SigPerlinGenes genes, uint g
     float4 cutoff = genes.cutoffs[group_id_x];
 
     for (uint idx_np2 = group_index; idx_np2 < TOTAL_NP2; idx_np2 += TOTAL_N) {
-        uint3 coord = indexToCoordNp2(idx_np2);
+        int3 coord = indexToCoordNp2(idx_np2);
 
         float4 sum_xyzw = float4(
             perlin_gen(coord, freq.x, seed.x),
@@ -128,15 +131,20 @@ void sig_gen(RWStructuredBuffer<half4> sig_map_np2, SigPerlinGenes genes, uint g
     }
 }
 
-void dop_sleep_gen(RWStructuredBuffer<half> map, PerlinGenes genes, uint group_id_x, uint group_index, uint3 group_thread_id) {
-    uint seed = genes.seed[group_id_x];
-    float bias = genes.bias[group_id_x];
-    float freq = genes.freq[group_id_x];
-    float cutoff = genes.cutoff[group_id_x];
+void neuromod_gen(RWStructuredBuffer<half4> map, SigPerlinGenes genes, uint group_id_x, uint group_index, uint3 group_thread_id) {
+    uint4 seed = genes.seeds[group_id_x];
+    float4 bias = genes.biases[group_id_x];
+    float4 freq = genes.freqs[group_id_x];
+    float4 cutoff = genes.cutoffs[group_id_x];
 
-    float sum = perlin_gen(group_thread_id, freq, seed);
+    float4 sum_xyzw = float4(
+        perlin_gen(group_thread_id, freq.x, seed.x),
+        perlin_gen(group_thread_id, freq.y, seed.y),
+        perlin_gen(group_thread_id, freq.z, seed.z),
+        perlin_gen(group_thread_id, freq.w, seed.w)
+    );
 
-    map[group_id_x * N * N * N + group_index] = half(clamp((sum - cutoff) / (1.0f - cutoff) + bias, -1.0f, 1.0f));
+    map[group_id_x * TOTAL_N + group_index] = half4(clamp((sum_xyzw - cutoff) / (1.0f - cutoff) + bias, -1.0f, 1.0f));
 }
 
 float get_inhib(int3 coord_np2, uint step) {
@@ -156,20 +164,16 @@ void computeMain(
     uint3 groupID: SV_GroupID,
     RWStructuredBuffer<half4> sig_pre_map_np2_pout,
     RWStructuredBuffer<half4> sig_post_map_np2_pout,
-    RWStructuredBuffer<half> dopamine_map_pout,
-    RWStructuredBuffer<half> sleep_map_pout,
+    RWStructuredBuffer<half4> neuromod_map_pout,
     RWStructuredBuffer<uint> inhib_sign_map_pout,
     uniform SigPerlinGenes sig_pre_genes,
     uniform SigPerlinGenes sig_post_genes,
-    uniform PerlinGenes dopamine_genes,
-    uniform PerlinGenes sleep_genes,
+    uniform SigPerlinGenes neuromod_genes,
     uniform InhibGenes inhib_genes
 ) {
     sig_gen(sig_pre_map_np2_pout, sig_pre_genes, groupID.x, groupIndex);
     sig_gen(sig_post_map_np2_pout, sig_post_genes, groupID.x, groupIndex);
-
-    dop_sleep_gen(dopamine_map_pout, dopamine_genes, groupID.x, groupIndex, groupThreadID);
-    dop_sleep_gen(sleep_map_pout, sleep_genes, groupID.x, groupIndex, groupThreadID);
+    neuromod_gen(neuromod_map_pout, neuromod_genes, groupID.x, groupIndex, groupThreadID);
 
     uint seed_inhib = inhib_genes.seed[groupID.x];
     float base_inhib = inhib_genes.base[groupID.x];
