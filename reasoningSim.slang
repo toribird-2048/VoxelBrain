@@ -45,12 +45,30 @@
 #define TOTAL_NP2H2 (TOTAL_NP2 >> 1)
 
 #define MAX_WAVE    (64)
-#define INNER_STEPS (1000)
+#ifndef INNER_STEPS
+#define INNER_STEPS (30)
+#endif
 
 #define NEUROMOD_NUM (4)
 
 #ifndef ONE_SIM
 #define ONE_SIM (0)
+#endif
+
+#ifndef VRAM_SYNC_MODE
+#if ONE_SIM == 1
+#define VRAM_SYNC_MODE (1)
+#else
+#define VRAM_SYNC_MODE (0)
+#endif
+#endif
+
+#ifndef KO_MASK_ENABLED
+#if ONE_SIM == 1
+#define KO_MASK_ENABLED (1)
+#else
+#define KO_MASK_ENABLED (0)
+#endif
 #endif
 
 // =============================================================================
@@ -538,15 +556,19 @@ void computeMain(
     RWStructuredBuffer<float> mutation_rate_all,
     uniform half dt,
     uniform uint step
-#if ONE_SIM == 1
+#if VRAM_SYNC_MODE == 1
     ,
-    uniform uint inner_step_val,
+    uniform uint inner_step_start,
+    uniform uint inner_step_count,
     uniform uint is_init,
     RWStructuredBuffer<float> body_state_all,
     RWStructuredBuffer<half> r_all,
     RWStructuredBuffer<half4> neuromod_state_all,
-    RWStructuredBuffer<half> synapse_weights_all,
+    RWStructuredBuffer<half> synapse_weights_all
+#if KO_MASK_ENABLED == 1
+    ,
     StructuredBuffer<uint> ko_mask_all
+#endif
 #endif
 ) 
 {
@@ -577,7 +599,7 @@ void computeMain(
     }
     GroupMemoryBarrierWithGroupSync();
 
-#if ONE_SIM == 1
+#if VRAM_SYNC_MODE == 1
     SynapseData synapse_data;
     half R;
     half my_output = 0.0h;
@@ -585,10 +607,18 @@ void computeMain(
     if (is_init == 1u) {
         // --- 初期化モード ---
         if (groupIndex == 0) {
-            my_energy_s = body_state_all[0];
-            my_pos_s    = float2(body_state_all[1], body_state_all[2]);
-            my_angle_s  = body_state_all[3];
-            my_obj_s    = float2(body_state_all[4], body_state_all[5]);
+#if ONE_SIM == 1
+            my_energy_s = body_state_all[agent_id * 6 + 0];
+            my_pos_s    = float2(body_state_all[agent_id * 6 + 1], body_state_all[agent_id * 6 + 2]);
+            my_angle_s  = body_state_all[agent_id * 6 + 3];
+            my_obj_s    = float2(body_state_all[agent_id * 6 + 4], body_state_all[agent_id * 6 + 5]);
+#else
+            my_energy_s = INITIAL_ENERGY;
+            my_pos_s    = float2(0.0, 0.0);
+            my_angle_s  = 0.0;
+            float obj_rand = 2.0f * (float)rand_half(12277u * step + 67u * agent_id);
+            my_obj_s    = float2(cospi(obj_rand), sinpi(obj_rand));
+#endif
         }
         init_synapse_weights(groupThreadID, groupIndex, link28th_params, synapse_data);
         R = 1.0h;
@@ -598,8 +628,12 @@ void computeMain(
         }
         GroupMemoryBarrierWithGroupSync();
 
+#if KO_MASK_ENABLED == 1
         bool is_ko_init = bool((ko_mask_all[groupIndex >> 5] >> (groupIndex & 31)) & 1);
         set_output_s(groupThreadID, is_ko_init ? 0.0h : 0.5h);
+#else
+        set_output_s(groupThreadID, 0.5h);
+#endif
         GroupMemoryBarrierWithGroupSync();
 
         set_neuromod(groupThreadID, 0u, 0.0h);
@@ -610,10 +644,10 @@ void computeMain(
     } else {
         // --- 状態復帰モード ---
         if (groupIndex == 0) {
-            my_energy_s = body_state_all[0];
-            my_pos_s    = float2(body_state_all[1], body_state_all[2]);
-            my_angle_s  = body_state_all[3];
-            my_obj_s    = float2(body_state_all[4], body_state_all[5]);
+            my_energy_s = body_state_all[agent_id * 6 + 0];
+            my_pos_s    = float2(body_state_all[agent_id * 6 + 1], body_state_all[agent_id * 6 + 2]);
+            my_angle_s  = body_state_all[agent_id * 6 + 3];
+            my_obj_s    = float2(body_state_all[agent_id * 6 + 4], body_state_all[agent_id * 6 + 5]);
         }
         [unroll]
         for (uint w = 0; w < 28; w++) {
@@ -629,10 +663,10 @@ void computeMain(
         }
         GroupMemoryBarrierWithGroupSync();
 
-        neuromod_map_s[groupIndex][inner_step_val & 1u] = neuromod_state_all[agent_id * TOTAL_N + groupIndex];
+        neuromod_map_s[groupIndex][inner_step_start & 1u] = neuromod_state_all[agent_id * TOTAL_N + groupIndex];
         GroupMemoryBarrierWithGroupSync();
 
-        my_output = (inner_step_val == 0u) ? 0.0h : get_output_s(groupThreadID);
+        my_output = (inner_step_start == 0u) ? 0.0h : get_output_s(groupThreadID);
     }
 #else
     // --- Step 1: 共有メモリと個体パラメータの初期化 ---
@@ -667,9 +701,9 @@ void computeMain(
 #endif
 
 // --- Step 3: 神経・環境ダイナミクスループ ---
-#if ONE_SIM == 1
+#if VRAM_SYNC_MODE == 1
     if (is_init == 0u) {
-        uint inner_step = inner_step_val;
+        for (uint inner_step = inner_step_start; inner_step < inner_step_start + inner_step_count; inner_step++) {
 #else
     for (uint inner_step = 0; inner_step < INNER_STEPS; inner_step++) {
 #endif
@@ -718,7 +752,7 @@ void computeMain(
         half scaled_net  = clamp(net * resource_params.beta, -20.0h, 20.0h);
         half output_rate = min(1.0h, resource_params.base_output * exp2(scaled_net));
         my_output   = half(my_inhib) * output_rate * R;
-#if ONE_SIM == 1
+#if KO_MASK_ENABLED == 1
         bool is_ko = bool((ko_mask_all[groupIndex >> 5] >> (groupIndex & 31)) & 1);
         if (is_ko) {
             my_output = 0.0h;
@@ -738,16 +772,19 @@ void computeMain(
         }
         GroupMemoryBarrierWithGroupSync();
     }
+#if VRAM_SYNC_MODE == 1
+    }
+#endif
 
     // --- Step 4: 最終状態のグローバルバッファへの書き戻し ---
-#if ONE_SIM == 1
+#if VRAM_SYNC_MODE == 1
     if (groupIndex == 0) {
-        body_state_all[0] = my_energy_s;
-        body_state_all[1] = my_pos_s.x;
-        body_state_all[2] = my_pos_s.y;
-        body_state_all[3] = my_angle_s;
-        body_state_all[4] = my_obj_s.x;
-        body_state_all[5] = my_obj_s.y;
+        body_state_all[agent_id * 6 + 0] = my_energy_s;
+        body_state_all[agent_id * 6 + 1] = my_pos_s.x;
+        body_state_all[agent_id * 6 + 2] = my_pos_s.y;
+        body_state_all[agent_id * 6 + 3] = my_angle_s;
+        body_state_all[agent_id * 6 + 4] = my_obj_s.x;
+        body_state_all[agent_id * 6 + 5] = my_obj_s.y;
         mutation_rate_all[agent_id] = saturate(my_energy_s);
     }
     [unroll]
@@ -755,7 +792,7 @@ void computeMain(
         synapse_weights_all[(agent_id * TOTAL_N + groupIndex) * 28 + w] = synapse_data.weights[w];
     }
     r_all[agent_id * TOTAL_N + groupIndex] = R;
-    uint save_step = (is_init == 1u) ? 0u : ((inner_step_val + 1) & 1u);
+    uint save_step = (is_init == 1u) ? 0u : ((inner_step_start + inner_step_count) & 1u);
     neuromod_state_all[agent_id * TOTAL_N + groupIndex] = neuromod_map_s[groupIndex][save_step];
 #else
     if (groupIndex == 0) {

@@ -4,6 +4,7 @@ __pycache__/
 *$py.class
 .mypy_cache/
 .pytest_cache/
+.ruff_cache/
 
 # === Virtual Environment ===
 .venv/
@@ -13,13 +14,16 @@ env/
 # === Slang / OptiX / GPU Cache ===
 optix7cache.db*
 *.nsys-rep
+*.qdrep
 
 # === Training Logs & Checkpoints ===
 logs/
 backups/checkpoint_*/
 backups/edited/
 backups/recordings/
+backups/uploaded/
 .voxelbrain_stop_signal
+vb_stop_signal.txt
 
 # === Visualizations ===
 trends/
@@ -36,5 +40,5 @@ Thumbs.db
 .idea/
 
 # === Keep Important Samples ===
-# backups 自体は一部追跡したい場合（handcrafted_v1.npz など）
+!backups/latest_best.npz
 !backups/elites/

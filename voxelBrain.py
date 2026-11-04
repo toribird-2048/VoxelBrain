@@ -12,6 +12,7 @@ import glob
 import csv
 from datetime import datetime
 import sys
+import argparse
 
 from elite_manager import EliteManager
 
@@ -31,6 +32,29 @@ from sim_config import (
     SPEED_GAIN,
     ROTATE_GAIN,
 )
+
+# ---------------------------------------------------------
+# コマンドライン引数の解析 (未指定時は環境変数またはデフォルト値)
+# ---------------------------------------------------------
+parser = argparse.ArgumentParser(description="VoxelBrain Evolution Simulation")
+parser.add_argument("--steps", "-n", type=int, default=None, help="総世代数 / ステップ数 (デフォルト: 50000 または VB_TOTAL_STEPS)")
+parser.add_argument("--inner-steps", type=int, default=None, help="1世代あたりの推論ステップ数 (デフォルト: 30 または VB_INNER_STEPS)")
+parser.add_argument("--sub-inner-steps", type=int, default=None, help="VRAM書き戻し間隔 (デフォルト: inner_steps または VB_SUB_INNER_STEPS)")
+parser.add_argument("--dim", type=int, default=None, help="ボクセル解像度次元 1, 2, or 3 (デフォルト: 2 または VB_DIM)")
+parser.add_argument("--m", type=int, default=None, help="個体群サイズ (デフォルト: 32768 または VB_M)")
+parser.add_argument("--wait-interval", type=int, default=None, help="GPU同期・ログ出力間隔 (デフォルト: 1 または VB_WAIT_INTERVAL)")
+parser.add_argument("--stop-file", type=str, default=None, help="安全停止用トリガーファイルパス")
+
+args, unknown_args = parser.parse_known_args()
+
+if args.dim is not None:
+    os.environ["VB_DIM"] = str(args.dim)
+if args.m is not None:
+    os.environ["VB_M"] = str(args.m)
+if args.inner_steps is not None:
+    os.environ["VB_INNER_STEPS"] = str(args.inner_steps)
+if args.sub_inner_steps is not None:
+    os.environ["VB_SUB_INNER_STEPS"] = str(args.sub_inner_steps)
 
 
 stop_requested = False
@@ -155,6 +179,13 @@ class Config:
     m: int = int(os.environ.get("VB_M", str(1 << 15)))
     world_size: float = 100.0
     
+    # 1世代あたりの総推論ステップ数 (デフォルト: 30)
+    inner_steps: int = int(os.environ.get("VB_INNER_STEPS", "30"))
+    # VRAM書き戻し間隔 (何inner_stepごとにVRAMへ書き戻すか。デフォルト: inner_steps = 一括実行)
+    sub_inner_steps: int = int(os.environ.get("VB_SUB_INNER_STEPS", str(inner_steps)))
+    # VRAM書き戻しモードの判定
+    is_vram_sync_mode: bool = sub_inner_steps < inner_steps
+    
     class Seed:
         sigpre: int = 1
         sigpost: int = 2
@@ -248,7 +279,6 @@ class GenesisParams:
         )
 
 
-genesis_params = GenesisParams.new()
 device = spy.create_device(type=spy.DeviceType.cuda)
 
 
@@ -267,10 +297,11 @@ def cast_and_buffer(ndarray_dict: dict[str, np.ndarray], device: spy.Device, flo
     return buf_dict
 
 
-def build_kernel(device, filename: str):
+def build_kernel(device, filename: str, extra_defines: str = ""):
     with open(filename + ".slang", "r", encoding="utf-8") as f:
         defines = (
             f"#define DIM {Config.dim}\n"
+            f"#define INNER_STEPS {Config.inner_steps}\n"
             f"#define NUM_IN_PORTS {NUM_IN_PORTS}\n"
             f"#define NUM_OUT_PORTS {NUM_OUT_PORTS}\n"
             f"#define INITIAL_ENERGY {INITIAL_ENERGY}f\n"
@@ -280,10 +311,12 @@ def build_kernel(device, filename: str):
             f"#define SUN_CYCLE_PERIOD {SUN_CYCLE_PERIOD}f\n"
             f"#define SPEED_GAIN {SPEED_GAIN}f\n"
             f"#define ROTATE_GAIN {ROTATE_GAIN}f\n"
+            f"{extra_defines}"
         )
         source_code = defines + f.read()
     
-    module = device.load_module_from_source("kernel" + filename, source_code)
+    module_name = f"kernel_{filename}_{'sync' if 'VRAM_SYNC_MODE' in extra_defines else 'mono'}"
+    module = device.load_module_from_source(module_name, source_code)
     entry = module.entry_point("computeMain")
     program = device.link_program([module], [entry])
     kernel = device.create_compute_kernel(program)
@@ -389,7 +422,10 @@ def create_neuromod_params_buffers(num_groups: int, seed: int = None):
 
 
 kernel_generation = build_kernel(device, "generation")
-kernel_reasoning = build_kernel(device, "reasoningSim")
+if Config.is_vram_sync_mode:
+    kernel_reasoning_step = build_kernel(device, "reasoningSim", extra_defines="#define VRAM_SYNC_MODE 1\n")
+else:
+    kernel_reasoning = build_kernel(device, "reasoningSim")
 kernel_mutation = build_kernel(device, "mutation")
 
 sig_pre_map_np2 = np.zeros(Config.m * Config.P * Config.P * Config.P * 4, dtype=np.half)
@@ -543,6 +579,57 @@ reasoning_sim_dict = {
     "step": 0,
 }
 
+if Config.is_vram_sync_mode:
+    body_state_buf = device.create_buffer(
+        data=np.zeros((Config.m, 6), dtype=np.float32),
+        usage=spy.BufferUsage.unordered_access | spy.BufferUsage.shader_resource
+    )
+    r_buf = device.create_buffer(
+        data=np.zeros((Config.m, Config.total_cells), dtype=np.float16),
+        usage=spy.BufferUsage.unordered_access | spy.BufferUsage.shader_resource
+    )
+    neuromod_state_buf = device.create_buffer(
+        data=np.zeros((Config.m, Config.total_cells, 4), dtype=np.float16),
+        usage=spy.BufferUsage.unordered_access | spy.BufferUsage.shader_resource
+    )
+    synapse_weights_buf = device.create_buffer(
+        data=np.zeros((Config.m, Config.total_cells * 28), dtype=np.float16),
+        usage=spy.BufferUsage.unordered_access | spy.BufferUsage.shader_resource
+    )
+
+    reasoning_step_dict = {
+        **reasoning_sim_dict,
+        "inner_step_start": np.uint32(0),
+        "inner_step_count": np.uint32(0),
+        "is_init": np.uint32(1),
+        "body_state_all": body_state_buf,
+        "r_all": r_buf,
+        "neuromod_state_all": neuromod_state_buf,
+        "synapse_weights_all": synapse_weights_buf,
+    }
+
+
+def physics_interaction_hook(
+    step: int,
+    inner_step_start: int,
+    inner_step_count: int,
+    body_state_buf: spy.Buffer,
+    global_outputs_buf: spy.Buffer,
+):
+    """
+    ユーザー拡張用: マルチエージェント物理シミュレーション挿入フック。
+    VRAM書き戻しモード時に各サブステップ終了直後に呼び出されます。
+    ユーザー独自の物理シミュレーション（GPUカーネルディスパッチ等）をここに実装してください。
+
+    Args:
+        step: 現在の世代 (global step)
+        inner_step_start: 直前のサブステップ開始番号
+        inner_step_count: 直前のサブステップ実行数
+        body_state_buf: 全個体の身体状態バッファ [Config.m, 6] (float32: energy, pos.x, pos.y, angle, obj.x, obj.y)
+        global_outputs_buf: 全個体のニューロン出力・膜電位バッファ
+    """
+    pass
+
 mutation_dict = {
     "neuromod_map_all": neuromod_map_buf,
     "inhib_map_all": gen_buf_dict["inhib_sign_map_pout"],
@@ -616,9 +703,9 @@ def save_top_k_elites(step_num: int, energies: np.ndarray, k: int = 20):
     print(f"[★] 上位 {k} 体の保存完了 & backups/latest_best.npz 同期完了！")
 
 
-TOTAL_STEPS = int(os.environ.get("VB_TOTAL_STEPS", "50000"))
-WAIT_INTERVAL = max(1, int(os.environ.get("VB_WAIT_INTERVAL", "1")))
-STOP_FILE = os.environ.get("VB_STOP_FILE", "")
+TOTAL_STEPS = args.steps if args.steps is not None else int(os.environ.get("VB_TOTAL_STEPS", "50000"))
+WAIT_INTERVAL = max(1, args.wait_interval if args.wait_interval is not None else int(os.environ.get("VB_WAIT_INTERVAL", "1")))
+STOP_FILE = args.stop_file if args.stop_file is not None else os.environ.get("VB_STOP_FILE", "")
 best_max_energy = BASE_ENERGY + 0.005
 last_completed_step = 0
 latest_energies = np.zeros(Config.m, dtype=np.float32)
@@ -628,7 +715,12 @@ periodic_save_interval = EliteManager.calculate_save_interval(TOTAL_STEPS)
 interval_start_time = time.perf_counter()
 interval_steps = 0
 
-print(f"[+] 実行設定: 総ステップ数={TOTAL_STEPS}, GPU同期(wait)間隔={WAIT_INTERVAL}st, 定期保存間隔={periodic_save_interval}st")
+mode_str = (
+    f"VRAM書き戻し分割モード ({Config.sub_inner_steps}st/chunk, 全{Config.inner_steps}st)"
+    if Config.is_vram_sync_mode
+    else f"一括モード ({Config.inner_steps}st)"
+)
+print(f"[+] 実行設定: 総ステップ数={TOTAL_STEPS}, 推論={mode_str}, GPU同期(wait)間隔={WAIT_INTERVAL}st, 定期保存間隔={periodic_save_interval}st")
 
 for step in range(TOTAL_STEPS):
     if stop_requested:
@@ -639,16 +731,40 @@ for step in range(TOTAL_STEPS):
     # 同期ステップ: 初回(step==0), 指定間隔(interval_steps >= WAIT_INTERVAL), 最終ステップ, または停止要求時
     is_sync_step = (step == 0) or (interval_steps >= WAIT_INTERVAL) or (step == TOTAL_STEPS - 1) or has_stop_signal
 
-    reasoning_sim_dict["step"] = step
     mutation_dict["step"] = step
     
     # -----------------------------------------------------------------
     # 1. まず推論・評価だけを実行する（まだ変異で上書きしない！）
     # -----------------------------------------------------------------
-    kernel_reasoning.dispatch(
-        thread_count=(Config.m * Config.N, Config.N, Config.N),
-        **reasoning_sim_dict
-    )
+    if not Config.is_vram_sync_mode:
+        reasoning_sim_dict["step"] = step
+        kernel_reasoning.dispatch(
+            thread_count=(Config.m * Config.N, Config.N, Config.N),
+            **reasoning_sim_dict
+        )
+    else:
+        reasoning_step_dict["step"] = step
+        # 1-1. 各個体の初期化ディスパッチ (is_init = 1)
+        reasoning_step_dict["is_init"] = 1
+        reasoning_step_dict["inner_step_start"] = 0
+        reasoning_step_dict["inner_step_count"] = 0
+        kernel_reasoning_step.dispatch(
+            thread_count=(Config.m * Config.N, Config.N, Config.N),
+            **reasoning_step_dict
+        )
+
+        # 1-2. sub_inner_steps ごとに分割実行し、VRAMに状態を書き戻す
+        reasoning_step_dict["is_init"] = 0
+        for start_s in range(0, Config.inner_steps, Config.sub_inner_steps):
+            count_s = min(Config.sub_inner_steps, Config.inner_steps - start_s)
+            reasoning_step_dict["inner_step_start"] = start_s
+            reasoning_step_dict["inner_step_count"] = count_s
+            kernel_reasoning_step.dispatch(
+                thread_count=(Config.m * Config.N, Config.N, Config.N),
+                **reasoning_step_dict
+            )
+            # ★ 物理シミュレーション挿入フック
+            physics_interaction_hook(step, start_s, count_s, body_state_buf, global_poutputs_buf)
     if is_sync_step:
         device.wait()
 
